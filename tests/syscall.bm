@@ -3,8 +3,8 @@ struct apple {
     count: uint
 }
 
-fn|c| main(argv: **uint8, argc: uint): uint8 {
+global|printf| fn|c| c_printf(message: *uint8);
 
-}
+fn|c| main(argv: **uint8, argc: uint): uint8 {}
 
 fn|c| other(a: struct apple): uint {}

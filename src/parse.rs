@@ -373,7 +373,7 @@ pub struct Function {
     name: Identifier,
     args: Vec<TypedBinding>,
     return_type: Option<Identifier>,
-    block: Block
+    block: Option<Block>
 }
 impl Function {
     fn parse(mut qualifiers: HashMap<String, Qualifier>, from: &mut &str, pos: &mut usize) -> Result<Self, ParseError> {
@@ -401,7 +401,13 @@ impl Function {
             strip_whitespace(from, pos);
             Some(to_ret)
         } else { None };
-        let block = Block::parse(from, pos)?;
+        strip_whitespace(from, pos);
+        let block = if &from[..1] == ";" {
+            parse_symbol(";", from, pos).unwrap();
+            None
+        } else {
+            Some(Block::parse(from, pos)?)
+        };
         Ok(Self {
             fn_qualifier,
             name,
@@ -413,7 +419,8 @@ impl Function {
 }
 impl Spans for Function {
     fn span(&self) -> Span {
-        self.block.span() - self.fn_qualifier.span()
+        // TODO: Full span
+        self.fn_qualifier.span()
     }
 }
 
