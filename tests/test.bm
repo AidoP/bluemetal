@@ -1,0 +1,38 @@
+fn main(argv: *char, argc: uint): uint {
+    no_error()
+}
+
+fn sum(values: [&]int): int {
+    mut to_ret = 0;
+    for (int v, uint i = 0; i < values; v = values[i++])
+        to_ret += v;
+    for (let v in values)
+        to_ret += v;
+}
+
+fn no_error(): uint {
+    0
+}
+
+enum(int) AppleType {
+    GrannySmith
+}
+
+struct Apple {
+    number: uint,
+    taste: uint8,
+    kind: AppleType
+}
+
+impl Apple {
+    fn new(): Self {
+        Self {
+            number: 5,
+            taste: 200,
+            kind: AppleType::GrannySmith
+        }
+    }
+    fn bad_taste(&self) -> uint8 {
+        255 - self.taste
+    }
+}

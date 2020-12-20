@@ -1,0 +1,10 @@
+struct apple {
+    type: [&]uint8,
+    count: uint
+}
+
+fn|c| main(argv: **uint8, argc: uint): uint8 {
+
+}
+
+fn|c| other(a: struct apple): uint {}

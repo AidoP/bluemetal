@@ -1,0 +1,28 @@
+interface person {
+    get_name: fn(&self): [&]uint8,
+    get_employment: fn(&self): [&]uint8
+}
+
+struct student {
+    name: [&]uint8,
+    age: uint8,
+    school: [&]uint8
+}
+
+impl interface person for struct student {
+    fn get_name(&self): [&]uint8 {
+        self.name
+    }
+    fn get_employment(&self): [&]uint8 {
+        const msg_prefix = "Student at ";
+        mut msg = std::alloc(msg_prefix.len + self.school);
+        self.school
+    }
+}
+
+fn main() {
+    let p1 = struct person {
+        name: "Adam",
+        age: 
+    };
+}
