@@ -1,0 +1,5 @@
+[toolchain]
+channel = "nightly"
+profile = "default"
+components = [ "rustc", "cargo", "rustfmt", "rust-analyzer", "clippy" ]
+targets = [ "riscv64gc-unknown-none-elf" ]

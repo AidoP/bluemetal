@@ -1,0 +1,18 @@
+[package]
+name = "bluemetal"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "bluemetal"
+test = false
+
+[features]
+
+[dependencies]
+panic = { path = "../panic" }
+serial = { path = "../serial" }
+
+[build-dependencies]
+configure = { path = "../configure", features = ["fix-build-dep-bug"] }

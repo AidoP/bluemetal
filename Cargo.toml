@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.metadata.rust-analyzer]
+cargo.allTargets = false
+
+[profile.dev]
+panic = "unwind"
+lto = "fat"
+
+[profile.release]
+panic = "abort"
+lto = "fat"
+codegen-units = 1
