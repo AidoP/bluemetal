@@ -54,6 +54,7 @@ impl Machine {
             _ => {
                 println!("cargo::rerun-if-changed={PKG_DIR}/link/{self:?}.ld");
                 println!("cargo::rustc-link-arg-bins=-T{PKG_DIR}/link/{self:?}.ld");
+                println!("cargo::rustc-link-arg-bins=--oformat=binary");
             },
         }
     }
@@ -82,11 +83,11 @@ impl Machine {
         }
         build.compile(lib);
     }
-    /// The path to the kernel entry code for the target machine relative to the
-    /// kernel package manifest.
-    pub fn kernel_entry(&self) -> &str {
+    /// The name of the base entry point file for the machine-specific entry
+    /// code.
+    pub fn init_name(&self) -> &str {
         match self {
-            _ => "src/entry.s",
+            _ => "riscv_m.s",
         }
     }
 }

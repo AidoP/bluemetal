@@ -1,19 +1,17 @@
-use crate::{Device, Serial};
+use crate::Serial;
 
 // Safety: this module is only enabled if the `sifive_uart` device is enabled,
 // which always has the UART at these addresses.
 const UART0: Uart = unsafe { Uart::at_address(0x10010000) };
 const UART1: Uart = unsafe { Uart::at_address(0x10011000) };
 
-pub fn sifive_uart(num: usize) -> Option<Device> {
+pub fn sifive_uart(num: usize) -> Option<&'static dyn Serial> {
     // Safety: the target machine has been configured to have a compatible
     // UART at the correct addresses.
-    unsafe {
-        match num {
-            0 => Some(UART0.device()),
-            1 => Some(UART1.device()),
-            _ => None,
-        }
+    match num {
+        0 => Some(&UART0),
+        1 => Some(&UART1),
+        _ => None,
     }
 }
 
@@ -44,11 +42,5 @@ impl Serial for Uart {
             txdata.write_volatile(byte as u32);
             Ok(())
         }
-    }
-}
-impl Uart {
-    /// Initialise the UART device and return a device handle.
-    pub unsafe fn device(&'static self) -> Device {
-        Device::new(self)
     }
 }

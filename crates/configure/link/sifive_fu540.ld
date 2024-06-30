@@ -19,11 +19,16 @@ SECTIONS {
         *(.rodata.*)
     } > ram
 
+    . = ALIGN(0x10);
     .eh_frame : {
+        PROVIDE(_eh_frame = .);
         *(.eh_frame)
+        PROVIDE(_eh_frame_len = SIZEOF(.eh_frame));
     } > ram
 
+    . = ALIGN(0x10);
     .eh_frame_hdr : {
+        PROVIDE(_eh_frame_hdr = .);
         *(.eh_frame_hdr)
     } > ram
 

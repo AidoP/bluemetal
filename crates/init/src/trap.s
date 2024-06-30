@@ -2,4 +2,5 @@
 
 .global _trap
 _trap:
-    call trap
+    wfi
+    j _trap

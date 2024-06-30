@@ -1,13 +1,12 @@
 #![no_std]
 #![no_main]
 
-extern crate panic;
-
-pub mod trap;
+extern crate init;
+use ::serial::prelude::*;
 
 #[no_mangle]
-extern "C" fn entry(hart_id: usize) -> ! {
-    let serial = serial::sifive_uart(0).unwrap();
-    let _ = writeln!(serial, "Hello, Hart {hart_id}!");
+fn bluemetal(hart_id: usize) -> ! {
+    println!("Hello, Hart {hart_id}!");
+
     todo!();
 }

@@ -7,7 +7,7 @@ name = "bluemetal"
 version = "0.1.0"
 dependencies = [
  "configure",
- "panic",
+ "init",
  "serial",
 ]
 
@@ -25,9 +25,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "init"
+version = "0.0.0"
+dependencies = [
+ "configure",
+ "panic",
+ "serial",
+]
+
+[[package]]
 name = "panic"
 version = "0.1.0"
 dependencies = [
+ "configure",
  "serial",
 ]
 

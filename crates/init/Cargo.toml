@@ -1,17 +1,14 @@
 [package]
-name = "bluemetal"
-version = "0.1.0"
+name = "init"
+version = "0.0.0"
 edition = "2021"
-license = "MIT"
 
-[[bin]]
-name = "bluemetal"
+[lib]
+path = "src/lib.rs"
 test = false
 
-[features]
-
 [dependencies]
-init = { path = "../init" }
+panic = { path = "../panic" }
 serial = { path = "../serial" }
 
 [build-dependencies]
