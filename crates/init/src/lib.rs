@@ -15,3 +15,8 @@ extern "C" fn init(hart_id: usize) -> ! {
     ::serial::init();
     unsafe { bluemetal(hart_id) }
 }
+
+#[no_mangle]
+extern "C" fn trap(mepc: usize, mcause: usize) -> ! {
+    panic!("hardware interrupt!\nmepc: 0x{mepc:016x}, mcause: 0x{mcause:016x}");
+}

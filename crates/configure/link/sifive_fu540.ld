@@ -32,6 +32,13 @@ SECTIONS {
         *(.eh_frame_hdr)
     } > ram
 
+    .data : ALIGN(0x1000) {
+        *(.data .data.*)
+        . = ALIGN(16);
+        PROVIDE(__global_pointer$ = . + 0x800);
+        *(.sdata .sdata.*)
+    } > ram
+
     . = ALIGN(0x1000);
     .bss : {
         PROVIDE(_bss_start = .);
