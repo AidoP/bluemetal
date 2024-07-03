@@ -1,1 +1,3 @@
 /target
+/profile/default.toml
+/profile/dev-*

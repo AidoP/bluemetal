@@ -1,0 +1,8 @@
+[package]
+name = "configure_cli"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.8", features = ["derive"] }
+configure_options = { path = "../options" }

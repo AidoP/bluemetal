@@ -1,0 +1,8 @@
+[package]
+name = "configure_options"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0.203", features = ["derive"] }
+toml = { version = "0.8.14", features = ["parse"], default-features = false }

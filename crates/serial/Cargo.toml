@@ -8,4 +8,4 @@ path = "src/lib.rs"
 test = false
 
 [build-dependencies]
-configure = { path = "../configure", features = ["fix-build-dep-bug"] }
+configure = { path = "../../configure/build" }

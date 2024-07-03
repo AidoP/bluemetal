@@ -1,0 +1,7 @@
+[package]
+name = "configure_tui"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+ratatui = "0.27.0"

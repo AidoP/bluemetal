@@ -11,4 +11,4 @@ test = false
 serial = { path = "../serial" }
 
 [build-dependencies]
-configure = { path = "../configure", features = ["fix-build-dep-bug"] }
+configure = { path = "../../configure/build" }

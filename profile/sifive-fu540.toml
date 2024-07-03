@@ -1,0 +1,11 @@
+machine = "sifive-fu540"
+target = "riscv64"
+linker-script = "sifive_fu540.ld"
+entry = { "name" = "riscv-machine-mode" }
+
+[compiler]
+compiler = "clang"
+flags = ["-Wno-unused-command-line-argument", "-mabi=lp64d"]
+
+[[device]]
+name = "sifive_uart"

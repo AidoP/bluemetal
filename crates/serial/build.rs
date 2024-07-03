@@ -1,4 +1,4 @@
 fn main() {
-    let machine = configure::Machine::configure();
-    machine.features();
+    configure::Profile::load()
+        .cfg();
 }

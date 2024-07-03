@@ -77,4 +77,4 @@ pub mod sifive_uart;
 #[cfg(target_device = "sifive_uart")]
 pub use sifive_uart::sifive_uart;
 #[cfg(not(target_device = "sifive_uart"))]
-pub fn sifive_uart(_: usize) -> Option<Device> { None }
+pub fn sifive_uart(_: usize) -> Option<&'static dyn Serial> { None }

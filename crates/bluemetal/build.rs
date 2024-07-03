@@ -1,5 +1,5 @@
 fn main() {
-    let machine = configure::Machine::configure();
-    machine.bin_args();
-    machine.features();
+   configure::Profile::load()
+       .cfg()
+       .bin();
 }
