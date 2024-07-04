@@ -1,5 +1,5 @@
 fn main() {
-    configure::Profile::load()
+    configure::Config::load()
         .cfg()
         .library("debug", &[
             "src/debug.s",

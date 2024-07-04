@@ -1,4 +1,4 @@
-use std::{error::Error, os::unix::process::CommandExt, path::{Path, PathBuf}, process::ExitCode};
+use std::{os::unix::process::CommandExt, path::{Path, PathBuf}, process::ExitCode};
 
 use clap::{Parser, Subcommand};
 use configure_options::Profile;

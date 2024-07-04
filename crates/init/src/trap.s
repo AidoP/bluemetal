@@ -1,2 +1,0 @@
-.section .text, "ax", %progbits
-

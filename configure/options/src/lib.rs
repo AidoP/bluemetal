@@ -1,4 +1,4 @@
-use std::{ffi::OsString, fmt::Display, path::PathBuf};
+use std::{fmt::Display, path::PathBuf};
 
 use serde::Deserialize;
 
@@ -44,7 +44,6 @@ pub struct Profile {
     /// Compiler options for `cc`.
     pub compiler: Option<Compiler>,
     pub runner: Vec<String>,
-    pub entry: Entry,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -78,35 +77,35 @@ impl Display for Target {
         }
     }
 }
-#[derive(Debug, Deserialize)]
-#[serde(tag = "name")]
-pub enum Device {
-    #[serde(rename = "sifive_uart")]
-    SifiveUart,
-    #[serde(rename = "uart16550")]
-    Uart16550,
-}
-impl Device {
-    pub fn cfg(&self) -> &str {
-        match self {
-            Self::SifiveUart => "sifive_uart",
-            Self::Uart16550 => "uart16550",
+macro_rules! devices {
+    ($($ident:ident = $name:literal,)*) => {
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "name")]
+        pub enum Device {
+            $(
+                #[serde(rename = $name)]
+                $ident,
+            )*
         }
-    }
-}
-#[allow(non_camel_case_types)]
-#[derive(Debug, Deserialize)]
-#[serde(tag = "name")]
-pub enum Entry {
-    #[serde(rename = "riscv-machine-mode")]
-    RiscvMachineMode,
-}
-impl Entry {
-    pub fn file_name(&self) -> &str {
-        match self {
-            Self::RiscvMachineMode => "riscv_m.s",
+        impl Device {
+            pub fn cfg(&self) -> &str {
+                match self {
+                    $(
+                        Self::$ident => $name,
+                    )*
+                }
+            }
+            pub const fn all() -> &'static [&'static str] {
+                &[
+                    $(stringify!($name),)*
+                ]
+            }
         }
-    }
+    };
+}
+devices!{
+    UartSifive = "sifive_uart",
+    Uart16550 = "uart16550",
 }
 
 #[derive(Debug, Deserialize)]

@@ -1,10 +1,13 @@
+pub use configure_options as profile;
+pub use profile::Profile;
+
 const PKG_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
-pub struct Profile {
+pub struct Config {
     build: cc::Build,
-    profile: configure_options::Profile
+    profile: Profile,
 }
-impl Profile {
+impl Config {
     pub fn load() -> Self {
         const PROFILE: &str = include_str!(concat!("../../../", env!("BLUEMETAL_PROFILE")));
         let mut build = cc::Build::new();
@@ -22,8 +25,12 @@ impl Profile {
             profile,
         }
     }
+    pub fn profile(&self) -> &Profile {
+        &self.profile
+    }
     pub fn cfg(&self) -> &Self {
         println!("cargo::rustc-cfg=target_machine={:?}", self.profile.machine.cfg());
+        println!("cargo::rustc-check-cfg=cfg(target_device, values({}))", profile::Device::all().join(", "));
         for device in &self.profile.device {
             println!("cargo::rustc-cfg=target_device={:?}", device.cfg());
         }
@@ -40,14 +47,6 @@ impl Profile {
         for path in paths {
             println!("cargo::rerun-if-changed={path:?}");
         }
-        self
-    }
-    /// Build the runtime library for `init`.
-    pub fn libinit(&self) -> &Self {
-        self.library("init", &[
-            &format!("src/init/{}", self.profile.entry.file_name()),
-            "src/trap.s",
-        ]);
         self
     }
 }

@@ -1,4 +1,4 @@
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "riscv32"))]
 #[no_mangle]
 extern "C" fn trap_early_panic(trap_pc: usize, trap_cause: usize) -> ! {
     extern "C" {

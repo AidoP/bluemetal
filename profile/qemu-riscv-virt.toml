@@ -1,9 +1,8 @@
 machine = "qemu-virt"
 target = "riscv64"
 linker-script = "riscv_virt.ld"
-entry = { "name" = "riscv-machine-mode" }
 
-runner = ["qemu-system-riscv64", "-s", "-machine", "virt", "-m", "128M", "-display", "none", "-serial", "stdio", "-bios", "{{BLUEMETAL_IMAGE}}"]
+runner = ["qemu-system-riscv64", "-machine", "virt", "-m", "128M", "-display", "none", "-serial", "stdio", "-bios", "{{BLUEMETAL_IMAGE}}"]
 
 [compiler]
 compiler = "clang"
