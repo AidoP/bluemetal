@@ -3,6 +3,8 @@ target = "riscv64"
 linker-script = "sifive_fu540.ld"
 entry = { "name" = "riscv-machine-mode" }
 
+runner = ["qemu-system-riscv64", "-s", "-machine", "sifive_u", "-m", "128M", "-display", "none", "-serial", "stdio", "-bios", "{{BLUEMETAL_IMAGE}}"]
+
 [compiler]
 compiler = "clang"
 flags = ["-Wno-unused-command-line-argument", "-mabi=lp64d"]

@@ -6,7 +6,7 @@
 #![allow(dead_code)]
 
 use core::{cell::UnsafeCell, fmt, mem::MaybeUninit};
-use crate::Serial;
+use crate::{uart16550, Serial};
 
 /// The global serial device.
 static GLOBAL: Global = Global::new();
@@ -20,7 +20,7 @@ pub fn global() -> &'static Global {
 pub fn init() {
     use crate::sifive_uart;
     let device = sifive_uart(0)
-        .or_else(|| sifive_uart(1));
+        .or_else(|| uart16550(0));
     let global = GLOBAL.lock();
     global.0.device = device;
 }

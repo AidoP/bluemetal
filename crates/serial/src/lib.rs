@@ -78,3 +78,10 @@ pub mod sifive_uart;
 pub use sifive_uart::sifive_uart;
 #[cfg(not(target_device = "sifive_uart"))]
 pub fn sifive_uart(_: usize) -> Option<&'static dyn Serial> { None }
+
+#[cfg(target_device = "uart16550")]
+pub mod uart16550;
+#[cfg(target_device = "uart16550")]
+pub use uart16550::uart16550;
+#[cfg(not(target_device = "uart16550"))]
+pub fn uart16550(_: usize) -> Option<&'static dyn Serial> { None }

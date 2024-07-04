@@ -1,12 +1,21 @@
-use std::{fmt::Display, path::PathBuf};
+use std::{ffi::OsString, fmt::Display, path::PathBuf};
 
 use serde::Deserialize;
 
 #[derive(Debug)]
 pub enum Error {
     InvalidPath(PathBuf, std::io::Error),
-    Toml(toml::de::Error),
+    ParseToml(toml::de::Error),
 }
+impl Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidPath(path, e) => write!(f, "invalid path {path:?}: {e}"),
+            Self::ParseToml(e) => Display::fmt(e, f),
+        }
+    }
+}
+impl std::error::Error for Error {}
 
 pub fn load(profile: &str) -> Result<(PathBuf, Profile), Error> {
     let path = if profile.contains('/') {
@@ -18,10 +27,10 @@ pub fn load(profile: &str) -> Result<(PathBuf, Profile), Error> {
         path
     };
     let raw = std::fs::read_to_string(&path).map_err(|e| Error::InvalidPath(path.clone(), e))?;
-    toml::from_str(&raw).map(|profile| (path, profile)).map_err(Error::Toml)
+    toml::from_str(&raw).map(|profile| (path, profile)).map_err(Error::ParseToml)
 }
 pub fn from_str(profile: &str) -> Result<Profile, Error> {
-    toml::from_str(&profile).map_err(Error::Toml)
+    toml::from_str(&profile).map_err(Error::ParseToml)
 }
 
 #[derive(Debug, Deserialize)]
@@ -30,9 +39,11 @@ pub struct Profile {
     pub target: Target,
     #[serde(rename = "linker-script")]
     pub linker_script: String,
+    #[serde(default)]
     pub device: Vec<Device>,
     /// Compiler options for `cc`.
     pub compiler: Option<Compiler>,
+    pub runner: Vec<String>,
     pub entry: Entry,
 }
 
@@ -72,11 +83,14 @@ impl Display for Target {
 pub enum Device {
     #[serde(rename = "sifive_uart")]
     SifiveUart,
+    #[serde(rename = "uart16550")]
+    Uart16550,
 }
 impl Device {
     pub fn cfg(&self) -> &str {
         match self {
             Self::SifiveUart => "sifive_uart",
+            Self::Uart16550 => "uart16550",
         }
     }
 }

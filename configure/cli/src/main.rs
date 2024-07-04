@@ -1,4 +1,4 @@
-use std::{os::unix::process::CommandExt, path::{Path, PathBuf}};
+use std::{error::Error, os::unix::process::CommandExt, path::{Path, PathBuf}, process::ExitCode};
 
 use clap::{Parser, Subcommand};
 use configure_options::Profile;
@@ -20,9 +20,15 @@ enum Command {
     },
 }
 
-fn main() {
+fn main() -> std::process::ExitCode {
     let args = Args::parse();
-    let (path, profile) = configure_options::load(&args.profile).unwrap();
+    let (path, profile) = match configure_options::load(&args.profile) {
+        Err(error) => {
+            eprintln!("failed to load profile {:?}: {error}", args.profile);
+            return ExitCode::FAILURE;
+        },
+        Ok((path, profile)) => (path, profile),
+    };
 
     match args.command {
         Command::Build {  } => {
@@ -35,6 +41,7 @@ fn main() {
             cargo_runner(&profile, &path);
         },
     }
+    ExitCode::SUCCESS
 }
 
 fn build(path: &Path, profile: &Profile) {
@@ -73,17 +80,17 @@ fn run(path: &Path, profile: &Profile) {
 }
 fn cargo_runner(profile: &Profile, path: &Path) {
     use std::process::Command;
-    Command::new("qemu-system-riscv64")
-        .arg("-s")
-        .arg("-machine")
-        .arg("sifive_u")
-        .arg("-m")
-        .arg("128M")
-        .arg("-display")
-        .arg("none")
-        .arg("-serial")
-        .arg("stdio")
-        .arg("-bios")
-        .arg(path)
-        .exec();
+    let args = profile.runner.as_slice();
+    let Some(program) = args.get(0) else {
+        panic!("no runner provided for this profile");
+    };
+    let mut command = Command::new(program);
+    for arg in &args[1..] {
+        if arg == "{{BLUEMETAL_IMAGE}}" {
+            command.arg(path);
+        } else {
+            command.arg(arg);
+        }
+    }
+    command.exec();
 }
