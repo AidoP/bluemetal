@@ -37,6 +37,9 @@ impl Profile {
     }
     pub fn library(&self, name: &str, paths: &[&str]) -> &Self {
         self.build.clone().files(paths).compile(name);
+        for path in paths {
+            println!("cargo::rerun-if-changed={path:?}");
+        }
         self
     }
     /// Build the runtime library for `init`.
