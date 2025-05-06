@@ -15,6 +15,9 @@ struct Args {
 enum Command {
     Build { },
     Run { },
+    Test {
+        tests: Vec<String>,
+    },
     CargoRunner {
         path: PathBuf,
     },
@@ -39,6 +42,11 @@ fn main() -> std::process::ExitCode {
         },
         Command::CargoRunner { path } => {
             cargo_runner(&profile, &path);
+        },
+        Command::Test {
+            tests,
+        } => {
+            test(&path, &profile, &tests);
         },
     }
     ExitCode::SUCCESS
@@ -78,6 +86,27 @@ fn run(path: &Path, profile: &Profile) {
     let error = command.exec();
     panic!("failed to run cargo: {error}");
 }
+fn test(path: &Path, profile: &Profile, tests: &[String]) {
+    use std::process::Command;
+
+//build-std = ["core", "compiler_builtins"]
+//build-std-features = ["compiler-builtins-mem", "panic-unwind"]
+    let mut command = Command::new("cargo");
+    command.arg("+nightly")
+        .arg("test")
+        .arg(format!("--target=configure/build/target/{}", profile.target))
+        .arg("-Zbuild-std=core,compiler_builtins")
+        .arg("-Zbuild-std-features=compiler-builtins-mem,panic-unwind")
+        .arg("--package=bluemetal")
+        .arg("--package=system")
+        .env("BLUEMETAL_PROFILE", path);
+    for test in tests {
+        command.arg(format!("{test}"));
+    }
+    println!("command: {command:?}");
+    let error = command.exec();
+    panic!("failed to run cargo: {error}");
+}
 fn cargo_runner(profile: &Profile, path: &Path) {
     use std::process::Command;
     let args = profile.runner.as_slice();
@@ -92,5 +121,6 @@ fn cargo_runner(profile: &Profile, path: &Path) {
             command.arg(arg);
         }
     }
-    command.exec();
+    let error = command.exec();
+    panic!("failed to run image: {error}");
 }

@@ -14,13 +14,7 @@ pub fn global() -> &'static Global {
     &GLOBAL
 }
 
-/// Initialise the global serial device.
-///
-/// Required for the [`print!`] and [`println!`] macros to work correctly.
-pub fn init() {
-    use crate::sifive_uart;
-    let device = sifive_uart(0)
-        .or_else(|| uart16550(0));
+pub fn set_global(device: Option<&'static dyn Serial>) {
     let global = GLOBAL.lock();
     global.0.device = device;
 }

@@ -8,6 +8,24 @@ _init:
     // use only 1 hart
     bnez a0, _hang
 
+    // `a1` **may** contain the address of a DTB
+    // attempt to test it for the DTB header magic
+    la t0, 1f
+    csrw mtvec, t0
+    lw t0, 0(a1)
+    lw t1, dtb_magic
+    beq t1, t0, 2f
+    j 1f
+dtb_magic:
+    .byte 0xd0, 0x0d, 0xfe, 0xed
+    .align 4
+1:
+    // `a1` is not a DTB so leave it as `None`
+    mv a1, zero
+2:
+
+    csrw mscratch, a1
+
     // set early trap vector
     la t0, _trap_early_panic
     csrw mtvec, t0
@@ -44,3 +62,7 @@ _init:
     // init(hart_id: a0) -> !
     j init
 
+.global _hang
+_hang:
+    wfi
+    j _hang

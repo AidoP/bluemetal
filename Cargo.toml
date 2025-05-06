@@ -1,6 +1,9 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = ["configure/*", "crates/*"]
+
+[workspace.dependencies]
+configure = { path = "configure/build" }
 
 [workspace.metadata.rust-analyzer]
 cargo.allTargets = false

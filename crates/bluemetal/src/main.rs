@@ -3,10 +3,11 @@
 
 extern crate init;
 use ::serial::prelude::*;
+use system::System;
 
 #[no_mangle]
-fn bluemetal(hart_id: usize) -> ! {
-    println!("Hello, Hart {hart_id}!");
-
+fn bluemetal(system: &System) -> ! {
+    println!("{:?}", system);
+    println!("{:?}", system.memory());
     todo!();
 }

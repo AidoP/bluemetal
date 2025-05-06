@@ -24,19 +24,27 @@ pub fn load(profile: &str) -> Result<(PathBuf, Profile), Error> {
         let mut path = PathBuf::from("profile/");
         path.push(profile);
         path.set_extension("toml");
-        path
+        match std::fs::canonicalize(&path) {
+            Ok(path) => path,
+            Err(error) => panic!("invalid profile {path:?}: {error}"),
+        }
     };
     let raw = std::fs::read_to_string(&path).map_err(|e| Error::InvalidPath(path.clone(), e))?;
     toml::from_str(&raw).map(|profile| (path, profile)).map_err(Error::ParseToml)
 }
 pub fn from_str(profile: &str) -> Result<Profile, Error> {
-    toml::from_str(&profile).map_err(Error::ParseToml)
+    toml::from_str(profile).map_err(Error::ParseToml)
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Profile {
     pub machine: Machine,
     pub target: Target,
+    /// Path to the system description table to embed, if any.
+    ///
+    /// Relative paths are relative to `/configure/build/system/`.
+    #[serde(rename = "system-description")]
+    pub system: Option<PathBuf>,
     #[serde(rename = "linker-script")]
     pub linker_script: String,
     #[serde(default)]

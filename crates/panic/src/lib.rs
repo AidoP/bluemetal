@@ -3,14 +3,14 @@
 #![feature(lang_items)]
 
 #[lang = "eh_personality"]
-#[no_mangle]
+#[unsafe(no_mangle)]
 unsafe extern "C" fn rust_eh_personality() {}
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 unsafe extern "C" fn _Unwind_Resume() {}
 
-extern "C" {
-    fn _hang() -> !;
+unsafe extern "C" {
+    unsafe fn _hang() -> !;
 }
 
 #[panic_handler]

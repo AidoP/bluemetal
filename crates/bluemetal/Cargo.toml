@@ -1,7 +1,7 @@
 [package]
 name = "bluemetal"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 
 [[bin]]
@@ -13,6 +13,10 @@ test = false
 [dependencies]
 init = { path = "../init" }
 serial = { path = "../serial" }
+system = { path = "../system" }
+
+[target.'cfg(any(target_arch = "riscv32", target_arch = "riscv64"))'.dependencies]
+riscv = { path = "../riscv" }
 
 [build-dependencies]
 configure = { path = "../../configure/build" }

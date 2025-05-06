@@ -1,15 +1,25 @@
 [package]
 name = "init"
 version = "0.0.0"
-edition = "2021"
+edition = "2024"
 
 [lib]
 path = "src/lib.rs"
 test = false
 
+[features]
+default = ["dtb"]
+dtb = ["dep:device_tree"]
+uefi = []
+
 [dependencies]
+device_tree = { path = "../device_tree", optional = true }
 panic = { path = "../panic" }
 serial = { path = "../serial" }
+system = { path = "../system" }
+
+[target.'cfg(any(target_arch = "riscv32", target_arch = "riscv64"))'.dependencies]
+riscv = { path = "../riscv" }
 
 [build-dependencies]
-configure = { path = "../../configure/build" }
+configure.workspace = true

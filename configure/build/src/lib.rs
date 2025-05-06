@@ -1,3 +1,5 @@
+use std::{io::Write, os::unix::ffi::OsStrExt, path::PathBuf, str::FromStr};
+
 pub use configure_options as profile;
 pub use profile::Profile;
 
@@ -9,9 +11,11 @@ pub struct Config {
 }
 impl Config {
     pub fn load() -> Self {
-        const PROFILE: &str = include_str!(concat!("../../../", env!("BLUEMETAL_PROFILE")));
+        let mut profile = PathBuf::from_str("../../../").unwrap();
+        profile.push(env!("BLUEMETAL_PROFILE"));
+        let profile = std::fs::read_to_string(profile).expect("unable to read profile specified by `BLUEMETAL_PROFILE`");
         let mut build = cc::Build::new();
-        let profile = configure_options::from_str(PROFILE)
+        let profile = configure_options::from_str(&profile)
             .expect("failed to load configuration profile");
         if let Some(compiler) = &profile.compiler {
             build.compiler(&compiler.compiler);
@@ -33,6 +37,23 @@ impl Config {
         println!("cargo::rustc-check-cfg=cfg(target_device, values({}))", profile::Device::all().join(", "));
         for device in &self.profile.device {
             println!("cargo::rustc-cfg=target_device={:?}", device.cfg());
+        }
+        println!("cargo::rustc-check-cfg=cfg(has_system_description)");
+        if let Some(system) = &self.profile.system {
+            println!("cargo::rustc-cfg=has_system_description");
+            let mut path;
+            if system.is_relative() {
+                path = PathBuf::from_str(env!("CARGO_MANIFEST_DIR")).unwrap();
+                path.push("system/");
+                path.push(system);
+            } else {
+                path = system.to_owned();
+            }
+            print!("cargo::rustc-env=BLUEMETAL_SYSTEM_DESCRIPTION=");
+            let path = path.as_os_str().as_bytes();
+            assert!(!path.contains(&b'\n'), "invalid path specified for `system-description`");
+            std::io::stdout().write_all(path).unwrap();
+            println!()
         }
         self
     }

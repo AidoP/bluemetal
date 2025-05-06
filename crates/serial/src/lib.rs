@@ -3,7 +3,7 @@
 #![feature(allow_internal_unstable)]
 
 mod global;
-pub use global::{global, init, print_fmt};
+pub use global::{global, print_fmt, set_global};
 
 pub mod prelude {
     pub use crate::{print, println};

@@ -5,6 +5,8 @@ configure-tui profile="default":
 
 build profile="default":
     cargo run -q --bin=configure_cli --profile=configure -- '{{profile}}' build
+test profile="default" *tests="":
+    cargo run -q --bin=configure_cli --profile=configure -- '{{profile}}' test {{tests}}
 run profile="default":
     cargo run -q --bin=configure_cli --profile=configure -- '{{profile}}' run
 cargo-runner path:
