@@ -2,15 +2,15 @@
 
 ## Building
 
-The build system is a single-crate binary at `dev/main.rs` with a shebang to
-compile itself as `bs`.
-
-After bootstrapping the build system will recompile itself as needed.
+First, the build system itself needs to be compiled. It is a standalone Rust
+program.
 
 ```sh
-# Bootstrap
-./dev/main.rs
+rustc -o bs dev/main.rs
+```
 
-# Build
-./bs -g rv64
+Now configure a build environment.
+
+```sh
+./bs -p rv64
 ```

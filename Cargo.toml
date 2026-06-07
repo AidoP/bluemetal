@@ -1,0 +1,7 @@
+[package]
+name = "dict"
+edition = "2024"
+
+[[bin]]
+name = "bs"
+path = "src/bs/main.rs"

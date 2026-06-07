@@ -1,234 +1,180 @@
-#!/usr/bin/env -S rustc -o bs -O --edition=2024
-use std::cell::RefCell;
-use std::ffi::OsString;
-use std::path::PathBuf;
-use std::path::Path;
-use std::io::IsTerminal;
 use std::process::ExitCode;
+use std::ffi::OsStr;
+use std::ffi::OsString;
+use std::io::IsTerminal;
+use std::io::Write;
+use std::ops::ControlFlow;
 
-// mod build;
-mod dag;
-mod db;
-mod log;
-mod job;
-pub mod tool;
-
-pub use tool::{
-    Command,
-    Rust,
-    Phony,
-};
-pub use job::JobPool;
-
-pub use dag::*;
-pub use log::Sev;
-
-pub struct Config {
+struct Options {
+    /// The name of the program that was executed.
     program: OsString,
-    stream: RefCell<Box<dyn std::io::Write>>,
-    color: bool,
-    verbose: bool,
-    debug: bool,
-    /// Allow the build system to rebuild and re-exec itself.
-    /// Typically only disabled by the build system to prevent recursive rebuilds.
-    bootstrap: bool,
-
-    source_root: PathBuf,
+    /// Use ANSI escape sequences.
+    ansi: bool,
 }
-impl Config {
-    /// Log a message, and return the configured severity of that message.
-    ///
-    /// If a message is [`Sev::Fatal`] it will not be downgraded.
-    pub fn log<F: std::fmt::Display>(&self, id: Option<&str>, sev: Sev, f: F) -> Sev {
-        let mut accent = "";
-        let mut highlight = "";
-        let mut reset = "";
-        let mut bold = "";
-        let mut normal = "";
-        if self.color {
-            accent = sev.accent();
-            highlight = "\x1b[95m";
-            bold = "\x1b[1m";
-            normal = "\x1b[22m";
-            reset = "\x1b[0m";
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            program: "bs".into(),
+            ansi: false,
         }
-        let sev_str = sev.as_str();
-        let mut s = self.stream.borrow_mut();
-        write!(s, "{accent}{sev_str}").unwrap();
-        if let Some(id) = id {
-            write!(s, " [{bold}{id}{normal}]").unwrap();
-        }
-        writeln!(s, ":{reset} {f}").unwrap();
-        if self.debug {
-            let backtrace = std::backtrace::Backtrace::force_capture();
-            writeln!(s, "{highlight}Stack backtrace:{reset}\n{backtrace}").unwrap();
-        }
-        sev
-    }
-    pub fn fatal<F: std::fmt::Display>(&self, f: F) {
-        let _ = self.log(None, Sev::Fatal, f);
-    }
-    pub fn error<F: std::fmt::Display>(&self, f: F) {
-        let _ = self.log(None, Sev::Error, f);
-    }
-    pub fn warn<F: std::fmt::Display>(&self, f: F) {
-        let _ = self.log(None, Sev::Warning, f);
-    }
-    pub fn info<F: std::fmt::Display>(&self, f: F) {
-        let _ = self.log(None, Sev::Info, f);
     }
 }
 
-macro_rules! invalid_usage {
-    ($config:expr, $fmt:literal $($args:tt)*) => {
-        {
-            $config.fatal(format_args!(concat!("invalid usage: ", $fmt) $($args)*));
-            $crate::help($config);
-        }
-    };
+enum ArgError {
+    Unexpected(OsString),
+    MissingValue,
 }
+impl core::fmt::Display for ArgError {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self {
+            Self::Unexpected(arg) => write!(f, "unexpected {arg:?}"),
+            Self::MissingValue => write!(f, "missing value"),
+        }
+    }
+}
+
+struct Arg {
+    name: &'static str,
+    long: Option<&'static str>,
+    short: Option<char>,
+    /// The number of times the argument can be used as a positional argument.
+    count: usize,
+    help: &'static str,
+    info: Option<&'static str>,
+    process: fn(Option<&OsStr>, &mut Options) -> Result<ControlFlow<ExitCode>, ArgError>,
+}
+
+const ARGS: &[Arg] = &[
+    Arg {
+        name: "color",
+        long: Some("color"),
+        short: None,
+        count: 0,
+        help: "Enable emitting ANSI escape character.
+The default (auto) uses escape characters if the output device is a terminal.",
+        info: Some("auto,always,never"),
+        process: |_, options| {
+            help(&mut std::io::stdout(), options);
+            Ok(ControlFlow::Break(ExitCode::SUCCESS))
+        },
+    },
+    Arg {
+        name: "help",
+        long: Some("help"),
+        short: Some('h'),
+        count: 0,
+        help: "Print this help text.",
+        info: None,
+        process: |_, options| {
+            help(&mut std::io::stdout(), options);
+            Ok(ControlFlow::Break(ExitCode::SUCCESS))
+        },
+    },
+];
 
 fn main() -> ExitCode {
+    let mut options = Options::default();
     let mut args = std::env::args_os();
-    let program = args.next().unwrap_or_else(|| "build".into());
-
-    let stream = std::io::stderr();
-    let color = stream.is_terminal();
-
-    let mut source_root = Path::new(&program).parent().unwrap_or_else(|| Path::new("")).to_path_buf();
-    if source_root.as_path() == "." {
-        source_root.clear();
+    let mut stderr = std::io::stderr();
+    if let Some(program) = args.next() {
+        options.program = program;
     }
 
-    let mut config = Config {
-        program,
-        stream: RefCell::new(Box::new(stream)),
-        color,
-        debug: std::env::var_os("BLUEMETAL_DEBUG").is_some(),
-        verbose: false,
-        bootstrap: true,
-        source_root,
+    if stderr.is_terminal() {
+        options.ansi = true;
+    }
+
+    match parse_args(args, &mut options) {
+        Err(e) => {
+            eprintln!("invalid argument: {e}");
+            help(&mut stderr, &options);
+            return ExitCode::FAILURE;
+        },
+        Ok(ControlFlow::Break(e)) => return e,
+        Ok(ControlFlow::Continue(())) => (),
     };
-
-    let mut targets = Vec::new();
-
-    while let Some(arg) = args.next() {
-        match arg.as_encoded_bytes() {
-            b"--no-bootstrap" => {
-                config.bootstrap = false;
-            },
-            b"-v" => {
-                config.verbose = true;
-            },
-            b"-o" => {
-                let Some(target) = args.next() else {
-                    invalid_usage!(&config, "missing required argument for `-o`");
-                    return ExitCode::FAILURE;
-                };
-                match target.into_string() {
-                    Ok(target) => targets.push(target),
-                    Err(target) => {
-                        invalid_usage!(&config, "invalid target name `{:?}`", target);
-                        return ExitCode::FAILURE;
-                    },
-                };
-            },
-            _ => {
-                invalid_usage!(&config, "unexpected argument {:?}", arg);
-                return ExitCode::FAILURE;
-            }
-        }
-    }
-
-    let mut terminal_pool = JobPool::new(&config);
-
-    // TODO: only bootstrap when dirty.
-    if config.bootstrap && cfg!(unix) {
-        // Rebuild the build system itself first.
-        const BUILD_SYSTEM: &Target = PLAN.find("bs").expect("missing required target `build`");
-        BUILD_SYSTEM.build(&mut terminal_pool).unwrap();
-
-        use std::os::unix::process::CommandExt;
-        let error = std::process::Command::new(&config.program).args(std::env::args_os().skip(1)).arg("--no-bootstrap").exec();
-        config.error(format_args!("failed to hot-reload: {error}"));
-        return ExitCode::FAILURE;
-    }
-
-    if targets.is_empty() {
-        const DEFAULT: &Target = PLAN.find("default").expect("missing required target `default`");
-        todo!("TODO: build all targets in {DEFAULT:#?}");
-    } else {
-        for name in targets {
-            let Some(target) = PLAN.find(&name) else {
-                config.error(format_args!("invalid target {name:?} requested"));
-                return ExitCode::FAILURE;
-            };
-            target.build(&mut terminal_pool).unwrap();
-        }
-    }
-
-    // let db = config.build_root.join("build.db");
-    // let db = match db::Db::new(&config) {
-    //     Ok(db) => db,
-    //     Err(error) => {
-    //         eprintln!("failed to access compilation database {db:?}: {error}");
-    //         return ExitCode::FAILURE;
-    //     }
-    // };
 
     ExitCode::SUCCESS
 }
 
-fn help(config: &Config) {
-    let program = &config.program;
-    let mut s = config.stream.borrow_mut();
-    writeln!(s, "Usage: {program}
+fn parse_args(mut args: std::env::ArgsOs, options: &mut Options) -> Result<ControlFlow<ExitCode>, ArgError> {
+    let mut pos = 0;
+    let mut count = 0;
 
-Options:
-
-    -v
-        Verbose. Print operations before performing tasks.
-
-    --dry-run
-        Do not build, just print what would have been done.
-
-    -g <group>
-        Only build the specified group.
-
-    -o <target>
-        Only build the specified target.
-",
-        program=program.display()
-    ).unwrap();
+    'args: for arg in args {
+        let arg_bytes = arg.as_encoded_bytes();
+        unsafe fn split_arg(s: &[u8]) -> (&OsStr, Option<&OsStr>) {
+            let mut i = 0;
+            while i < s.len() {
+                if s[i] == b'=' {
+                    unsafe {
+                        return (
+                            OsStr::from_encoded_bytes_unchecked(&s[..i]),
+                            Some(OsStr::from_encoded_bytes_unchecked(&s[i+1..]))
+                        );
+                    }
+                }
+                i += 1;
+            }
+            (OsStr::from_encoded_bytes_unchecked(s), None)
+        }
+        if arg_bytes.starts_with(b"--") {
+            let (key, value) = unsafe { split_arg(&arg_bytes[2..]) };
+            for arg in ARGS {
+                let Some(name) = arg.long else {
+                    continue;
+                };
+                if name.as_bytes() == key.as_encoded_bytes() {
+                    match (arg.process)(value, options) {
+                        Ok(ControlFlow::Continue(())) => continue 'args,
+                        Ok(c) => return Ok(c),
+                        Err(error) => break,
+                    }
+                }
+            }
+        } else if arg_bytes.starts_with(b"-") {
+            let (key, value) = unsafe { split_arg(&arg_bytes[1..]) };
+        } else {
+            for a in &ARGS[pos..] {
+                count += 1;
+                if count > a.count {
+                    pos += 1;
+                    count = 0;
+                    continue;
+                }
+                match (a.process)(Some(&arg), options) {
+                    Ok(ControlFlow::Continue(())) => continue 'args,
+                    Ok(c) => return Ok(c),
+                    Err(error) => break,
+                }
+            }
+        };
+        return Err(ArgError::Unexpected(arg));
+    }
+    Ok(ControlFlow::Continue(()))
 }
 
-pub const PLAN: &'static Plan = &Plan::new([
-    Target::new(
-        "bs",
-        &Rust::new("dev/main.rs")
-            .crate_type(tool::rust::CrateType::Bin),
-    ),
-    Target::new(
-        "default",
-        &Phony,
-    ).depends(&[
-        "debug",
-    ]),
-    Target::new(
-        "debug",
-        &Command {
-            program: "echo",
-            args: &[
-                "Hello,",
-                "World!",
-            ],
-        },
-    ).depends(&[
-        "bs",
-    ]),
-    Target::new(
-        "build/example",
-        &Rust::new("example.rs")
-            .crate_type(tool::rust::CrateType::Bin),
-    ),
-]);
+fn help(f: &mut dyn Write, options: &Options) {
+    writeln!(f, "Usage: {program} [OPTION]...", program=options.program.display());
+    for arg in ARGS {
+        let mut seperator = "\n    ";
+        if arg.count > 0 {
+            write!(f, "{seperator}{}", arg.name.to_ascii_uppercase());
+            seperator = ", ";
+        }
+        if let Some(name) = arg.short {
+            write!(f, "{seperator}-{name}");
+            seperator = ", ";
+        }
+        if let Some(name) = arg.long {
+            write!(f, "{seperator}--{name}");
+        }
+        if let Some(info) = arg.info {
+            write!(f, "={info}");
+        }
+        writeln!(f);
+        for line in arg.help.lines() {
+            writeln!(f, "        {}", line);
+        }
+    }
+}

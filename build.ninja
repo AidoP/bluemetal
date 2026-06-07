@@ -1,0 +1,8 @@
+rule rust
+    command = rustc -O -Cdebuginfo=full -Clto=fat -Ccodegen-units=1 -Ctarget-cpu=native --edition=2024 --emit=dep-info=$out.d --emit=link=$out $in
+    deps = gcc
+    depfile = $out.d
+    description = RUST $out
+    pool = console
+
+build bs: rust src/bs/main.rs
