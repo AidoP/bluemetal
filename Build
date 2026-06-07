@@ -1,0 +1,9 @@
+platform riscv64
+
+crate nucleus
+    crate-type bin
+    link-script
+
+crate compiler_builtins
+    disable builtins
+    extern core

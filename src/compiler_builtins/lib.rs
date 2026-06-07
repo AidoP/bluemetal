@@ -1,0 +1,5 @@
+#![allow(internal_features)]
+#![compiler_builtins]
+#![feature(compiler_builtins)]
+#![no_std]
+#![no_builtins]

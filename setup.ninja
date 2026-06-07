@@ -1,0 +1,12 @@
+rule rust
+    command = rustc $flags --color=always -O -Cdebuginfo=full -Clto=fat -Ccodegen-units=1 -Ctarget-cpu=native --edition=2024 --emit=dep-info=$depfile --emit=link=$out $in
+    deps = gcc
+    depfile = $out.d
+    description = RUST $out
+
+build build/setup: rust src/setup/main.rs
+
+rule run
+    command = $in $out
+
+build build.ninja: run build/setup Build

@@ -1,0 +1,4 @@
+/.ninja*
+/build
+/build.ninja
+/config.kdl
