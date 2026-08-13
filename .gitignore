@@ -1,0 +1,5 @@
+/.ninja*
+/build
+/build.ninja
+/flake.lock
+__pycache__
