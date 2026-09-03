@@ -9,18 +9,19 @@
     in {
         devShells.${system}.default = pkgs.mkShell.override { stdenv = pkgs.clangStdenv; } {
             buildInputs = with pkgs; [
+                ccache
                 cmake
-                    ninja
-                    python3
-                    ccache
+                hercules
+                ninja
+                python3
+                python3Packages.python-lsp-server
+                ruff
+                rustup
             ];
 
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
                 pkgs.stdenv.cc.cc.lib
                 pkgs.zlib
-                pkgs.rustup
-                pkgs.ruff
-                pkgs.python3Packages.python-lsp-server
             ];
 
             hardeningDisable = [ "all" ];

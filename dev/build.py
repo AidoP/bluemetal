@@ -8,11 +8,12 @@ import pkgutil
 import subprocess
 import sys
 
+root = Path('build')
 
 class Target:
     def __init__(
         self,
-        name,
+        name: str,
         /,
         builtin: bool = False,
     ):
@@ -20,8 +21,12 @@ class Target:
         self.builtin = builtin
 
 
-    def generate(self, writer: dev.ninja.Writer, root: Path, rule: 'Rule'):
+    def generate(self, writer: dev.ninja.Writer, rule: 'Rule'):
         writer.build(rule.name, outputs=root / self.name)
+
+
+    def __repr__(self) -> str:
+        return str(root / self.name)
 
 
 class Rule:
@@ -50,6 +55,41 @@ class Rule:
         return target
 
 
+class Command(Rule):
+    def __init__(
+        self,
+        name: str,
+        *args: str | Target,
+        info: str | None = None,
+    ):
+        super().__init__(name)
+        self.args = args
+        self.info = info
+        self.deps = set(str(arg) for arg in args if isinstance(arg, Target))
+
+
+    def generate(self, writer: dev.ninja.Writer):
+        writer.rule(
+            self.name,
+            *self.args,
+            description=f"{(self.info or self.name).upper()} $out",
+        )
+
+
+class CustomTarget(Target):
+    def __init__(
+        self,
+        name: str,
+        *inputs: str | Target,
+    ):
+        super().__init__(name)
+        self.inputs = inputs
+
+
+    def generate(self, writer: dev.ninja.Writer, rule: Rule):
+        writer.build(rule.name, outputs=root / self.name, inputs=self.inputs, dependencies=rule.deps)
+
+
 _sysroot = subprocess.run(['rustc', '--print=sysroot'], check=True, capture_output=True, encoding='utf-8').stdout.strip()
 _rust_src = Path(_sysroot) / 'lib/rustlib/src/rust'
 _host_tuple = subprocess.run(['rustc', '--print=host-tuple'], check=True, capture_output=True, encoding='utf-8').stdout.strip()
@@ -57,30 +97,37 @@ _host_tuple = subprocess.run(['rustc', '--print=host-tuple'], check=True, captur
 class Rust(Rule):
     def __init__(
         self,
-        name: str,
+        name: str | None = None,
         *,
         target: str | None = None,
         flags: list[str] | None = None,
+        unstable: bool = False,
     ):
-        super().__init__(f"rust-{name}")
+        super().__init__(f"rust-{name}" if name else 'rust')
         self.info = name
         self.target = target or _host_tuple
         self.flags = flags or []
+        self.unstable = unstable
+        if self.target.endswith('.json'):
+            self.unstable = True
 
 
     def generate(self, writer: dev.ninja.Writer):
+        extra_flags = []
+        if self.unstable:
+            extra_flags.append('-Zunstable-options')
         writer.rule(
             self.name,
             'rustc',
-            '-Dwarnings',
+            # '-Dwarnings',
             '--color=always',
             '--edition=2024',
             f"--target={self.target}",
-            '-Clinker-flavor=ld.lld',
             '--crate-name=$crate_name',
             '--crate-type=$crate_type',
             '--emit=dep-info=$depfile',
             '--emit=link=$out',
+            *extra_flags,
             *self.flags,
             '$flags',
             '$in',
@@ -95,12 +142,12 @@ class Crate(Target):
         name: str,
         source: str,
         /,
-        *,
+        *depends: 'Crate',
         crate_type: Literal['bin', 'rlib'] = 'rlib',
         path: str | None = None,
-        depends: list['Crate'] | None = None,
         builtin: bool = False,
         sysroot: bool = False,
+        link_script: str | None = None,
     ):
         if '/' in name:
             raise ValueError('invalid crate name')
@@ -112,30 +159,39 @@ class Crate(Target):
         super().__init__(name, builtin=builtin)
         self.source = source
         self.crate_type = crate_type
-        self.depends = depends or []
+        self.depends = depends
         self.builtin = builtin
         self.sysroot = sysroot
+        self.link_script = link_script
 
 
-    def generate(self, writer: dev.ninja.Writer, root: Path, rule: Rule):
+    def generate(self, writer: dev.ninja.Writer, rule: Rule):
         assert isinstance(rule, Rust)
         output = root / self.name
         flags = [
             f"--out-dir={output.parent}",
         ]
+        search_path = set()
         deps = []
         if not self.builtin:
             for dep in rule.builtins:
                 path = root / dep.name
                 flags.append(f"--extern={dep.crate_name}={path}")
                 deps.append(path)
+                search_path.add(Path(path).parent)
         for dep in self.depends:
             path = root / dep.name
             flags.append(f"--extern={dep.crate_name}={path}")
             deps.append(path)
+            search_path.add(Path(path).parent)
+        for path in search_path:
+            flags.append(f"-L{path}")
         source = self.source
         if self.sysroot:
             source = _rust_src / source
+        if self.link_script:
+            flags.append(f"-Clink-arg=-T{self.link_script}")
+            deps.append(self.link_script)
         writer.build(
             rule.name,
             outputs=output,
@@ -186,7 +242,7 @@ class Link(Target):
         self.inputs = inputs
 
 
-    def generate(self, writer: dev.ninja.Writer, root: Path, rule: Rule):
+    def generate(self, writer: dev.ninja.Writer, rule: Rule):
         assert isinstance(rule, Linker)
         output = root / self.name
         flags = []
@@ -206,7 +262,6 @@ class Link(Target):
 
 class Project:
     source_dir: Path
-    build_dir: Path
 
     build_files: list[Path]
 
@@ -215,10 +270,8 @@ class Project:
     def __init__(
         self,
         source_dir: Path,
-        build_dir: Path,
     ):
         self.source_dir = source_dir
-        self.build_dir = build_dir
         self.build_files = []
         self.rules = {}
 
@@ -258,10 +311,9 @@ class Project:
                 paths.append(str(p.relative_to(self.source_dir, walk_up=True)))
             return paths
 
-        build_rel = self.build_dir.relative_to(self.source_dir, walk_up=True)
-
         deps = module_deps('Build')
-        with open(self.source_dir / 'build.ninja', 'w') as f:
+        ninja_path = self.source_dir / 'build.ninja.tmp'
+        with open(ninja_path, 'w') as f:
             writer = dev.ninja.Writer(f)
             writer.rule('dev', 'python', '$in', description='Regenerate $out')
             writer.build(
@@ -275,7 +327,8 @@ class Project:
                 rule.generate(writer)
 
                 for target in sorted(rule.targets, key=lambda t: t.name):
-                    target.generate(writer, build_rel, rule)
+                    target.generate(writer, rule)
+        ninja_path.rename(ninja_path.with_suffix(''))
 
 
     def add(self, rule: Rule, /):

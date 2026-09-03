@@ -2,28 +2,43 @@
 """
 Build configuration script.
 """
-from dev.build import Crate, Link, Linker, Project, Rust
+from dev.build import Crate, Command, CustomTarget, Project, Rust
 from pathlib import Path
 
-root = Path(__file__).parent
+import tomllib
 
+
+with open('Config.toml', 'rb') as f:
+    config = tomllib.load(f)
+
+
+with Project(Path(__file__).parent, config.get('build', 'build')) as project:
+    pass
+
+
+
+
+release = True
 
 class Target:
-    def __init__(self, name: str, triple: str):
+    def __init__(self, project: Project, name: str, triple: str):
         self.name = name
         self.triple = triple
 
-
-    def add(self, project: Project):
-        rust = project.add(Rust(
+        flags = ['-Cpanic=abort']
+        if release:
+            flags += [
+                '-O',
+                '-Clto=fat',
+                '-Ccodegen-units=1',
+            ]
+        self.rust = project.add(Rust(
             self.name,
             target=self.triple,
-            flags=[
-                '-Cpanic=abort'
-            ],
+            flags=flags,
         ))
 
-        self.libcore = rust.add(Crate(
+        self.libcore = self.rust.add(Crate(
             'core',
             'library/core/src/lib.rs',
             builtin=True,
@@ -31,32 +46,82 @@ class Target:
             path=self.name,
         ))
 
-        rust.add(Crate(
+        self.rust.add(Crate(
             'compiler_builtins',
             'lib/compiler_builtins/lib.rs',
+            self.libcore,
             builtin=True,
             path=self.name,
-            depends=[self.libcore],
         ))
 
-        self.libnucleus = rust.add(Crate(
+        self.libnucleus = self.rust.add(Crate(
             'nucleus',
-            'sys/nucleus/main.rs',
+            'sys/nucleus/lib.rs',
             path=self.name,
         ))
 
 
-rv64 = Target('rv64', 'riscv64gc-unknown-none-elf')
+class Riscv(Target):
+    def __init__(self, project: Project, name: str, triple: str):
+        super().__init__(project, name, triple)
+        machine_init = self.rust.add(Crate(
+            'machine_init',
+            'sys/init/riscv/machine-mode.rs',
+            path=self.name,
+        ))
+        supervisor_init = self.rust.add(Crate(
+            'supervisor_init',
+            'sys/init/riscv/supervisor-mode.rs',
+            self.libnucleus,
+            path=self.name,
+        ))
 
-with Project(root, root / 'build') as project:
-    linker = project.add(Linker('lld'))
-    for target in (
-        rv64,
-    ):
-        target.add(project)
+        self.rust.add(Crate(
+            'nucleus',
+            'sys/platform/riscv/virt/main.rs',
+            supervisor_init,
+            link_script='sys/platform/riscv/virt/link.ld',
+            path=f"platform/{self.name}/virt",
+            crate_type='bin',
+        ))
 
-    linker.add(Link(
-        'platform/riscv/virt/nucleus',
-        rv64.libnucleus,
-        "sys/platform/riscv/virt.ld",
-    ))
+
+class Systemz(Target):
+    def __init__(self, project: Project, rust: Rust):
+        super().__init__(project, 'systemz', 'sys/arch/systemz/s390x-unknown-none-elf.json')
+        nucleus = self.rust.add(Crate(
+            'nucleus',
+            'sys/arch/systemz/main.rs',
+            self.libnucleus,
+            link_script='sys/arch/systemz/link.ld',
+            path='systemz',
+            crate_type='bin',
+        ))
+
+        mkobj = project.add(Command(
+            'mkobj',
+            rust.add(Crate(
+                'mkobj',
+                'sys/arch/systemz/mkobj.rs',
+                path='systemz',
+                crate_type='bin',
+            )),
+            '-',
+            '$in',
+            '$out',
+            info='MKOBJ',
+        ))
+        dasdload = project.add(Command('dasdload', 'python', 'sys/arch/systemz/dasdload.py', '--ipl-obj', '$in', '$out', info='DASD'))
+        dasdload.add(CustomTarget(
+            'systemz/iplvol.3390',
+            mkobj.add(CustomTarget('arch/systemz/ipl.o', nucleus)),
+        ))
+
+
+with Project(Path(__file__).parent) as project:
+    rust = project.add(Rust())
+
+    riscv64 = Riscv(project, 'riscv64', 'riscv64gc-unknown-none-elf')
+    riscv32 = Riscv(project, 'riscv32', 'riscv32imac-unknown-none-elf')
+
+    # systemz = Systemz(project, rust)

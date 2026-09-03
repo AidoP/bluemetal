@@ -47,12 +47,12 @@ class Writer:
         self,
         name: str,
         /,
-        *command: str,
+        *command,
         depfile: str | None = None,
         **variables: list[str] | str,
     ):
         self._write(f"rule {name}")
-        self.variable('command', ' '.join(command), indent=1)
+        self.variable('command', ' '.join(str(s) for s in command), indent=1)
         if depfile is not None:
             self.variable('deps', 'gcc', indent=1)
             self.variable('depfile', depfile, indent=1)

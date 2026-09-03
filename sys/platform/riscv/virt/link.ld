@@ -1,14 +1,20 @@
 OUTPUT_ARCH(riscv)
-ENTRY(_init)
+ENTRY(_start)
+
+/* SECTIONS */
+/* { */
+/*   . = 0x80200000; */
+/*   .text : { *(.text._start) *(.text) } */
+/* } */
 
 MEMORY {
-    ram (rwx): ORIGIN = 0x80000000, LENGTH = 0x80000
+    ram (rwx): ORIGIN = 0x80200000, LENGTH = 0x80000
 }
 
 SECTIONS {
     . = ALIGN(0x1000);
     .text : {
-        *(.entry)
+        *(.text._start)
         *(.text)
         *(.text.*)
     } > ram
