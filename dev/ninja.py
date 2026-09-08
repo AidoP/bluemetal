@@ -57,9 +57,7 @@ class Writer:
             self.variable('deps', 'gcc', indent=1)
             self.variable('depfile', depfile, indent=1)
         for k, v in variables.items():
-            if not isinstance(v, str):
-                v = ' '.join(v)
-            self.variable(k, v, indent=1)
+            self.variable(k, _make_list(v), indent=1)
 
     def build(
         self,
@@ -80,3 +78,10 @@ class Writer:
                     continue
                 v = ' '.join(v)
             self.variable(k, v, indent=1)
+
+    def subninja(
+        self,
+        path: str | Path,
+        /,
+        ):
+        self._write(f"subninja {path}")

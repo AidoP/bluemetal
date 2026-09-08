@@ -1,0 +1,28 @@
+#!/usr/bin/env python
+"""
+Build configuration script.
+"""
+from dev.build import Project
+from pathlib import Path
+
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument('--config', '-c', default='config.toml', help='path of the configuration file')
+parser.add_argument('build', nargs='?', default='build', help='path of the build output directory')
+args = parser.parse_args()
+
+with Project(Path(__file__).parent, Path(args.build), config=Path(args.config)) as project:
+    core = project.crate(
+        'core',
+        path='library/core/src/lib.rs',
+        builtin=True,
+        sysroot=True,
+    )
+    compiler_builtins = project.crate(
+        'lib/compiler_builtins',
+        builtin=True,
+        deps=[
+            core,
+        ],
+    )
+    project.crate('sys/nucleus')

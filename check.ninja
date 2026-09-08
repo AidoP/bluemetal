@@ -1,0 +1,19 @@
+subninja /main/projects/bluemetal/build.ninja
+rule crate
+  command = rustc --edition=2024 --target=$target --crate-name=$crate_name --crate-type=$crate_type --emit=metadata=$out.rmeta --error-format=json $flags $in || true
+  description = FLYCHECK $crate_name
+  pool = console
+build build/riscv64gc-unknown-none-elf/libcore.rlib.flycheck: crate /home/aidop/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/lib.rs
+  crate_type = lib
+  crate_name = core
+  target = riscv64gc-unknown-none-elf
+build build/riscv64gc-unknown-none-elf/lib/libcompiler_builtins.rlib.flycheck: crate lib/compiler_builtins/lib.rs | build/riscv64gc-unknown-none-elf/libcore.rlib
+  crate_type = lib
+  crate_name = compiler_builtins
+  target = riscv64gc-unknown-none-elf
+  flags = --extern=core=build/riscv64gc-unknown-none-elf/libcore.rlib
+build build/riscv64gc-unknown-none-elf/sys/libnucleus.rlib.flycheck: crate sys/nucleus/lib.rs | build/riscv64gc-unknown-none-elf/lib/libcompiler_builtins.rlib build/riscv64gc-unknown-none-elf/libcore.rlib
+  crate_type = lib
+  crate_name = nucleus
+  target = riscv64gc-unknown-none-elf
+  flags = --extern=compiler_builtins=build/riscv64gc-unknown-none-elf/lib/libcompiler_builtins.rlib --extern=core=build/riscv64gc-unknown-none-elf/libcore.rlib

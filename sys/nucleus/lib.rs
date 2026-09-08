@@ -3,11 +3,7 @@
 //pub mod console;
 //pub mod spinlock;
 
-#[thread_local]
-static A: usize = 0;
-
 pub fn main() -> ! {
-    
     unreachable!();
 }
 

@@ -1,336 +1,277 @@
 from pathlib import Path
 from typing import Literal
 import dev
+from dev.config import Config
 import dev.ninja
-import importlib
-import importlib.util
+import dev.rust_analyzer
 import pkgutil
 import subprocess
-import sys
 
-root = Path('build')
 
-class Target:
+class Crate:
     def __init__(
         self,
         name: str,
+        module: Path,
+        output: Path,
+        crate_type: Literal['bin', 'lib'] = 'lib',
         /,
-        builtin: bool = False,
-    ):
-        self.name = name
-        self.builtin = builtin
-
-
-    def generate(self, writer: dev.ninja.Writer, rule: 'Rule'):
-        writer.build(rule.name, outputs=root / self.name)
-
-
-    def __repr__(self) -> str:
-        return str(root / self.name)
-
-
-class Rule:
-    targets: set[Target]
-    builtins: set[Target]
-    def __init__(
-        self,
-        name: str,
-        /,
-    ):
-        self.name = name
-        self.targets = set()
-        self.builtins = set()
-
-
-    def generate(self, writer: dev.ninja.Writer):
-        pass
-
-
-    def add(self, target: Target):
-        if target.name in self.targets:
-            raise Exception(f"duplicate target `{target.name}`")
-        self.targets.add(target)
-        if target.builtin:
-            self.builtins.add(target)
-        return target
-
-
-class Command(Rule):
-    def __init__(
-        self,
-        name: str,
-        *args: str | Target,
-        info: str | None = None,
-    ):
-        super().__init__(name)
-        self.args = args
-        self.info = info
-        self.deps = set(str(arg) for arg in args if isinstance(arg, Target))
-
-
-    def generate(self, writer: dev.ninja.Writer):
-        writer.rule(
-            self.name,
-            *self.args,
-            description=f"{(self.info or self.name).upper()} $out",
-        )
-
-
-class CustomTarget(Target):
-    def __init__(
-        self,
-        name: str,
-        *inputs: str | Target,
-    ):
-        super().__init__(name)
-        self.inputs = inputs
-
-
-    def generate(self, writer: dev.ninja.Writer, rule: Rule):
-        writer.build(rule.name, outputs=root / self.name, inputs=self.inputs, dependencies=rule.deps)
-
-
-_sysroot = subprocess.run(['rustc', '--print=sysroot'], check=True, capture_output=True, encoding='utf-8').stdout.strip()
-_rust_src = Path(_sysroot) / 'lib/rustlib/src/rust'
-_host_tuple = subprocess.run(['rustc', '--print=host-tuple'], check=True, capture_output=True, encoding='utf-8').stdout.strip()
-
-class Rust(Rule):
-    def __init__(
-        self,
-        name: str | None = None,
         *,
-        target: str | None = None,
-        flags: list[str] | None = None,
-        unstable: bool = False,
-    ):
-        super().__init__(f"rust-{name}" if name else 'rust')
-        self.info = name
-        self.target = target or _host_tuple
-        self.flags = flags or []
-        self.unstable = unstable
-        if self.target.endswith('.json'):
-            self.unstable = True
-
-
-    def generate(self, writer: dev.ninja.Writer):
-        extra_flags = []
-        if self.unstable:
-            extra_flags.append('-Zunstable-options')
-        writer.rule(
-            self.name,
-            'rustc',
-            # '-Dwarnings',
-            '--color=always',
-            '--edition=2024',
-            f"--target={self.target}",
-            '--crate-name=$crate_name',
-            '--crate-type=$crate_type',
-            '--emit=dep-info=$depfile',
-            '--emit=link=$out',
-            *extra_flags,
-            *self.flags,
-            '$flags',
-            '$in',
-            description="RUST $out",
-            depfile='$out.d',
-        )
-
-
-class Crate(Target):
-    def __init__(
-        self,
-        name: str,
-        source: str,
-        /,
-        *depends: 'Crate',
-        crate_type: Literal['bin', 'rlib'] = 'rlib',
-        path: str | None = None,
+        target: str,
+        deps: list['Crate'] = [],
         builtin: bool = False,
-        sysroot: bool = False,
-        link_script: str | None = None,
     ):
-        if '/' in name:
-            raise ValueError('invalid crate name')
-        self.crate_name = name
-        if crate_type == 'rlib':
-            name = f"lib{name}.rlib"
-        if path is not None:
-            name = f"{path}/{name}"
-        super().__init__(name, builtin=builtin)
-        self.source = source
+        self.name = name
+        self.module = module
+        self.output = output
         self.crate_type = crate_type
-        self.depends = depends
+        self.target = target
+        self.deps = deps
         self.builtin = builtin
-        self.sysroot = sysroot
-        self.link_script = link_script
 
 
-    def generate(self, writer: dev.ninja.Writer, rule: Rule):
-        assert isinstance(rule, Rust)
-        output = root / self.name
-        flags = [
-            f"--out-dir={output.parent}",
-        ]
-        search_path = set()
+    def _ninja(self, writer: dev.ninja.Writer, flycheck_writer: dev.ninja.Writer, project: 'Project'):
+        flags = []
         deps = []
         if not self.builtin:
-            for dep in rule.builtins:
-                path = root / dep.name
-                flags.append(f"--extern={dep.crate_name}={path}")
-                deps.append(path)
-                search_path.add(Path(path).parent)
-        for dep in self.depends:
-            path = root / dep.name
-            flags.append(f"--extern={dep.crate_name}={path}")
-            deps.append(path)
-            search_path.add(Path(path).parent)
-        for path in search_path:
-            flags.append(f"-L{path}")
-        source = self.source
-        if self.sysroot:
-            source = _rust_src / source
-        if self.link_script:
-            flags.append(f"-Clink-arg=-T{self.link_script}")
-            deps.append(self.link_script)
+            for crate in project.builtins:
+                flags.append(f"--extern={crate.name}={crate.output}")
+                deps.append(crate.output)
+        for crate in self.deps:
+            flags.append(f"--extern={crate.name}={crate.output}")
+            deps.append(crate.output)
         writer.build(
-            rule.name,
-            outputs=output,
-            inputs=source,
+            'crate',
+            outputs=self.output,
+            inputs=self.module,
             dependencies=deps,
-            crate_name=self.crate_name,
             crate_type=self.crate_type,
+            crate_name=self.name,
+            target=self.target,
+            flags=flags,
+        )
+        flycheck_writer.build(
+            'crate',
+            outputs=str(self.output) + '.flycheck',
+            inputs=self.module,
+            dependencies=deps,
+            crate_type=self.crate_type,
+            crate_name=self.name,
+            target=self.target,
             flags=flags,
         )
 
 
-class Linker(Rule):
-    def __init__(
-        self,
-        name: str,
-        *,
-        program: str = 'ld.lld',
-        flags: list[str] | None = None,
-    ):
-        super().__init__(name)
-        self.program = program
-        self.flags = flags or []
-
-
-    def generate(self, writer: dev.ninja.Writer):
-        writer.rule(
+    def _rust_analyzer(self, rust_analyzer: dev.rust_analyzer.Project, project: 'Project'):
+        deps = set()
+        if not self.builtin:
+            for crate in project.builtins:
+                deps.add(crate.name)
+        for crate in self.deps:
+            deps.add(crate.name)
+        rust_analyzer.crate(
+            self.module,
             self.name,
-            'ld.lld',
-            '-o',
-            '$out',
-            '--dependency-file=$depfile',
-            *self.flags,
-            '$flags',
-            '$in',
-            description='LINK $out',
-            depfile='$out.d',
+            edition='2024',
+            deps=deps,
+            build_info=dev.rust_analyzer.BuildInfo(
+                self.output,
+                self.module,
+                self.crate_type,
+            ),
         )
 
 
-class Link(Target):
-    def __init__(
-        self,
-        name: str,
-        /,
-        *inputs: Target | str | Path,
-    ):
-        super().__init__(name)
-        self.inputs = inputs
-
-
-    def generate(self, writer: dev.ninja.Writer, rule: Rule):
-        assert isinstance(rule, Linker)
-        output = root / self.name
+    def _flycheck(self, project: 'Project') -> str:
         flags = []
-        inputs = []
-        for i in self.inputs:
-            if isinstance(i, Target):
-                inputs.append(root / i.name)
-            else:
-                inputs.append(i)
-        writer.build(
-            rule.name,
-            outputs=output,
-            inputs=inputs,
-            flags=flags,
-        )
+        deps = []
+        if not self.builtin:
+            for crate in project.builtins:
+                flags.append(f"--extern={crate.name}={crate.output}")
+                deps.append(crate.output)
+        for crate in self.deps:
+            flags.append(f"--extern={crate.name}={crate.output}")
+            deps.append(crate.output)
 
 
 class Project:
-    source_dir: Path
-
-    build_files: list[Path]
-
-    rules: dict[str, Rule]
+    includes: list[Path]
+    crates: dict[str, Crate]
+    builtins: set[Crate]
 
     def __init__(
         self,
-        source_dir: Path,
+        root: Path,
+        build: Path,
+        /,
+        config: Path | None = None,
     ):
-        self.source_dir = source_dir
-        self.build_files = []
-        self.rules = {}
+        self.root = root
+        self.build = build
+        self.config_path = config
+        self.includes = []
+        self.crates = {}
+        self.builtins = set()
+        self.config = Config()
 
 
     def __enter__(self):
+        self.config.load(self.config_path)
+        self.sysroot = subprocess.run(['rustc', '--print=sysroot'], check=True, capture_output=True, encoding='utf-8').stdout.strip()
+        self.rust_src = Path(self.sysroot) / 'lib/rustlib/src/rust'
+        self.host_target = subprocess.run(['rustc', '--print=host-tuple'], check=True, capture_output=True, encoding='utf-8').stdout.strip()
+        self.target = self.config.platform.target
+
         return self
 
 
-    def __exit__(self, exc_type, exc_value, traceback):
-        if exc_value is None:
-            self._generate()
+    def __exit__(self, exc_type, exc_value, exc_tbk):
+        if exc_type is not None:
+            return
 
-
-    def _include(
-        self,
-        build_file: Path,
-    ):
-        name = 'buildgen'
-        spec = importlib.util.spec_from_file_location(name, build_file)
-        if spec is None:
-            raise ImportError(name=name, path=build_file)
-        buildgen = importlib.util.module_from_spec(spec)
-
-        # Inject methods
-        buildgen.crate = lambda name, path: self._crate(name, path)
-
-        sys.modules[name] = buildgen
-        spec.loader.exec_module(buildgen)
-        self.build_files.append(build_file)
-
-
-    def _generate(self):
         def module_deps(path: Path) -> list[str]:
             paths = []
             for info in [p for p in pkgutil.iter_modules(dev.__path__)]:
                 p = (Path(info.module_finder.path) / info.name).with_suffix('.py')
-                paths.append(str(p.relative_to(self.source_dir, walk_up=True)))
+                paths.append(str(p.relative_to(self.root, walk_up=True)))
             return paths
 
         deps = module_deps('Build')
-        ninja_path = self.source_dir / 'build.ninja.tmp'
-        with open(ninja_path, 'w') as f:
-            writer = dev.ninja.Writer(f)
-            writer.rule('dev', 'python', '$in', description='Regenerate $out')
-            writer.build(
-                'dev',
-                outputs='build.ninja',
-                inputs='Build',
-                dependencies=[str(p) for p in self.build_files] + deps,
+
+        build_ninja_path = self.root / 'build.ninja.tmp'
+        check_ninja_path = self.root / 'check.ninja.tmp'
+        with open(build_ninja_path, 'w') as build_ninja,  open(check_ninja_path, 'w') as check_ninja:
+            build_writer = dev.ninja.Writer(build_ninja)
+            check_writer = dev.ninja.Writer(check_ninja)
+            check_writer.subninja(build_ninja_path.with_suffix(''))
+            config_path = self.config_path.absolute().relative_to(self.root, walk_up=True)
+            build_path = self.build.absolute().relative_to(self.root, walk_up=True)
+            build_writer.rule(
+                'configure',
+                'python',
+                'Configure',
+                '-c',
+                '$in',
+                build_path,
+                description='Regenerate $out',
+            )
+            build_writer.build(
+                'configure',
+                outputs=['build.ninja', 'check.ninja'],
+                inputs=config_path,
+                dependencies=['Configure'] + [str(p) for p in self.includes] + deps + self.config.includes,
                 pool='console',
             )
-            for rule in sorted(self.rules.values(), key=lambda r: r.name):
-                rule.generate(writer)
+            build_writer.rule(
+                'crate',
+                'rustc',
+                # '-Dwarnings',
+                '--color=always',
+                '--edition=2024',
+                '--target=$target',
+                '--crate-name=$crate_name',
+                '--crate-type=$crate_type',
+                '--emit=dep-info=$depfile',
+                '--emit=link=$out',
+                '$flags',
+                '$in',
+                description="CRATE $crate_name",
+                depfile='$out.d',
+            )
+            check_writer.rule(
+                'crate',
+                'rustc',
+                '--edition=2024',
+                '--target=$target',
+                '--crate-name=$crate_name',
+                '--crate-type=$crate_type',
+                '--emit=metadata=$out.rmeta',
+                '--error-format=json',
+                '$flags',
+                '$in',
+                '||',
+                'true',
+                description="FLYCHECK $crate_name",
+                pool='console',
+            )
 
-                for target in sorted(rule.targets, key=lambda t: t.name):
-                    target.generate(writer, rule)
-        ninja_path.rename(ninja_path.with_suffix(''))
+            for crate in sorted(self.crates.values(), key=lambda crate: (crate.target, crate.module)):
+                crate._ninja(build_writer, check_writer, self)
+
+        rust_project_path = self.root / '.rust-project.json.tmp'
+        project = dev.rust_analyzer.Project()
+        project.runnable(
+            'ninja',
+            '--quiet',
+            '-f',
+            'check.ninja',
+            '{label}',
+            cwd=str(self.root),
+            kind='flycheck',
+        )
+        for crate in sorted(self.crates.values(), key=lambda crate: (crate.target, crate.module)):
+            crate._rust_analyzer(project, self)
+        project.write(rust_project_path)
+
+        # commit files
+        build_ninja_path.rename(build_ninja_path.with_suffix(''))
+        check_ninja_path.rename(check_ninja_path.with_suffix(''))
+        rust_project_path.rename(rust_project_path.with_suffix(''))
 
 
-    def add(self, rule: Rule, /):
-        self.rules[rule.name] = rule
-        return rule
+    def crate(
+        self,
+        name: str,
+        crate_type: Literal['bin', 'lib'] = 'lib',
+        /,
+        *,
+        path: str | None = None,
+        edition: Literal['2021', '2024'] = '2024',
+        target: str | Literal['native'] | None = None,
+        builtin: bool = False,
+        sysroot: bool = False,
+        deps: list[Crate] = [],
+    ) -> Crate:
+        output = Path(name)
+        module = path and Path(path)
+        name = output.stem
+
+        match target:
+            case 'native':
+                target = self.host_target
+            case None:
+                target = self.config.platform.target
+                if target is None:
+                    raise Exception('`platform.target` is unconfigured')
+
+        if '/' in target or '.' in target:
+            target_name = Path(target).stem
+        else:
+            target_name = target
+
+        match crate_type:
+            case 'bin':
+                if not module:
+                    module = output / 'main.rs'
+                output = Path(target_name) / output.with_stem()
+            case _:
+                if not module:
+                    module = output / 'lib.rs'
+                output = Path(target_name) / output.with_name(f"lib{output.stem}.rlib")
+
+        if sysroot:
+            module = self.rust_src / module
+
+        crate = Crate(
+            name,
+            module,
+            self.build / output,
+            crate_type,
+            target=target,
+            deps=deps,
+            builtin=builtin,
+        )
+        self.crates[crate.name] = crate
+        if builtin:
+            self.builtins.add(crate)
+        return crate
