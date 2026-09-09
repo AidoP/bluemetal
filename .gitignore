@@ -1,6 +1,9 @@
+/*.ninja
+/config.toml
 /.ninja*
+/.rust-project.json
 /build
-/build.ninja
 /flake.lock
 /run
+/target
 __pycache__

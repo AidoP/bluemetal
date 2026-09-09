@@ -35,14 +35,16 @@ class Crate:
         deps = []
         if not self.builtin:
             for crate in project.builtins:
-                flags.append(f"--extern={crate.name}={crate.output}")
-                deps.append(crate.output)
+                path = project.build / crate.output
+                flags.append(f"--extern={crate.name}={path}")
+                deps.append(path)
         for crate in self.deps:
-            flags.append(f"--extern={crate.name}={crate.output}")
-            deps.append(crate.output)
+            path = project.build / crate.output
+            flags.append(f"--extern={crate.name}={path}")
+            deps.append(path)
         writer.build(
             'crate',
-            outputs=self.output,
+            outputs=project.build / self.output,
             inputs=self.module,
             dependencies=deps,
             crate_type=self.crate_type,
@@ -52,7 +54,7 @@ class Crate:
         )
         flycheck_writer.build(
             'crate',
-            outputs=str(self.output) + '.flycheck',
+            outputs='target' / self.output,
             inputs=self.module,
             dependencies=deps,
             crate_type=self.crate_type,
@@ -75,23 +77,11 @@ class Crate:
             edition='2024',
             deps=deps,
             build_info=dev.rust_analyzer.BuildInfo(
-                self.output,
+                'target' / self.output,
                 self.module,
                 self.crate_type,
             ),
         )
-
-
-    def _flycheck(self, project: 'Project') -> str:
-        flags = []
-        deps = []
-        if not self.builtin:
-            for crate in project.builtins:
-                flags.append(f"--extern={crate.name}={crate.output}")
-                deps.append(crate.output)
-        for crate in self.deps:
-            flags.append(f"--extern={crate.name}={crate.output}")
-            deps.append(crate.output)
 
 
 class Project:
@@ -265,7 +255,7 @@ class Project:
         crate = Crate(
             name,
             module,
-            self.build / output,
+            output,
             crate_type,
             target=target,
             deps=deps,

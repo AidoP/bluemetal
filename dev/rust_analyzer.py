@@ -34,7 +34,7 @@ class BuildInfo:
         path: str | Path,
         kind: Literal['bin', 'lib', 'test'],
     ):
-        self.label = str(label) + '.flycheck'
+        self.label = str(label)
         self.path = str(path)
         self.kind = kind
 
