@@ -1,0 +1,15 @@
+include 'arch/riscv'
+include '''
+
+'''
+
+include arch/riscv/virt
+
+crate configure
+    path: meta/configure.rs
+    target: native
+    extern: core
+
+bin configure
+    native
+    path: 

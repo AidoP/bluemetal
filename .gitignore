@@ -1,0 +1,7 @@
+/*.ninja
+!/bootstrap.ninja
+/config.toml
+/.ninja*
+/.rust-project.json
+/out
+/target

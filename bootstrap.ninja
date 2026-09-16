@@ -1,0 +1,20 @@
+edition = 2024
+
+rule rust
+    command = rustc --color=always --emit=link=$out --emit=dep-info=$depfile --crate-type=$crate-type --crate-name=$crate-name --edition=$edition $flags $in
+    deps = gcc
+    depfile = $out.d
+
+rule configure
+    command = target/configure $in $out
+
+build target/configure: rust meta/configure/main.rs
+    crate-type = bin
+    crate-name = configure
+
+build target/test-configure: rust meta/configure/main.rs
+    crate-type = bin
+    crate-name = test_configure
+    flags = --test
+
+build build.ninja: configure Build | target/configure
