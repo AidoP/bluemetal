@@ -19,6 +19,17 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
     let mut ctx = syntax::Context::new();
     ctx.load(input.as_ref());
 
+    println!("{ctx:?}");
+    if !ctx.diagnostics().is_empty() {
+        let mut stderr = std::io::stderr();
+        for diagnostic in ctx.diagnostics() {
+            if let Err(error) = ctx.write_diagnostic(&mut stderr, diagnostic) {
+                return Err(Error::Stderr(error));
+            }
+        }
+        return Err(Error::Parse);
+    }
+
     let mut build_ninja = NinjaFile::new("build.ninja")?;
     build_ninja.subninja("bootstrap.ninja")?;
     build_ninja.sync_all()?;
@@ -29,6 +40,8 @@ enum Error {
     MissingArg(&'static str),
     Create(std::path::PathBuf, std::io::Error),
     Write(std::path::PathBuf, std::io::Error),
+    Parse,
+    Stderr(std::io::Error),
 }
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
@@ -36,6 +49,8 @@ impl core::fmt::Display for Error {
             Self::MissingArg(name) => write!(f, "missing required argument `{name}`"),
             Self::Create(path, error) => write!(f, "failed to create {path:?}: {error}"),
             Self::Write(path, error) => write!(f, "failed to write to {path:?}: {error}"),
+            Self::Parse => write!(f, "failed to parse build definition"),
+            Self::Stderr(error) => write!(f, "failed to write to stderr: {error}"),
         }
     }
 }
