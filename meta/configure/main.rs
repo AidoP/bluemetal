@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 mod syntax;
 
 fn main() -> std::process::ExitCode {
@@ -16,18 +18,20 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
     let Some(input) = args.next() else {
         return Err(Error::MissingArg("input"));
     };
-    let mut ctx = syntax::Context::new();
-    ctx.load(input.as_ref());
+    let input = PathBuf::from(input);
+    let mut project = syntax::Project::new();
+    let file = match syntax::File::read(input.clone()) {
+        Ok(file) => file,
+        Err(error) => return Err(Error::Read(input, error)),
+    };
+    project.parse(file);
 
-    println!("{ctx:?}");
-    if !ctx.diagnostics().is_empty() {
-        let mut stderr = std::io::stderr();
-        for diagnostic in ctx.diagnostics() {
-            if let Err(error) = ctx.write_diagnostic(&mut stderr, diagnostic) {
-                return Err(Error::Stderr(error));
-            }
-        }
-        return Err(Error::Parse);
+    let decl = syntax::Decl { span: syntax::Span { file: 0, offset: 0, len: 0 }, current: None };
+    let decl2 = syntax::Decl { span: syntax::Span { file: 0, offset: 0, len: 0 }, current: None };
+    project.declare("apples".into(), decl);
+    project.declare("apples".into(), decl2);
+    for d in project.diagnostics {
+        eprintln!("diag: {}", d.message);
     }
 
     let mut build_ninja = NinjaFile::new("build.ninja")?;
@@ -38,6 +42,7 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
 
 enum Error {
     MissingArg(&'static str),
+    Read(std::path::PathBuf, std::io::Error),
     Create(std::path::PathBuf, std::io::Error),
     Write(std::path::PathBuf, std::io::Error),
     Parse,
@@ -47,6 +52,7 @@ impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         match self {
             Self::MissingArg(name) => write!(f, "missing required argument `{name}`"),
+            Self::Read(path, error) => write!(f, "unable to read {path:?}: {error}"),
             Self::Create(path, error) => write!(f, "failed to create {path:?}: {error}"),
             Self::Write(path, error) => write!(f, "failed to write to {path:?}: {error}"),
             Self::Parse => write!(f, "failed to parse build definition"),

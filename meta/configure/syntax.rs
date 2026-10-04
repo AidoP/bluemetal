@@ -1,235 +1,238 @@
-use std::path::Path;
-use std::path::PathBuf;
+use std::{collections::{HashMap, hash_map::Entry}, path::{Path, PathBuf}};
 
-const WS: &[char] = &[' ', '\n'];
-
-// struct Error {
-//     UnexpectedEof,
-//     UnexpectedToken,
-//     InvalidStatement,
-// }
-
-enum Severity {
-    Warning,
-    Error,
+pub struct Project {
+    files: Vec<File>,
+    files_idx: HashMap<PathBuf, usize>,
+    decls: Vec<Decl>,
+    decls_idx: HashMap<String, usize>,
+    pub diagnostics: Vec<Diagnostic>,
 }
-impl core::fmt::Display for Severity {
-    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-        match self {
-            Self::Warning => write!(f, "warning"),
-            Self::Error => write!(f, "error"),
-        }
-    }
-}
-
-#[derive(Debug)]
-enum Msg {
-    Eof,
-    InvalidStatement,
-}
-impl Msg {
-    pub fn severity(&self) -> Severity {
-        match self {
-            Self::Eof => Severity::Error,
-            Self::InvalidStatement => Severity::Error,
-        }
-    }
-}
-impl core::fmt::Display for Msg {
-    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-        match self {
-            Self::Eof => write!(f, "unexpected end of file"),
-            Self::InvalidStatement => write!(f, "invalid statement"),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct Diagnostic {
-    /// The ID of the file that emitted the diagnostic.
-    id: usize,
-    offset: usize,
-    len: usize,
-    msg: Msg,
-    location: &'static std::panic::Location<'static>,
-}
-
-#[derive(Debug)]
-enum Value {
-    String(String),
-    Path(PathBuf),
-    Int(i64),
-}
-
-#[derive(Debug)]
-enum Expression {
-    Literal(Value),
-}
-
-#[derive(Debug)]
-enum Scope {
-    Local,
-    Global,
-}
-
-#[derive(Debug)]
-pub enum Statement {
-    Use(PathBuf),
-    Set {
-        scope: Scope,
-        value: Expression,
-    },
-}
-impl Statement {
-    fn parse(ctx: &mut Context, def: &BuildDef, s: &mut &str, offset: usize) -> Option<Self> {
-        let Some(end) = s.find(WS) else {
-            ctx.diagnostics.push(Diagnostic {
-                id: def.id,
-                offset,
-                len: s.len(),
-                msg: Msg::Eof,
-                location: std::panic::Location::caller(),
-            });
-            return None;
-        };
-        match &s[..end] {
-            "include" => {
-                *s = &s[end..];
-                return Some(Statement::Use("a".into()));
-            },
-            _ => {
-                ctx.diagnostics.push(Diagnostic {
-                    id: def.id,
-                    offset,
-                    len: end,
-                    msg: Msg::InvalidStatement,
-                    location: std::panic::Location::caller(),
-                });
-                return None;
-            },
-        }
-    }
-}
-
-/// # Build Definition File
-#[derive(Debug)]
-pub struct BuildDef {
-    id: usize,
-    path: PathBuf,
-    data: String,
-    statements: Vec<Statement>,
-}
-impl BuildDef {
-    pub fn new(id: usize, path: PathBuf, data: String) -> Self {
-        Self {
-            id,
-            path,
-            data,
-            statements: Vec::new(),
-        }
-    }
-    pub fn parse(&mut self, ctx: &mut Context) {
-        let mut s = &self.data[..];
-        while !s.is_empty() {
-            s = s.trim_ascii_start();
-            // safety: `s` is a substring of `data`
-            let offset = unsafe { s.as_ptr().offset_from(self.data.as_ptr()) } as usize;
-            let Some(statement) = Statement::parse(ctx, self, &mut s, offset) else {
-                break;
-            };
-        }
-    }
-    pub fn position(&self, offset: usize) -> Option<(usize, usize)> {
-        // find line
-        let mut pos = 0;
-        let mut line = 1;
-        while pos < offset {
-            if let Some(end) = self.data[pos..].find('\n') {
-                pos += end + 1;
-            } else {
-                // end of file
-                break;
-            }
-            line += 1;
-        }
-        println!("{offset}, {pos}");
-        Some((line, offset + 1 - pos))
-    }
-}
-
-#[derive(Debug)]
-pub struct Context {
-    definitions: Vec<BuildDef>,
-    diagnostics: Vec<Diagnostic>,
-}
-impl Context {
+impl Project {
     pub fn new() -> Self {
         Self {
-            definitions: Vec::new(),
+            files: Vec::new(),
+            files_idx: HashMap::new(),
+            decls: Vec::new(),
+            decls_idx: HashMap::new(),
             diagnostics: Vec::new(),
         }
     }
-    pub fn load(&mut self, path: &Path) -> Result<&BuildDef, std::io::Error> {
-        use std::io::Read;
-        let mut file = std::fs::File::open(path)?;
-        let mut data = String::new();
-        file.read_to_string(&mut data)?;
-        println!("loaded {path:?}:\n{data}");
-        let id = self.definitions.len();
-        let mut definition = BuildDef::new(id, path.to_owned(), data);
-        definition.parse(self);
-        self.definitions.push(definition);
-        let definition = &mut self.definitions[id];
-        Ok(definition)
+    pub fn parse(&mut self, file: File) {
+        let idx = self.files.len();
+        self.files_idx.insert(file.path.clone(), idx);
+        self.files.push(file);
+        self.parse_file(idx);
     }
-    pub fn diagnostics(&self) -> &[Diagnostic] {
-        &self.diagnostics
-    }
-    pub fn write_diagnostic(&self, w: &mut dyn std::io::Write, diagnostic: &Diagnostic) -> std::io::Result<()> {
-        let build_def = &self.definitions[diagnostic.id];
-        let (line, col) = build_def.position(diagnostic.offset).unwrap();
-        writeln!(w, "{}: {}\nfrom {}\n --> {}:{line}:{col}", diagnostic.msg.severity(), diagnostic.msg, diagnostic.location, build_def.path.display())
+    /// Declare a property.
+    pub fn declare(&mut self, name: String, decl: Decl) {
+        let idx = self.decls.len();
+        match self.decls_idx.entry(name) {
+            Entry::Occupied(entry) => {
+                let existing = *entry.get();
+                self.diagnostics.push(Diagnostic {
+                    span: decl.span,
+                    message: Message::DeclExists { existing },
+                });
+                return;
+            },
+            Entry::Vacant(entry) => {
+                entry.insert(idx);
+            },
+        }
+        self.decls.push(decl);
     }
 }
+
+impl Project {
+    fn parse_file(&mut self, idx: usize) {
+        let file = &mut self.files[idx];
+        let mut parser = Parser::new(idx, &file.data);
+        while !parser.is_empty() {
+            parser.skip_empty();
+            let Some(keyword) = parser.keyword() else {
+                let span = parser.skip_statement();
+                self.diagnostics.push(Diagnostic {
+                    span,
+                    message: Message::ExpectedKeyword,
+                });
+                continue;
+            };
+            match keyword {
+                "use" => {
+
+            println!("keyword: {keyword}");
+                }
+                _ => {
+                    let span = parser.skip_statement();
+                    self.diagnostics.push(Diagnostic {
+                        span,
+                        message: Message::InvalidStatement,
+                    });
+                },
+            }
+        }
+    }
+}
+
+pub struct File {
+    path: PathBuf,
+    data: String,
+}
+impl File {
+    pub fn read(path: std::path::PathBuf) -> std::io::Result<Self> {
+        Ok(Self {
+            data: std::fs::read_to_string(&path)?,
+            path,
+        })
+    }
+    /// Returns the path relative to the file.
+    pub fn relative_path(&self, path: &Path) -> PathBuf {
+        self.path.parent().unwrap().join(path)
+    }
+}
+
+pub struct Span {
+    pub file: usize,
+    pub offset: usize,
+    pub len: usize,
+}
+
+pub struct Diagnostic {
+    pub span: Span,
+    pub message: Message,
+}
+
+#[repr(u32)]
+pub enum Message {
+    InvalidStatement,
+    ExpectedKeyword,
+    UnexpectedEof,
+    DeclExists {
+        existing: usize,
+    },
+}
+impl core::fmt::Display for Message {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidStatement => write!(f, "invalid statement"),
+            Self::ExpectedKeyword => write!(f, "expected keyword"),
+            Self::UnexpectedEof => write!(f, "unexpected end of file"),
+            Self::DeclExists { .. } => write!(f, "property has already been defined"),
+        }
+    }
+}
+
+/// A variable declaration.
+pub struct Decl {
+    pub span: Span,
+    /// The ID of the current value.
+    pub current: Option<u32>,
+}
+
+struct Var {
+    id: u32,
+    decl: u32,
+    /// The previous value of the declaration.
+    prev: Option<u32>,
+    value: Value,
+}
+
+
+enum Statement {
+    /// Set a variable
+    Local {
+        id: u32,
+        value: Value,
+    },
+    Use(),
+}
+
+enum Value {
+    Str(String),
+    Bool(bool),
+    Unsigned(u64),
+    Signed(i64),
+}
+
 
 struct Parser<'a> {
-    data: &'a [u8],
-    pos: usize,
+    file: usize,
+    data: &'a str,
+    offset: usize,
 }
-impl<'a> Parser<'a> {
-    pub fn new(data: &'a str) -> Self {
+
+impl <'a> Parser<'a> {
+    pub fn new(file: usize, data: &'a str) -> Self {
         Self {
-            data: data.as_bytes(),
-            pos: 0,
+            file,
+            data,
+            offset: 0,
         }
     }
+    pub fn as_str(&self) -> &'a str {
+        &self.data[self.offset..]
+    }
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.data[self.offset..].as_bytes()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.offset >= self.data.len()
+    }
+    pub fn skip_empty(&mut self) {
+        while let Some(b) = self.as_bytes().get(0) {
+            match b {
+                b'#' => {
+                    let data = self.as_str();
+                    let end = data.find('\n').unwrap_or(data.len());
+                    self.offset += end;
+                },
+                _ => return,
+            }
 
-    fn next_ident(&self) -> Option<&'a str> {
-        let mut i = self.pos;
-        while i < self.data.len() {
-            // safety: bounds check above
-            let c = unsafe { self.data.get_unchecked(i) };
-            match c {
-                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' => (),
+        }
+    }
+    pub fn skip_statement(&mut self) -> Span {
+        let offset = self.offset;
+        while self.offset < self.data.len() {
+            // continue from the next non-indented line
+            if let Some(end) = self.as_str().find('\n') {
+                self.offset += end + 1;
+            } else {
+                self.offset = self.data.len();
+            }
+            match self.as_bytes().get(self.offset) {
+                Some(b' ') => (),
                 _ => break,
             }
-            i += 1;
         }
-        if i == 0 {
+        Span {
+            file: self.file,
+            offset,
+            len: self.offset - offset,
+        }
+    }
+    pub fn keyword(&mut self) -> Option<&'a str> {
+        let data = self.data.as_bytes();
+        let mut i = self.offset;
+        while i < data.len() {
+            match data[i] {
+                b'a'..=b'z' | b'-' => i += 1,
+
+                _ => break,
+            }
+        }
+        if i == self.offset {
             return None;
         }
-        // safety: original sequence is valid UTF-8 and this cuts on an ASCII boundary
-        Some(unsafe { str::from_utf8_unchecked(self.data.get_unchecked(self.pos..i)) })
+        let keyword = &self.data[self.offset..i];
+        self.offset = i;
+        Some(keyword)
     }
-}
-
-#[cfg(test)]
-mod test {
-    use super::Parser;
-    #[test]
-    fn test_parser() {
-        let p = Parser::new("hello world!");
-        assert_eq!(p.next_ident(), Some("hello"));
-        assert_eq!(p.next_ident(), Some("world"));
+    pub fn span_eof(&self) -> Span {
+        Span {
+            file: self.file,
+            offset: self.offset,
+            len: self.data.len() - self.offset,
+        }
     }
 }

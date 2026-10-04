@@ -1,15 +1,5 @@
-include 'arch/riscv'
-include '''
+declare platform
+    required
+    type: str
 
-'''
-
-include arch/riscv/virt
-
-crate configure
-    path: meta/configure.rs
-    target: native
-    extern: core
-
-bin configure
-    native
-    path: 
+use 'arch/riscv'
