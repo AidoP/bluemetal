@@ -1,5 +1,5 @@
 declare platform
-    required
-    type: str
+    type 'str'
+    default 'virt'
 
-use 'arch/riscv'
+use 'arch/riscv/{platform}'

@@ -7,6 +7,8 @@ rule rust
 
 rule configure
     command = target/configure $in $out
+    description = CONFIGURE $out
+    pool = console
 
 build target/configure: rust meta/configure/main.rs
     crate-type = bin
