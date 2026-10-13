@@ -31,11 +31,22 @@ impl Project {
     pub fn file(&self, idx: usize) -> &File {
         &self.files[idx]
     }
-    pub fn parse(&mut self, file: File) {
+    /// Process a file, unless it has already been processed.
+    ///
+    /// Returns the index of the file if it has already been processed.
+    pub fn parse(&mut self, file: File) -> Option<usize> {
         let idx = self.files.len();
-        self.files_idx.insert(file.path.clone(), idx);
+        // a file can be referred to by many paths, so identify it by its canonical path
+        let path = std::fs::canonicalize(&file.path).unwrap_or_else(|_| file.path.clone());
+        match self.files_idx.entry(path) {
+            Entry::Occupied(entry) => return Some(*entry.get()),
+            Entry::Vacant(entry) => entry.insert(idx),
+        };
         self.files.push(file);
+        self.files[idx].active = true;
         self.parse_file(idx);
+        self.files[idx].active = false;
+        None
     }
     /// Declare a property, returning its ID.
     ///
@@ -145,6 +156,12 @@ impl Project {
                     self.write_location(w, span, style_note, style_reset)?;
                 }
             },
+            Message::RepeatedUse { file, .. } => {
+                if let Some(span) = &self.files[*file].used {
+                    writeln!(w, "{style_note}note{style_white}: first used here{style_reset}")?;
+                    self.write_location(w, span, style_note, style_reset)?;
+                }
+            },
             Message::UnknownDeclarationAttribute { property, .. } => {
                 let property = self.properties[*property].as_ref().unwrap();
                 if let Some(span) = &property.span {
@@ -237,8 +254,16 @@ impl Project {
         }
         path = path.join("Build");
         match File::read(path.clone()) {
-            Ok(file) => {
-                self.parse(file);
+            Ok(mut file) => {
+                file.used = Some(span);
+                // using a file again is fine unless it is still being processed, which is a cycle
+                if let Some(idx) = self.parse(file) && self.files[idx].active {
+                    self.diagnostics.push(Diagnostic {
+                        span: Some(span),
+                        message: Message::RepeatedUse { path, file: idx },
+                        severity: Severity::Warning,
+                    });
+                }
             },
             Err(error) => {
                 self.diagnostics.push(Diagnostic {
@@ -491,10 +516,10 @@ impl Project {
         };
         let path_buf;
         if path.starts_with('/') {
-            let path = self.evaluate_str(&path[1..], span);
+            let path = self.evaluate_str(&path[1..], span.file, span.offset + 2);
             path_buf = self.root.join(path);
         } else {
-            let path = self.evaluate_str(path, span);
+            let path = self.evaluate_str(path, span.file, span.offset + 1);
             path_buf = self.file(parser.file).relative_path(path)
         }
         Some((path_buf, span))
@@ -509,32 +534,88 @@ impl Project {
             });
             return None;
         };
-        Some((self.evaluate_str(string, span), span))
+        Some((self.evaluate_str(string, span.file, span.offset + 1), span))
     }
+    /// Take the next expression from the parser and evaluate it.
+    ///
+    /// An expression is an operand, or operands joined by operators.
+    /// An operator must have a single space on either side of it.
     fn parse_expression(&mut self, parser: &mut Parser) -> Option<(Data, Span)> {
+        let operand = self.parse_binary(parser, 0)?;
+        Some((operand.data, operand.span))
+    }
+    /// Take operands joined by operators with a precedence of at least `min_precedence`.
+    fn parse_binary(&mut self, parser: &mut Parser, min_precedence: u8) -> Option<Operand> {
+        let mut lhs = self.parse_operand(parser)?;
+        while let Some(operator) = parser.operator(min_precedence) {
+            let rhs = self.parse_binary(parser, operator.precedence() + 1)?;
+            lhs = self.evaluate_binary(operator, lhs, rhs)?;
+        }
+        Some(lhs)
+    }
+    /// Take the next operand from the parser.
+    ///
+    /// An operand is a literal, a property name, an expression in `{}` to permit coercion, or an expression in `()`.
+    /// It may be preceded by `!` to negate a boolean.
+    fn parse_operand(&mut self, parser: &mut Parser) -> Option<Operand> {
+        let start = parser.offset;
         match parser.peek() {
-            Some('\'') => if let Some((string , span)) = parser.string() {
-                let string = self.evaluate_str(string, span);
-                Some((Data::Str(string), span))
-            } else {
-                None
-            },
-            Some('t' | 'f') => if let Some((value , span)) = parser.bool() {
-                Some((Data::Bool(value), span))
-            } else {
-                None
+            Some('\'') => {
+                let (string, span) = self.parse_string(parser)?;
+                Some(Operand { data: Data::Str(string), span, coerce: Coercion::Strict })
             },
             Some('0'..='9' | '-' | '+') => {
                 let span = parser.span_until(|c| c == ' ' || c == '\n');
-                let integer = parser.integer();
-                if integer.is_none() {
+                let Some((data, span)) = parser.integer() else {
                     self.diagnostics.push(Diagnostic {
                         span: Some(span),
                         message: Message::InvalidInteger,
                         severity: Severity::Error,
                     });
+                    return None;
+                };
+                Some(Operand { data, span, coerce: Coercion::Sign })
+            },
+            Some('!') => {
+                parser.expect('!');
+                let operand = self.parse_operand(parser)?;
+                let value = self.bool_operand(operand)?;
+                Some(Operand { data: Data::Bool(!value), span: parser.span_from(start), coerce: Coercion::Strict })
+            },
+            Some('(') => {
+                parser.expect('(');
+                let inner = self.parse_binary(parser, 0)?;
+                if !parser.expect(')') {
+                    self.diagnostics.push(Diagnostic {
+                        span: Some(parser.span_char()),
+                        message: Message::ExpectedExact(")"),
+                        severity: Severity::Error,
+                    });
+                    return None;
                 }
-                integer
+                Some(Operand { span: parser.span_from(start), ..inner })
+            },
+            Some('{') => {
+                parser.expect('{');
+                let inner = self.parse_binary(parser, 0)?;
+                if !parser.expect('}') {
+                    self.diagnostics.push(Diagnostic {
+                        span: Some(parser.span_char()),
+                        message: Message::ExpectedExact("}"),
+                        severity: Severity::Error,
+                    });
+                    return None;
+                }
+                Some(Operand { data: inner.data, span: parser.span_from(start), coerce: Coercion::Any })
+            },
+            Some('a'..='z') => {
+                let (name, span) = parser.ident()?;
+                let data = match name {
+                    "true" => Data::Bool(true),
+                    "false" => Data::Bool(false),
+                    _ => self.property(name, span)?,
+                };
+                Some(Operand { data, span, coerce: Coercion::Strict })
             },
             _ => {
                 self.diagnostics.push(Diagnostic {
@@ -545,6 +626,201 @@ impl Project {
                 None
             },
         }
+    }
+    /// Returns the value of a property referenced by an expression.
+    fn property(&mut self, name: &str, span: Span) -> Option<Data> {
+        let data = self.get(name, span.file).cloned();
+        if data.is_none() {
+            self.diagnostics.push(Diagnostic {
+                span: Some(span),
+                message: Message::UnsetProperty(name.into()),
+                severity: Severity::Error,
+            });
+        }
+        data
+    }
+    /// Apply an operator.
+    ///
+    /// Operands must have the type required by the operator, and the same type as each other.
+    /// An operand is only converted to satisfy this as far as its [`Coercion`] permits.
+    fn evaluate_binary(&mut self, operator: Operator, lhs: Operand, rhs: Operand) -> Option<Operand> {
+        let span = Span {
+            file: lhs.span.file,
+            offset: lhs.span.offset,
+            len: rhs.span.offset + rhs.span.len - lhs.span.offset,
+        };
+        let rhs_span = rhs.span;
+        let mut coerce = Coercion::Strict;
+        let data = match operator {
+            Operator::Or | Operator::And => {
+                let lhs = self.bool_operand(lhs)?;
+                let rhs = self.bool_operand(rhs)?;
+                Data::Bool(match operator {
+                    Operator::Or => lhs || rhs,
+                    _ => lhs && rhs,
+                })
+            },
+            Operator::Equal | Operator::NotEqual => {
+                let (lhs, rhs) = self.comparable_operands(lhs, rhs, span)?;
+                Data::Bool((lhs == rhs) == matches!(operator, Operator::Equal))
+            },
+            Operator::Less | Operator::LessEqual | Operator::Greater | Operator::GreaterEqual => {
+                let ordering = match self.integer_operands(lhs, rhs, span)? {
+                    (Data::Unsigned(lhs), Data::Unsigned(rhs)) => lhs.cmp(&rhs),
+                    (Data::Signed(lhs), Data::Signed(rhs)) => lhs.cmp(&rhs),
+                    _ => unreachable!(),
+                };
+                Data::Bool(match operator {
+                    Operator::Less => ordering.is_lt(),
+                    Operator::LessEqual => ordering.is_le(),
+                    Operator::Greater => ordering.is_gt(),
+                    _ => ordering.is_ge(),
+                })
+            },
+            Operator::Add | Operator::Subtract | Operator::Multiply | Operator::Divide | Operator::Remainder => {
+                coerce = lhs.coerce.min(rhs.coerce);
+                let (lhs, rhs) = self.integer_operands(lhs, rhs, span)?;
+                if matches!(operator, Operator::Divide | Operator::Remainder) && matches!(rhs, Data::Unsigned(0) | Data::Signed(0)) {
+                    self.diagnostics.push(Diagnostic {
+                        span: Some(rhs_span),
+                        message: Message::DivisionByZero,
+                        severity: Severity::Error,
+                    });
+                    return None;
+                }
+                macro_rules! checked {
+                    ($lhs:expr, $rhs:expr) => {
+                        match operator {
+                            Operator::Add => $lhs.checked_add($rhs),
+                            Operator::Subtract => $lhs.checked_sub($rhs),
+                            Operator::Multiply => $lhs.checked_mul($rhs),
+                            Operator::Divide => $lhs.checked_div($rhs),
+                            _ => $lhs.checked_rem($rhs),
+                        }
+                    };
+                }
+                let data = match (lhs, rhs) {
+                    (Data::Unsigned(lhs), Data::Unsigned(rhs)) => checked!(lhs, rhs).map(Data::Unsigned),
+                    (Data::Signed(lhs), Data::Signed(rhs)) => checked!(lhs, rhs).map(Data::Signed),
+                    _ => unreachable!(),
+                };
+                let Some(data) = data else {
+                    self.diagnostics.push(Diagnostic {
+                        span: Some(span),
+                        message: Message::IntegerOverflow,
+                        severity: Severity::Error,
+                    });
+                    return None;
+                };
+                data
+            },
+        };
+        Some(Operand { data, span, coerce })
+    }
+    /// Ensure an operand is a boolean, converting it if it permits coercion.
+    fn bool_operand(&mut self, operand: Operand) -> Option<bool> {
+        let value = match &operand.data {
+            Data::Bool(value) => Some(*value),
+            data if operand.coerce == Coercion::Any => data.coerce_bool(),
+            _ => None,
+        };
+        if value.is_none() {
+            self.diagnostics.push(Diagnostic {
+                span: Some(operand.span),
+                message: Message::InvalidOperand {
+                    ty: operand.data.type_name(),
+                    expected: "bool",
+                    coerce: operand.coerce == Coercion::Any,
+                },
+                severity: Severity::Error,
+            });
+        }
+        value
+    }
+    /// Ensure an operand is an integer, converting it if it permits coercion.
+    fn integer_operand(&mut self, operand: Operand) -> Option<Operand> {
+        let data = match &operand.data {
+            Data::Unsigned(_) | Data::Signed(_) => return Some(operand),
+            data if operand.coerce == Coercion::Any => data.coerce_integer(),
+            _ => None,
+        };
+        let Some(data) = data else {
+            self.diagnostics.push(Diagnostic {
+                span: Some(operand.span),
+                message: Message::InvalidOperand {
+                    ty: operand.data.type_name(),
+                    expected: "integer",
+                    coerce: operand.coerce == Coercion::Any,
+                },
+                severity: Severity::Error,
+            });
+            return None;
+        };
+        Some(Operand { data, ..operand })
+    }
+    /// Ensure both operands are integers of the same type.
+    fn integer_operands(&mut self, lhs: Operand, rhs: Operand, span: Span) -> Option<(Data, Data)> {
+        let lhs = self.integer_operand(lhs)?;
+        let rhs = self.integer_operand(rhs)?;
+        self.unify_sign(lhs, rhs, span)
+    }
+    /// Ensure two integer operands are either both signed or both unsigned.
+    fn unify_sign(&mut self, lhs: Operand, rhs: Operand, span: Span) -> Option<(Data, Data)> {
+        if lhs.data.type_name() == rhs.data.type_name() {
+            return Some((lhs.data, rhs.data));
+        }
+        if let Some(data) = rhs.data.convert_sign() && rhs.coerce >= Coercion::Sign {
+            return Some((lhs.data, data));
+        }
+        if let Some(data) = lhs.data.convert_sign() && lhs.coerce >= Coercion::Sign {
+            return Some((data, rhs.data));
+        }
+        self.diagnostics.push(Diagnostic {
+            span: Some(span),
+            message: Message::MismatchedOperands {
+                lhs: lhs.data.type_name(),
+                rhs: rhs.data.type_name(),
+            },
+            severity: Severity::Error,
+        });
+        None
+    }
+    /// Ensure both operands have the same type, of any kind.
+    fn comparable_operands(&mut self, lhs: Operand, rhs: Operand, span: Span) -> Option<(Data, Data)> {
+        if lhs.data.type_name() == rhs.data.type_name() {
+            return Some((lhs.data, rhs.data));
+        }
+        if lhs.data.is_integer() && rhs.data.is_integer() {
+            return self.unify_sign(lhs, rhs, span);
+        }
+        let (from, to, swap) = if rhs.coerce == Coercion::Any {
+            (rhs, lhs, false)
+        } else if lhs.coerce == Coercion::Any {
+            (lhs, rhs, true)
+        } else {
+            self.diagnostics.push(Diagnostic {
+                span: Some(span),
+                message: Message::MismatchedOperands {
+                    lhs: lhs.data.type_name(),
+                    rhs: rhs.data.type_name(),
+                },
+                severity: Severity::Error,
+            });
+            return None;
+        };
+        let Some(data) = from.data.coerce_like(&to.data) else {
+            self.diagnostics.push(Diagnostic {
+                span: Some(from.span),
+                message: Message::InvalidOperand {
+                    ty: from.data.type_name(),
+                    expected: to.data.type_name(),
+                    coerce: true,
+                },
+                severity: Severity::Error,
+            });
+            return None;
+        };
+        Some(if swap { (data, to.data) } else { (to.data, data) })
     }
     fn parse_attribute<'a>(&mut self, parser: &mut Parser<'a>) -> Option<Attribute<'a>> {
         let Some((name, name_span)) = parser.ident() else {
@@ -573,71 +849,119 @@ impl Project {
             data_span,
         })
     }
-    /// Evaluate string templates
-    fn evaluate_str(&mut self, s: &str, span: Span) -> String {
+    /// Evaluate string templates.
+    ///
+    /// An expression in `{}` is replaced with its value, while `{{` and `}}` are replaced with a single brace.
+    /// `offset` is the offset of `s` within the file.
+    fn evaluate_str(&mut self, s: &str, file: usize, offset: usize) -> String {
         let mut string = String::new();
-        let mut chars = s.char_indices().peekable();
-        let mut name_start = None;
-        while let Some((i, c)) = chars.next() {
-            match c {
-                '{' => {
-                    match chars.next() {
-                        Some((_, '{')) => string.push(c),
-                        _ => {
-                            name_start = Some(i+1);
-                        },
-                    }
-                },
-                '}' => {
-                    match chars.peek() {
-                        Some((_, '}')) => {
-                            chars.next();
-                            string.push(c);
-                        },
-                        _ => {
-                            let Some(start) = name_start else {
-                                self.diagnostics.push(Diagnostic {
-                                    span: Some(Span { file: span.file, offset: span.offset + i, len: 1 }),
-                                    message: Message::InvalidStringTemplate,
-                                    severity: Severity::Error,
-                                });
-                                continue;
-                            };
-                            let name = &s[start..i];
-                            name_start = None;
-                            let Some(value) = self.get(name, span.file) else {
-                                self.diagnostics.push(Diagnostic {
-                                    span: Some(Span { file: span.file, offset: span.offset + start + 1, len: i - start }),
-                                    message: Message::UnsetProperty(name.into()),
-                                    severity: Severity::Error,
-                                });
-                                continue;
-                            };
-                            let value = value.coerce_string();
-                            string.push_str(&value);
-                        },
-                    }
-                },
-                'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' if name_start.is_some() => (),
-                _ if name_start.is_some() => {
-                    let start = name_start.unwrap();
-                    self.diagnostics.push(Diagnostic {
-                        span: Some(Span { file: span.file, offset: span.offset + start + 1, len: i + 1 - start }),
-                        message: Message::InvalidStringTemplate,
-                        severity: Severity::Error,
-                    });
-                    // consume the template literal otherwise it will error a second time
-                    while let Some((_, c)) = chars.next() {
-                        if c == '}' {
-                            break;
-                        }
-                    }
-                    name_start = None;
-                },
-                _ => string.push(c),
+        let mut rest = s;
+        while let Some(i) = rest.find(['{', '}']) {
+            string.push_str(&rest[..i]);
+            let brace = &rest[i..i + 1];
+            let after = &rest[i + 1..];
+            if after.starts_with(brace) {
+                string.push_str(brace);
+                rest = &after[1..];
+                continue;
             }
+            // the offset of `after` within the file
+            let offset = offset + s.len() - after.len();
+            if brace == "}" {
+                self.diagnostics.push(Diagnostic {
+                    span: Some(Span { file, offset: offset - 1, len: 1 }),
+                    message: Message::InvalidStringTemplate,
+                    severity: Severity::Error,
+                });
+                rest = after;
+                continue;
+            }
+            // the expression may itself contain `{}` to coerce a property
+            let mut depth = 0usize;
+            let end = after.find(|c| {
+                match c {
+                    '{' => depth += 1,
+                    '}' if depth == 0 => return true,
+                    '}' => depth -= 1,
+                    _ => (),
+                }
+                false
+            });
+            let Some(end) = end else {
+                self.diagnostics.push(Diagnostic {
+                    span: Some(Span { file, offset: offset - 1, len: after.len() + 1 }),
+                    message: Message::InvalidStringTemplate,
+                    severity: Severity::Error,
+                });
+                return string;
+            };
+            let first_diagnostic = self.diagnostics.len();
+            let mut parser = Parser::new(file, &after[..end]);
+            match self.parse_expression(&mut parser) {
+                Some((data, _)) if parser.is_empty() => string.push_str(&data.coerce_string()),
+                Some(_) => self.diagnostics.push(Diagnostic {
+                    span: Some(parser.span_until(|_| false)),
+                    message: Message::InvalidStringTemplate,
+                    severity: Severity::Error,
+                }),
+                None => (),
+            }
+            // the parser's spans are relative to the expression
+            for diagnostic in &mut self.diagnostics[first_diagnostic..] {
+                if let Some(span) = &mut diagnostic.span {
+                    span.offset += offset;
+                }
+            }
+            rest = &after[end + 1..];
         }
+        string.push_str(rest);
         string
+    }
+}
+
+/// An evaluated part of an expression.
+struct Operand {
+    data: Data,
+    span: Span,
+    coerce: Coercion,
+}
+
+/// How far an operand may be converted to the type an operator requires.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Coercion {
+    /// The operand must already have the required type.
+    Strict,
+    /// An integer literal, which may change between signed and unsigned.
+    Sign,
+    /// An expression in `{}`, which may be converted to any type.
+    Any,
+}
+
+#[derive(Clone, Copy)]
+enum Operator {
+    Or,
+    And,
+    Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Remainder,
+}
+impl Operator {
+    const fn precedence(self) -> u8 {
+        match self {
+            Self::Or => 0,
+            Self::And => 1,
+            Self::Equal | Self::NotEqual | Self::Less | Self::LessEqual | Self::Greater | Self::GreaterEqual => 2,
+            Self::Add | Self::Subtract => 3,
+            Self::Multiply | Self::Divide | Self::Remainder => 4,
+        }
     }
 }
 
@@ -652,6 +976,10 @@ pub struct File {
     pub path: PathBuf,
     data: String,
     locals: HashMap<String, usize>,
+    /// Whether the file is currently being processed.
+    active: bool,
+    /// The `use` statement which caused the file to be processed.
+    used: Option<Span>,
 }
 impl File {
     pub fn read(path: std::path::PathBuf) -> std::io::Result<Self> {
@@ -659,6 +987,8 @@ impl File {
             data: std::fs::read_to_string(&path)?,
             path,
             locals: HashMap::new(),
+            active: false,
+            used: None,
         })
     }
     /// Returns the path relative to the file.
@@ -722,10 +1052,25 @@ pub enum Message {
     ExpectedString,
     InvalidStringTemplate,
     InvalidInteger,
+    InvalidOperand {
+        ty: &'static str,
+        expected: &'static str,
+        coerce: bool,
+    },
+    MismatchedOperands {
+        lhs: &'static str,
+        rhs: &'static str,
+    },
+    IntegerOverflow,
+    DivisionByZero,
     InvalidType(String),
     ExpectedPath,
     ExpectedExpression,
     ReadFailure(PathBuf, std::io::Error),
+    RepeatedUse {
+        path: PathBuf,
+        file: usize,
+    },
     ExpectedExact(&'static str),
     UndeclaredProperty(String),
     RedeclareProperty {
@@ -754,10 +1099,16 @@ impl core::fmt::Display for Message {
             Self::ExpectedString => write!(f, "expected string"),
             Self::InvalidStringTemplate { .. } => write!(f, "invalid string template"),
             Self::InvalidInteger => write!(f, "invalid integer"),
+            Self::InvalidOperand { ty, expected, coerce: false } => write!(f, "{ty} value used where {expected} is required"),
+            Self::InvalidOperand { ty, expected, coerce: true } => write!(f, "{ty} value cannot be coerced to {expected}"),
+            Self::MismatchedOperands { lhs, rhs } => write!(f, "mismatched operand types {lhs} and {rhs}"),
+            Self::IntegerOverflow => write!(f, "integer overflow"),
+            Self::DivisionByZero => write!(f, "division by zero"),
             Self::InvalidType(ty) => write!(f, "invalid data type {ty:?}"),
             Self::ExpectedPath => write!(f, "expected path"),
             Self::ExpectedExpression => write!(f, "expected expression"),
             Self::ExpectedExact(s) => write!(f, "expected {s:?}"),
+            Self::RepeatedUse { path, .. } => write!(f, "file {path:?} is already used"),
             Self::ReadFailure(path, error) => write!(f, "failed to read {path:?}: {error}"),
             Self::UndeclaredProperty(name) => write!(f, "property {name:?} is undeclared"),
             Self::RedeclareProperty { .. } => write!(f, "redeclaration of property"),
@@ -810,7 +1161,7 @@ impl Value {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Data {
     None,
     Str(String),
@@ -819,6 +1170,72 @@ pub enum Data {
     Signed(i64),
 }
 impl Data {
+    /// Returns the name of the type as used by `declare`.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Str(_) => "str",
+            Self::Bool(_) => "bool",
+            Self::Unsigned(_) => "unsigned",
+            Self::Signed(_) => "signed",
+        }
+    }
+    pub fn is_integer(&self) -> bool {
+        matches!(self, Self::Unsigned(_) | Self::Signed(_))
+    }
+    /// Convert to an integer: a `bool` is `0` or `1` and a `str` is parsed.
+    pub fn coerce_integer(&self) -> Option<Self> {
+        match self {
+            Self::None => None,
+            Self::Str(string) => {
+                let mut parser = Parser::new(0, string);
+                match parser.integer() {
+                    Some((data, _)) if parser.is_empty() => Some(data),
+                    _ => None,
+                }
+            },
+            Self::Bool(value) => Some(Self::Unsigned(*value as u64)),
+            Self::Unsigned(_) | Self::Signed(_) => Some(self.clone()),
+        }
+    }
+    /// Convert to a boolean: an integer is true if it is not zero and a `str` must be `true` or `false`.
+    pub fn coerce_bool(&self) -> Option<bool> {
+        match self {
+            Self::None => None,
+            Self::Str(string) => match string.as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            },
+            Self::Bool(value) => Some(*value),
+            Self::Unsigned(i) => Some(*i != 0),
+            Self::Signed(i) => Some(*i != 0),
+        }
+    }
+    /// Convert to the type of `other`.
+    pub fn coerce_like(&self, other: &Self) -> Option<Self> {
+        match other {
+            Self::None => None,
+            Self::Str(_) => Some(Self::Str(self.coerce_string())),
+            Self::Bool(_) => self.coerce_bool().map(Self::Bool),
+            Self::Unsigned(_) | Self::Signed(_) => {
+                let integer = self.coerce_integer()?;
+                if integer.type_name() == other.type_name() {
+                    Some(integer)
+                } else {
+                    integer.convert_sign()
+                }
+            },
+        }
+    }
+    /// Convert between a signed and unsigned integer, if the value can be represented.
+    pub fn convert_sign(&self) -> Option<Self> {
+        match self {
+            Self::Unsigned(i) => i64::try_from(*i).ok().map(Self::Signed),
+            Self::Signed(i) => u64::try_from(*i).ok().map(Self::Unsigned),
+            _ => None,
+        }
+    }
     pub fn coerce_string(&self) -> String {
         match self {
             Self::None => String::new(),
@@ -941,22 +1358,33 @@ impl <'a> Parser<'a> {
         self.offset = i;
         Some((ident, Span { file: self.file, offset: start, len: ident.len() }))
     }
-    /// Either `true` or `false`.
-    pub fn bool(&mut self) -> Option<(bool, Span)> {
-        let s = self.as_str();
-        const TRUE: &str = "true";
-        const FALSE: &str = "false";
-        if s.starts_with(TRUE) {
-            let span = Span { file: self.file, offset: self.offset, len: TRUE.len() };
-            self.offset += span.len;
-            return Some((true, span));
+    /// An operator with a single space on either side.
+    ///
+    /// The operator is only taken if its precedence is at least `min_precedence`.
+    pub fn operator(&mut self, min_precedence: u8) -> Option<Operator> {
+        let rest = self.as_str().strip_prefix(' ')?;
+        let end = rest.find(' ')?;
+        let operator = match &rest[..end] {
+            "||" => Operator::Or,
+            "&&" => Operator::And,
+            "==" => Operator::Equal,
+            "!=" => Operator::NotEqual,
+            "<" => Operator::Less,
+            "<=" => Operator::LessEqual,
+            ">" => Operator::Greater,
+            ">=" => Operator::GreaterEqual,
+            "+" => Operator::Add,
+            "-" => Operator::Subtract,
+            "*" => Operator::Multiply,
+            "/" => Operator::Divide,
+            "%" => Operator::Remainder,
+            _ => return None,
+        };
+        if operator.precedence() < min_precedence {
+            return None;
         }
-        if s.starts_with(FALSE) {
-            let span = Span { file: self.file, offset: self.offset, len: FALSE.len() };
-            self.offset += span.len;
-            return Some((false, span));
-        }
-        None
+        self.offset += end + 2;
+        Some(operator)
     }
     /// An integer with an optional `-` or `+` sign.
     ///
