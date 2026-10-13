@@ -110,6 +110,8 @@ impl Project {
                 (Type::String, Data::Str(_)) => (),
                 (Type::Unsigned, Data::Unsigned(_)) => (),
                 (Type::Signed, Data::Signed(_)) => (),
+                // a literal without a sign is unsigned, but may still be in range
+                (Type::Signed, Data::Unsigned(i)) if i64::try_from(*i).is_ok() => (),
                 _ => self.diagnostics.push(Diagnostic {
                     span: value.data_span,
                     message: Message::MismatchedType { value: idx, name: name.clone() },
@@ -522,6 +524,18 @@ impl Project {
             } else {
                 None
             },
+            Some('0'..='9' | '-' | '+') => {
+                let span = parser.span_until(|c| c == ' ' || c == '\n');
+                let integer = parser.integer();
+                if integer.is_none() {
+                    self.diagnostics.push(Diagnostic {
+                        span: Some(span),
+                        message: Message::InvalidInteger,
+                        severity: Severity::Error,
+                    });
+                }
+                integer
+            },
             _ => {
                 self.diagnostics.push(Diagnostic {
                     span: Some(parser.span_until(|c| c == ' ' || c == '\n')),
@@ -707,6 +721,7 @@ pub enum Message {
     ExpectedIdentifier,
     ExpectedString,
     InvalidStringTemplate,
+    InvalidInteger,
     InvalidType(String),
     ExpectedPath,
     ExpectedExpression,
@@ -738,6 +753,7 @@ impl core::fmt::Display for Message {
             Self::ExpectedIdentifier => write!(f, "expected identifier"),
             Self::ExpectedString => write!(f, "expected string"),
             Self::InvalidStringTemplate { .. } => write!(f, "invalid string template"),
+            Self::InvalidInteger => write!(f, "invalid integer"),
             Self::InvalidType(ty) => write!(f, "invalid data type {ty:?}"),
             Self::ExpectedPath => write!(f, "expected path"),
             Self::ExpectedExpression => write!(f, "expected expression"),
@@ -941,6 +957,40 @@ impl <'a> Parser<'a> {
             return Some((false, span));
         }
         None
+    }
+    /// An integer with an optional `-` or `+` sign.
+    ///
+    /// The prefixes `0x`, `0o` and `0b` select hexadecimal, octal and binary, otherwise it is decimal.
+    /// Digits may be separated with `_`, but the first character must be a digit.
+    /// Returns [`Data::Signed`] if the sign is `-` and [`Data::Unsigned`] otherwise.
+    pub fn integer(&mut self) -> Option<(Data, Span)> {
+        let s = self.as_str();
+        let (negative, unsigned) = match s.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, s.strip_prefix('+').unwrap_or(s)),
+        };
+        let (radix, digits) = if let Some(rest) = unsigned.strip_prefix("0x") {
+            (16, rest)
+        } else if let Some(rest) = unsigned.strip_prefix("0o") {
+            (8, rest)
+        } else if let Some(rest) = unsigned.strip_prefix("0b") {
+            (2, rest)
+        } else {
+            (10, unsigned)
+        };
+        let end = digits.find(|c: char| !c.is_ascii_alphanumeric() && c != '_').unwrap_or(digits.len());
+        if digits.starts_with('_') {
+            return None;
+        }
+        let magnitude = u64::from_str_radix(&digits[..end].replace('_', ""), radix).ok()?;
+        let data = if negative {
+            Data::Signed(0i64.checked_sub_unsigned(magnitude)?)
+        } else {
+            Data::Unsigned(magnitude)
+        };
+        let start = self.offset;
+        self.offset += s.len() - digits.len() + end;
+        Some((data, self.span_from(start)))
     }
     /// A `'` quoted string on a single line.
     pub fn string(&mut self) -> Option<(&'a str, Span)> {
