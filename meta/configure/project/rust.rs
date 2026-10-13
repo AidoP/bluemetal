@@ -6,7 +6,6 @@ pub struct Crate {
     pub name_span: Span,
     pub path: PathBuf,
     pub path_span: Span,
-    pub sysroot: bool,
     pub builtin: bool,
 }
 

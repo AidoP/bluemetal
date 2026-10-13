@@ -22,11 +22,16 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
         return Err(Error::MissingArg("input"));
     };
     let input = PathBuf::from(input);
+
+    let sysroot = sysroot()?;
+
     let mut project = project::Project::new(input.parent().map_or_default(|path| path.into()));
     let file = match project::File::read(input.clone()) {
         Ok(file) => file,
         Err(error) => return Err(Error::Read(input, error)),
     };
+    let id = project.declare("sysroot".into(), Some(project::Property::new("sysroot".into(), project::Type::String)));
+    project.set("sysroot".into(), project::Value::new(id, project::Data::Str(sysroot.display().to_string())));
     project.parse(file);
     project.check();
 
@@ -60,19 +65,50 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
         }
     }
 
+    let depfile_path = std::path::Path::new("build.ninja.d");
+    let mut depfile = match std::fs::File::create(depfile_path) {
+        Ok(file) => file,
+        Err(error) => return Err(Error::Create(depfile_path.into(), error)),
+    };
+    if let Err(error) = write_depfile(&mut depfile, &project) {
+        return Err(Error::Write(depfile_path.into(), error));
+    }
+
     let mut build_ninja = NinjaFile::new("build.ninja")?;
     build_ninja.subninja("bootstrap.ninja")?;
 
-    build_ninja.rule("rustc")?;
+    build_ninja.variable("edition", "2024")?;
+    build_ninja.rule("rustc", &[
+        ("command", "rustc --color=always --emit=link=$out --emit=dep-info=$depfile --crate-type=$crate-type --crate-name=$crate-name --edition=$edition $flags $in"),
+        ("description", "RUSTC $out"),
+        ("deps", "gcc"),
+        ("depfile", "$out.d"),
+    ])?;
 
     let mut crates: Vec<_> = project.crates.into_values().collect();
     crates.sort_unstable_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
     for c in crates {
-        build_ninja.build("a")?;
-
+        let output = PathBuf::from(format!("target/lib{}.rlib", c.name));
+        build_ninja.build(&ninja::Build {
+            rule: "rustc",
+            outputs: &[&output],
+            inputs: &[&c.path],
+            variables: &[("crate-name", &c.name), ("crate-type", "lib")],
+            ..Default::default()
+        })?;
     }
 
     build_ninja.sync_all()?;
+
+    Ok(())
+}
+
+fn write_depfile(w: &mut dyn std::io::Write, project: &project::Project) -> Result<(), std::io::Error> {
+    write!(w, "build.ninja:")?;
+    for file in &project.files {
+        write!(w, " {}", file.path.display())?;
+    }
+    writeln!(w)?;
     Ok(())
 }
 
@@ -86,6 +122,8 @@ enum Error {
         warnings: usize,
     },
     Stderr(std::io::Error),
+    InvalidOutput(std::process::Command),
+    Exec(std::process::Command, std::io::Error),
 }
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
@@ -104,6 +142,28 @@ impl core::fmt::Display for Error {
                 write!(f, "configuration failed with {errors} error{error_suffix}, {warnings} warning{warning_suffix}")
             },
             Self::Stderr(error) => write!(f, "failed to write to stderr: {error}"),
+            Self::InvalidOutput(cmd) => write!(f, "invalid output from command {cmd:?}"),
+            Self::Exec(cmd, error) => write!(f, "failed to execute {cmd:?}: {error}"),
         }
     }
+}
+
+fn sysroot() -> Result<PathBuf, Error> {
+    use std::process::Command;
+    let mut cmd = Command::new("rustc");
+    cmd.arg("--print=sysroot");
+    let output = match cmd.output() {
+        Err(error) => {
+            return Err(Error::Exec(cmd, error));
+        },
+        Ok(output) => output,
+    };
+    if !output.status.success() {
+        return Err(Error::InvalidOutput(cmd));
+    }
+    let sysroot = match String::try_from(output.stdout) {
+        Ok(sysroot) if !sysroot.trim().is_empty() => PathBuf::from(sysroot.trim()),
+        _ => return Err(Error::InvalidOutput(cmd)),
+    };
+    Ok(sysroot)
 }

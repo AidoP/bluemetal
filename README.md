@@ -19,5 +19,12 @@ From now on just build with `ninja`.
 
 ### Statements
 
-- `include <path>`: start processing the file `<path>`
+- `use <path>`: start processing the build configuration file at `<path>`
+- `declare <name>`: define a property that can be used for substitution
+- `set <name> <value>`: assign a value to a property
 - `crate <name>`: introduces a crate named `<name>`
+
+
+### Builtin properties
+
+- `sysroot`: the sysroot of the Rust toolchain, as printed by `rustc --print=sysroot`

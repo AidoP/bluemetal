@@ -1,0 +1,6 @@
+declare rust-src
+    type 'str'
+    default '{sysroot}/lib/rustlib/src/rust'
+
+crate core '{rust-src}/library/core/src/lib.rs'
+    builtin

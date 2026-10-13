@@ -4,7 +4,7 @@ mod rust;
 
 pub struct Project {
     root: PathBuf,
-    files: Vec<File>,
+    pub files: Vec<File>,
     files_idx: HashMap<PathBuf, usize>,
     properties: Vec<Option<Property>>,
     properties_idx: HashMap<String, usize>,
@@ -50,7 +50,7 @@ impl Project {
                 };
                 match &mut self.properties[id] {
                     Some(_) => self.diagnostics.push(Diagnostic {
-                        span: Some(property_ref.span),
+                        span: property_ref.span,
                         message: Message::RedeclareProperty { id },
                         severity: Severity::Error,
                     }),
@@ -71,11 +71,13 @@ impl Project {
     /// Assign a value to a property, returning the ID of the value handle.
     pub fn set(&mut self, name: String, value: Value) -> usize {
         let id = self.values.len();
-        let file = &mut self.files[value.span.file];
-        if value.local {
-            file.locals.insert(name.clone(), id);
-        } else {
-            let _ = file.locals.remove(&name);
+        if let Some(span) = &value.span {
+            let file = &mut self.files[span.file];
+            if value.local {
+                file.locals.insert(name.clone(), id);
+            } else {
+                let _ = file.locals.remove(&name);
+            }
         }
         self.values.push(value);
         self.values_idx.insert(name, id);
@@ -96,7 +98,7 @@ impl Project {
             let value = &self.values[idx];
             let Some(property) = &self.properties[value.property] else {
                 self.diagnostics.push(Diagnostic {
-                    span: Some(value.span),
+                    span: value.span,
                     message: Message::UndeclaredProperty(name.clone()),
                     severity: Severity::Error,
                 });
@@ -109,7 +111,7 @@ impl Project {
                 (Type::Unsigned, Data::Unsigned(_)) => (),
                 (Type::Signed, Data::Signed(_)) => (),
                 _ => self.diagnostics.push(Diagnostic {
-                    span: Some(value.data_span),
+                    span: value.data_span,
                     message: Message::MismatchedType { value: idx, name: name.clone() },
                     severity: Severity::Error,
                 }),
@@ -136,18 +138,24 @@ impl Project {
         }
         match &diagnostic.message {
             Message::RedeclareProperty { id } => {
-                writeln!(w, "{style_note}note{style_white}: previously declared here{style_reset}")?;
-                self.write_location(w, &self.properties[*id].as_ref().unwrap().span, style_note, style_reset)?;
+                if let Some(span) = &self.properties[*id].as_ref().unwrap().span {
+                    writeln!(w, "{style_note}note{style_white}: previously declared here{style_reset}")?;
+                    self.write_location(w, span, style_note, style_reset)?;
+                }
             },
             Message::UnknownDeclarationAttribute { property, .. } => {
                 let property = self.properties[*property].as_ref().unwrap();
-                writeln!(w, "{style_note}note{style_white}: attribute specified for declaration of {:?}{style_reset}", property.name)?;
-                self.write_location(w, &property.span, style_note, style_reset)?;
+                if let Some(span) = &property.span {
+                    writeln!(w, "{style_note}note{style_white}: attribute specified for declaration of {:?}{style_reset}", property.name)?;
+                    self.write_location(w, span, style_note, style_reset)?;
+                }
             },
             Message::MismatchedType { value, .. } => {
                 let value = &self.values[*value];
-                writeln!(w, "{style_note}note{style_white}: previously declared here{style_reset}")?;
-                self.write_location(w, &self.properties[value.property].as_ref().unwrap().span, style_note, style_reset)?;
+                if let Some(span) = &self.properties[value.property].as_ref().unwrap().span {
+                    writeln!(w, "{style_note}note{style_white}: previously declared here{style_reset}")?;
+                    self.write_location(w, span, style_note, style_reset)?;
+                }
             },
             _ => (),
         }
@@ -281,9 +289,9 @@ impl Project {
                 "default" => {
                     self.set(ident.into(), Value {
                         property: idx,
-                        span: attribute.name_span,
+                        span: Some(attribute.name_span),
                         data: attribute.data,
-                        data_span: attribute.data_span,
+                        data_span: Some(attribute.data_span),
                         local: false,
                     });
                 }
@@ -302,7 +310,7 @@ impl Project {
             return;
         }
         *property = Some(Property {
-            span,
+            span: Some(span),
             name: ident.into(),
             ty,
         });
@@ -335,9 +343,9 @@ impl Project {
         let property = self.declare(ident.into(), None);
         let value = Value {
             property,
-            span,
+            span: Some(span),
             data,
-            data_span,
+            data_span: Some(data_span),
             local: false,
         };
         self.set(ident.into(), value);
@@ -415,7 +423,6 @@ impl Project {
             parser.skip_statement();
         }
         let mut builtin = false;
-        let mut sysroot = false;
         while let Some(_) = parser.indent() {
             let Some(attribute) = self.parse_attribute(parser) else {
                 parser.skip_line();
@@ -423,7 +430,6 @@ impl Project {
             };
             match attribute.name {
                 "builtin" => builtin = true,
-                "sysroot" => sysroot = true,
                 name => self.diagnostics.push(Diagnostic {
                     span: Some(attribute.name_span),
                     message: Message::UnknownCrateAttribute {
@@ -438,7 +444,6 @@ impl Project {
             name_span: span,
             path,
             path_span,
-            sysroot,
             builtin,
         });
     }
@@ -630,7 +635,7 @@ struct Attribute<'a> {
 }
 
 pub struct File {
-    path: PathBuf,
+    pub path: PathBuf,
     data: String,
     locals: HashMap<String, usize>,
 }
@@ -748,9 +753,18 @@ impl core::fmt::Display for Message {
 }
 
 pub struct Property {
-    span: Span,
+    span: Option<Span>,
     name: String,
     ty: Type,
+}
+impl Property {
+    pub fn new(name: String, ty: Type) -> Self {
+        Self {
+            span: None,
+            name,
+            ty,
+        }
+    }
 }
 
 pub enum Type {
@@ -763,10 +777,21 @@ pub enum Type {
 
 pub struct Value {
     property: usize,
-    span: Span,
+    span: Option<Span>,
     data: Data,
-    data_span: Span,
+    data_span: Option<Span>,
     local: bool,
+}
+impl Value {
+    pub fn new(property: usize, data: Data) -> Self {
+        Self {
+            property,
+            span: None,
+            data,
+            data_span: None,
+            local: false,
+        }
+    }
 }
 
 #[derive(Debug)]
