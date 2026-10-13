@@ -1,5 +1,7 @@
 use std::{collections::{HashMap, hash_map::Entry}, path::{Path, PathBuf}};
 
+mod rust;
+
 pub struct Project {
     root: PathBuf,
     files: Vec<File>,
@@ -9,6 +11,8 @@ pub struct Project {
     values: Vec<Value>,
     values_idx: HashMap<String, usize>,
     pub diagnostics: Vec<Diagnostic>,
+
+    pub crates: HashMap<String, rust::Crate>,
 }
 impl Project {
     pub fn new(root: PathBuf) -> Self {
@@ -21,6 +25,7 @@ impl Project {
             values: Vec::new(),
             values_idx: HashMap::new(),
             diagnostics: Vec::new(),
+            crates: HashMap::new(),
         }
     }
     pub fn file(&self, idx: usize) -> &File {
@@ -97,6 +102,18 @@ impl Project {
                 });
                 continue;
             };
+            match (&property.ty, &value.data) {
+                (Type::Any, _) => (),
+                (Type::Bool, Data::Bool(_)) => (),
+                (Type::String, Data::Str(_)) => (),
+                (Type::Unsigned, Data::Unsigned(_)) => (),
+                (Type::Signed, Data::Signed(_)) => (),
+                _ => self.diagnostics.push(Diagnostic {
+                    span: Some(value.data_span),
+                    message: Message::MismatchedType { value: idx, name: name.clone() },
+                    severity: Severity::Error,
+                }),
+            }
         }
     }
     /// Write a diagnostic in a human readable form.
@@ -126,6 +143,11 @@ impl Project {
                 let property = self.properties[*property].as_ref().unwrap();
                 writeln!(w, "{style_note}note{style_white}: attribute specified for declaration of {:?}{style_reset}", property.name)?;
                 self.write_location(w, &property.span, style_note, style_reset)?;
+            },
+            Message::MismatchedType { value, .. } => {
+                let value = &self.values[*value];
+                writeln!(w, "{style_note}note{style_white}: previously declared here{style_reset}")?;
+                self.write_location(w, &self.properties[value.property].as_ref().unwrap().span, style_note, style_reset)?;
             },
             _ => (),
         }
@@ -176,6 +198,7 @@ impl Project {
                 "use" => self.parse_use(&mut parser),
                 "set" => self.parse_set(&mut parser),
                 "log" => self.parse_log(&mut parser),
+                "crate" => self.parse_crate(&mut parser),
                 _ => {
                     parser.offset = start;
                     let _ = parser.skip_statement();
@@ -234,6 +257,7 @@ impl Project {
         if !self.parse_line_end(parser) {
             parser.skip_statement();
         }
+        let mut ty = Type::Any;
         while let Some(_) = parser.indent() {
             let Some(attribute) = self.parse_attribute(parser) else {
                 parser.skip_line();
@@ -241,12 +265,18 @@ impl Project {
             };
             match attribute.name {
                 "type" => {
-                    self.diagnostics.push(Diagnostic {
-                        span: Some(attribute.name_span),
-                        message: Message::User("unimplemented".into()),
-                        severity: Severity::Error,
-                    });
-                    println!("attr type {:?}", attribute.data.coerce_string());
+                    let name = attribute.data.coerce_string();
+                    match name.as_str() {
+                        "str" => ty = Type::String,
+                        "bool" => ty = Type::Bool,
+                        "unsigned" => ty = Type::Unsigned,
+                        "signed" => ty = Type::Signed,
+                        _ => self.diagnostics.push(Diagnostic {
+                            span: Some(attribute.data_span),
+                            message: Message::InvalidType(name),
+                            severity: Severity::Error,
+                        }),
+                    }
                 },
                 "default" => {
                     self.set(ident.into(), Value {
@@ -274,6 +304,7 @@ impl Project {
         *property = Some(Property {
             span,
             name: ident.into(),
+            ty,
         });
     }
     fn parse_set(&mut self, parser: &mut Parser) {
@@ -353,6 +384,62 @@ impl Project {
             span: Some(span),
             message: Message::User(string),
             severity,
+        });
+    }
+    fn parse_crate(&mut self, parser: &mut Parser) {
+        if !self.parse_space(parser) {
+            parser.skip_statement();
+            return;
+        }
+        let Some((name, span)) = parser.ident() else {
+            let span = parser.skip_statement();
+            self.diagnostics.push(Diagnostic {
+                span: Some(span),
+                message: Message::ExpectedIdentifier,
+                severity: Severity::Error,
+            });
+            return;
+        };
+        let path;
+        let path_span;
+        if parser.peek() == Some(' ') && self.parse_space(parser) && let Some((p, s)) = self.parse_path(parser) {
+            path = p;
+            path_span = s;
+        } else {
+            let mut rel_path = self.files[parser.file].relative_path(name);
+            rel_path.push("lib.rs");
+            path = rel_path;
+            path_span = span;
+        }
+        if !self.parse_line_end(parser) {
+            parser.skip_statement();
+        }
+        let mut builtin = false;
+        let mut sysroot = false;
+        while let Some(_) = parser.indent() {
+            let Some(attribute) = self.parse_attribute(parser) else {
+                parser.skip_line();
+                continue;
+            };
+            match attribute.name {
+                "builtin" => builtin = true,
+                "sysroot" => sysroot = true,
+                name => self.diagnostics.push(Diagnostic {
+                    span: Some(attribute.name_span),
+                    message: Message::UnknownCrateAttribute {
+                        name: name.into(),
+                    },
+                    severity: Severity::Error,
+                }),
+            }
+        }
+        self.crates.insert(name.into(), rust::Crate {
+            name: name.into(),
+            name_span: span,
+            path,
+            path_span,
+            sysroot,
+            builtin,
         });
     }
     /// Takes the next space from the parser and returns true.
@@ -615,6 +702,7 @@ pub enum Message {
     ExpectedIdentifier,
     ExpectedString,
     InvalidStringTemplate,
+    InvalidType(String),
     ExpectedPath,
     ExpectedExpression,
     ReadFailure(PathBuf, std::io::Error),
@@ -625,6 +713,13 @@ pub enum Message {
     },
     UnknownDeclarationAttribute {
         property: usize,
+        name: String,
+    },
+    UnknownCrateAttribute {
+        name: String,
+    },
+    MismatchedType {
+        value: usize,
         name: String,
     },
 }
@@ -638,6 +733,7 @@ impl core::fmt::Display for Message {
             Self::ExpectedIdentifier => write!(f, "expected identifier"),
             Self::ExpectedString => write!(f, "expected string"),
             Self::InvalidStringTemplate { .. } => write!(f, "invalid string template"),
+            Self::InvalidType(ty) => write!(f, "invalid data type {ty:?}"),
             Self::ExpectedPath => write!(f, "expected path"),
             Self::ExpectedExpression => write!(f, "expected expression"),
             Self::ExpectedExact(s) => write!(f, "expected {s:?}"),
@@ -645,6 +741,8 @@ impl core::fmt::Display for Message {
             Self::UndeclaredProperty(name) => write!(f, "property {name:?} is undeclared"),
             Self::RedeclareProperty { .. } => write!(f, "redeclaration of property"),
             Self::UnknownDeclarationAttribute { name, .. } => write!(f, "unknown declare attribute {name:?}"),
+            Self::UnknownCrateAttribute { name, .. } => write!(f, "unknown crate attribute {name:?}"),
+            Self::MismatchedType { name, .. } => write!(f, "invalid data type for property {name:?}"),
         }
     }
 }
@@ -652,6 +750,15 @@ impl core::fmt::Display for Message {
 pub struct Property {
     span: Span,
     name: String,
+    ty: Type,
+}
+
+pub enum Type {
+    Any,
+    String,
+    Bool,
+    Unsigned,
+    Signed,
 }
 
 pub struct Value {

@@ -1,6 +1,9 @@
 use std::{io::IsTerminal, path::PathBuf};
 
+mod ninja;
 mod project;
+
+use ninja::NinjaFile;
 
 fn main() -> std::process::ExitCode {
     let mut args = std::env::args_os();
@@ -59,6 +62,16 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
 
     let mut build_ninja = NinjaFile::new("build.ninja")?;
     build_ninja.subninja("bootstrap.ninja")?;
+
+    build_ninja.rule("rustc")?;
+
+    let mut crates: Vec<_> = project.crates.into_values().collect();
+    crates.sort_unstable_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
+    for c in crates {
+        build_ninja.build("a")?;
+
+    }
+
     build_ninja.sync_all()?;
     Ok(())
 }
@@ -92,49 +105,5 @@ impl core::fmt::Display for Error {
             },
             Self::Stderr(error) => write!(f, "failed to write to stderr: {error}"),
         }
-    }
-}
-
-struct NinjaFile {
-    path: std::path::PathBuf,
-    tmp_path: std::path::PathBuf,
-    file: std::io::BufWriter<std::fs::File>,
-}
-impl NinjaFile {
-    pub fn new<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
-        fn new(path: &std::path::Path) -> Result<NinjaFile, Error> {
-            let tmp_path = path.with_added_extension("tmp");
-            let file = match std::fs::File::create(&tmp_path) {
-                Ok(f) => f,
-                Err(error) => return Err(Error::Create(path.into(), error)),
-            };
-            Ok(NinjaFile {
-                tmp_path,
-                path: path.into(),
-                file: std::io::BufWriter::new(file),
-            })
-        }
-        new(path.as_ref())
-    }
-    pub fn subninja(&mut self, name: &str) -> Result<(), Error> {
-        use std::io::Write;
-        if let Err(error) = writeln!(self.file, "subninja {name}") {
-            return Err(Error::Write(self.path.clone(), error));
-        }
-        Ok(())
-    }
-    /// Finalize writing the ninja file.
-    ///
-    /// Flushes writes and renames the temporary file to the true file.
-    pub fn sync_all(&mut self) -> Result<(), Error> {
-        if let Err(error) = self.file.get_mut().sync_all() {
-            return Err(Error::Write(self.path.clone(), error));
-        }
-        if let Err(error) = std::fs::rename(&self.tmp_path, &self.path) {
-            // last-ditch clean up attempt
-            let _ = std::fs::remove_file(&self.tmp_path);
-            return Err(Error::Write(self.path.clone(), error));
-        }
-        Ok(())
     }
 }
