@@ -1,6 +1,6 @@
-target riscv64gc-unknown-linux-gnu
-    override
+target rv64
+    inherit 'riscv64gc-unknown-linux-gnu'
     test
 
-set target 'riscv64gc-unknown-linux-gnu'
+set target 'rv64'
 use '/sys'

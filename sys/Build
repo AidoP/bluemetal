@@ -7,6 +7,7 @@ crate core '{rust-src}/library/core/src/lib.rs'
 
 crate compiler_builtins 'compiler_builtins/lib.rs'
     builtin
+    use core
 
 crate core '{rust-src}/library/core/src/lib.rs'
     target '{host-target}'
@@ -16,9 +17,6 @@ declare device-tree
     type 'bool'
     info 'enable runtime device tree loading'
     default false
-
-# test clippy
-    cargo clippy
 
 @if device-tree
 crate dtb 'device-tree.rs'
