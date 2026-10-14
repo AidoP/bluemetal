@@ -23,7 +23,8 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
     };
     let input = PathBuf::from(input);
 
-    let sysroot = sysroot()?;
+    let sysroot = rustc_print("sysroot")?;
+    let host = rustc_print("host-tuple")?;
 
     let mut project = project::Project::new(input.parent().map_or_default(|path| path.into()));
     let file = match project::File::read(input.clone()) {
@@ -31,7 +32,13 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
         Err(error) => return Err(Error::Read(input, error)),
     };
     let id = project.declare("sysroot".into(), Some(project::Property::new("sysroot".into(), project::Type::String)));
-    project.set("sysroot".into(), project::Value::new(id, project::Data::Str(sysroot.display().to_string())));
+    project.set("sysroot".into(), project::Value::new(id, project::Data::Str(sysroot)));
+    // the target triple crates are compiled for, unless they have a `target` attribute
+    let id = project.declare("target".into(), Some(project::Property::new("target".into(), project::Type::String)));
+    project.set("target".into(), project::Value::new(id, project::Data::Str(host.clone())));
+    // the triple of the machine running the build, for crates such as tools which must run during it
+    let id = project.declare("host-target".into(), Some(project::Property::new("host-target".into(), project::Type::String)));
+    project.set("host-target".into(), project::Value::new(id, project::Data::Str(host)));
     project.parse(file);
     project.check();
 
@@ -79,21 +86,22 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
 
     build_ninja.variable("edition", "2024")?;
     build_ninja.rule("rustc", &[
-        ("command", "rustc --color=always --emit=link=$out --emit=dep-info=$depfile --crate-type=$crate-type --crate-name=$crate-name --edition=$edition $flags $in"),
+        ("command", "rustc --color=always --out-dir=target/tmp --emit=link=$out --emit=dep-info=$depfile --crate-type=$crate-type --crate-name=$crate-name --edition=$edition $flags $in"),
         ("description", "RUSTC $out"),
         ("deps", "gcc"),
         ("depfile", "$out.d"),
     ])?;
 
     let mut crates: Vec<_> = project.crates.into_values().collect();
-    crates.sort_unstable_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
+    crates.sort_unstable_by(|lhs, rhs| (&lhs.name, &lhs.target).cmp(&(&rhs.name, &rhs.target)));
     for c in crates {
-        let output = PathBuf::from(format!("target/lib{}.rlib", c.name));
+        let output = PathBuf::from(format!("target/{}/lib{}.rlib", c.target, c.name));
+        let flags = format!("--target={}", c.target);
         build_ninja.build(&ninja::Build {
             rule: "rustc",
             outputs: &[&output],
             inputs: &[&c.path],
-            variables: &[("crate-name", &c.name), ("crate-type", "lib")],
+            variables: &[("crate-name", &c.name), ("crate-type", "lib"), ("flags", &flags)],
             ..Default::default()
         })?;
     }
@@ -148,10 +156,11 @@ impl core::fmt::Display for Error {
     }
 }
 
-fn sysroot() -> Result<PathBuf, Error> {
+/// Returns the trimmed output of `rustc --print=<request>`.
+fn rustc_print(request: &str) -> Result<String, Error> {
     use std::process::Command;
     let mut cmd = Command::new("rustc");
-    cmd.arg("--print=sysroot");
+    cmd.arg(format!("--print={request}"));
     let output = match cmd.output() {
         Err(error) => {
             return Err(Error::Exec(cmd, error));
@@ -161,9 +170,8 @@ fn sysroot() -> Result<PathBuf, Error> {
     if !output.status.success() {
         return Err(Error::InvalidOutput(cmd));
     }
-    let sysroot = match String::try_from(output.stdout) {
-        Ok(sysroot) if !sysroot.trim().is_empty() => PathBuf::from(sysroot.trim()),
-        _ => return Err(Error::InvalidOutput(cmd)),
-    };
-    Ok(sysroot)
+    match String::from_utf8(output.stdout) {
+        Ok(value) if !value.trim().is_empty() => Ok(value.trim().into()),
+        _ => Err(Error::InvalidOutput(cmd)),
+    }
 }

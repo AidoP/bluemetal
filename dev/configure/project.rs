@@ -12,7 +12,8 @@ pub struct Project {
     values_idx: HashMap<String, usize>,
     pub diagnostics: Vec<Diagnostic>,
 
-    pub crates: HashMap<String, rust::Crate>,
+    /// Crates keyed by name and target, as a crate may be compiled for several targets.
+    pub crates: HashMap<(String, String), rust::Crate>,
 }
 impl Project {
     pub fn new(root: PathBuf) -> Self {
@@ -161,6 +162,11 @@ impl Project {
                     writeln!(w, "{style_note}note{style_white}: first used here{style_reset}")?;
                     self.write_location(w, span, style_note, style_reset)?;
                 }
+            },
+            Message::RedeclareCrate { name, target } => {
+                let span = &self.crates[&(name.clone(), target.clone())].name_span;
+                writeln!(w, "{style_note}note{style_white}: previously declared here{style_reset}")?;
+                self.write_location(w, span, style_note, style_reset)?;
             },
             Message::UnknownDeclarationAttribute { property, .. } => {
                 let property = self.properties[*property].as_ref().unwrap();
@@ -450,6 +456,7 @@ impl Project {
             parser.skip_statement();
         }
         let mut builtin = false;
+        let mut target = None;
         while let Some(_) = parser.indent() {
             let Some(attribute) = self.parse_attribute(parser) else {
                 parser.skip_line();
@@ -457,6 +464,18 @@ impl Project {
             };
             match attribute.name {
                 "builtin" => builtin = true,
+                "target" => match attribute.data {
+                    Data::Str(string) => target = Some(string),
+                    data => self.diagnostics.push(Diagnostic {
+                        span: Some(attribute.data_span),
+                        message: Message::InvalidOperand {
+                            ty: data.type_name(),
+                            expected: "str",
+                            coerce: false,
+                        },
+                        severity: Severity::Error,
+                    }),
+                },
                 name => self.diagnostics.push(Diagnostic {
                     span: Some(attribute.name_span),
                     message: Message::UnknownCrateAttribute {
@@ -466,13 +485,28 @@ impl Project {
                 }),
             }
         }
-        self.crates.insert(name.into(), rust::Crate {
-            name: name.into(),
-            name_span: span,
-            path,
-            path_span,
-            builtin,
-        });
+        // without an attribute, the crate is compiled for the `target` property in effect at its declaration
+        let target = target.unwrap_or_else(|| self.property("target", span).map_or_default(|data| data.coerce_string()));
+        match self.crates.entry((name.into(), target.clone())) {
+            Entry::Occupied(_) => self.diagnostics.push(Diagnostic {
+                span: Some(span),
+                message: Message::RedeclareCrate {
+                    name: name.into(),
+                    target,
+                },
+                severity: Severity::Error,
+            }),
+            Entry::Vacant(entry) => {
+                entry.insert(rust::Crate {
+                    name: name.into(),
+                    name_span: span,
+                    path,
+                    path_span,
+                    target,
+                    builtin,
+                });
+            },
+        }
     }
     /// Takes the next space from the parser and returns true.
     /// If the parser is not pointing at a space, a diagnostic is created and false is returned.
@@ -1083,6 +1117,10 @@ pub enum Message {
     UnknownCrateAttribute {
         name: String,
     },
+    RedeclareCrate {
+        name: String,
+        target: String,
+    },
     MismatchedType {
         value: usize,
         name: String,
@@ -1114,6 +1152,7 @@ impl core::fmt::Display for Message {
             Self::RedeclareProperty { .. } => write!(f, "redeclaration of property"),
             Self::UnknownDeclarationAttribute { name, .. } => write!(f, "unknown declare attribute {name:?}"),
             Self::UnknownCrateAttribute { name, .. } => write!(f, "unknown crate attribute {name:?}"),
+            Self::RedeclareCrate { name, target } => write!(f, "redeclaration of crate {name:?} for target {target:?}"),
             Self::MismatchedType { name, .. } => write!(f, "invalid data type for property {name:?}"),
         }
     }

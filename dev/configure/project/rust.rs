@@ -6,6 +6,8 @@ pub struct Crate {
     pub name_span: Span,
     pub path: PathBuf,
     pub path_span: Span,
+    /// The target triple the crate is compiled for.
+    pub target: String,
     pub builtin: bool,
 }
 

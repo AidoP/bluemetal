@@ -1,7 +1,7 @@
 edition = 2024
 
 rule rust
-    command = rustc --color=always --emit=link=$out --emit=dep-info=$depfile --crate-type=$crate-type --crate-name=$crate-name --edition=$edition $flags $in
+    command = rustc --color=always --out-dir=target/tmp --emit=link=$out --emit=metadata=$out.rmeta --emit=dep-info=$depfile --crate-type=$crate-type --crate-name=$crate-name --edition=$edition $flags $in
     deps = gcc
     depfile = $out.d
 
@@ -12,11 +12,11 @@ rule configure
     deps = gcc
     depfile = $out.d
 
-build target/configure: rust meta/configure/main.rs
+build target/configure: rust dev/configure/main.rs
     crate-type = bin
     crate-name = configure
 
-build target/test-configure: rust meta/configure/main.rs
+build target/test-configure: rust dev/configure/main.rs
     crate-type = bin
     crate-name = test_configure
     flags = --test

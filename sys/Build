@@ -4,3 +4,7 @@ declare rust-src
 
 crate core '{rust-src}/library/core/src/lib.rs'
     builtin
+
+crate core '{rust-src}/library/core/src/lib.rs'
+    target '{host-target}'
+    builtin
