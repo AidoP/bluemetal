@@ -1402,20 +1402,21 @@ fn list_functions() {
     let project = Project::new("list-functions", &[("Build", "\
 declare flags
     default ['-O', 'dtb', 2, -1]
-log note '{len(flags)} {len([])} {len([[1, 2]])}'
+log note '{len(flags)} {len([])} {len([[1, 2]])} {len('abc')} {len('')} {len('é')}'
 log note '{contains(flags, 'dtb')} {contains(flags, 'x')} {contains(flags, 2)} {contains(flags, -1)} {contains([[1]], [1])}'
 @if len(flags) > 3 && contains(flags, '-O')
 log note 'condition'
 declare a
-set a len('abc')
+set a len(5)
 set a contains('abc', 'a')
 set a contains(flags)
 ")]);
     project.configure().failed()
-        .stderr("note: 4 0 1\n")
+        // the length of a string is in bytes
+        .stderr("note: 4 0 1 3 0 2\n")
         .stderr("note: true false true true true\n")
         .stderr("note: condition\n")
-        .stderr("error: str value used where list is required\n --> Build:8:11")
+        .stderr("error: unsigned value used where list or str is required\n --> Build:8:11")
         .stderr("error: str value used where list is required\n --> Build:9:16")
         .stderr("error: function \"contains\" takes 2 arguments, but 1 was given")
         .stderr("configuration failed with 3 errors");
@@ -1548,9 +1549,10 @@ test app
     let host = project.host();
     project.configure().failed()
         // other environments are not supported yet
-        .stderr(&format!("error: tests for target \"riscv64gc-unknown-none-elf\" cannot be run, only those for the host target \"{host}\"\n --> Build:2:12"))
-        .stderr("error: redeclaration of test \"app\"\n --> Build:6:6")
-        .stderr("note: previously declared here\n --> Build:4:7");
+        .stderr(&format!("error: tests for target \"riscv64gc-unknown-none-elf\" cannot be run, only those for the host target \"{host}\" or a target with `test`\n --> Build:2:12"))
+        // the tests of crates are registered once the targets are known, after the statements
+        .stderr("error: redeclaration of test \"app\"\n --> Build:4:7")
+        .stderr("note: previously declared here\n --> Build:6:6");
 }
 
 #[test]
@@ -1672,7 +1674,7 @@ target later
         .stderr("error: unsigned value used where str is required\n --> Build:4:16")
         .stderr("error: str value used where bool is required\n --> Build:5:16")
         .stderr("error: list value used where str is required\n --> Build:6:20")
-        .stderr("error: \"riscv64gc-unknown-none-elf\" is the name of a builtin target\n --> Build:7:8")
+        .stderr("error: \"riscv64gc-unknown-none-elf\" is the name of a builtin target, which can be changed with `override`\n --> Build:7:8")
         .stderr("error: redeclaration of target \"bad\"\n --> Build:9:8")
         .stderr("error: unknown target \"nonexistent\"\n  --> Build:11:12")
         .stderr("configuration failed with 8 errors");
@@ -1731,4 +1733,311 @@ log note '''
         .stderr("warning: after\n --> Build:6:13")
         .stderr("error: multi-line string is not terminated\n --> Build:7:10")
         .stderr("configuration failed with 4 errors, 1 warning");
+}
+
+#[test]
+fn crate_targets() {
+    let project = Project::new("crate-targets", &[("Build", "\
+crate core 'core.rs'
+    target ['riscv64gc-unknown-none-elf', host-target]
+    builtin
+crate util 'util.rs'
+    target ['riscv64gc-unknown-none-elf', host-target]
+crate app 'app.rs'
+    target ['riscv64gc-unknown-none-elf']
+    use util
+")]);
+    let host = project.host();
+    let output = project.configure().ok();
+    // a crate is declared for each target, with its dependencies for the same target
+    let mut outputs = output.outputs();
+    outputs.sort();
+    let mut expected = vec![
+        "target/riscv64gc-unknown-none-elf/libapp.rlib".to_string(),
+        "target/riscv64gc-unknown-none-elf/libcore.rlib".into(),
+        "target/riscv64gc-unknown-none-elf/libutil.rlib".into(),
+        format!("target/{host}/libcore.rlib"),
+        format!("target/{host}/libutil.rlib"),
+    ];
+    expected.sort();
+    assert_eq!(outputs, expected);
+    assert_contains(output.build(&format!("target/{host}/libutil.rlib")), &format!(
+        "--extern core=target/{host}/libcore.rlib",
+    ));
+}
+
+#[test]
+fn crate_target_errors() {
+    let project = Project::new("crate-target-errors", &[("Build", "\
+crate a 'a.rs'
+    target ['riscv64gc-unknown-none-elf', 'riscv64gc-unknown-none-elf']
+crate b 'b.rs'
+    target ['x86_64-unknown-none', 5]
+crate c 'c.rs'
+    target [host-target, 'riscv64gc-unknown-none-elf']
+    test
+")]);
+    let host = project.host();
+    let output = project.configure().failed();
+    output
+        .stderr("error: target \"riscv64gc-unknown-none-elf\" is listed more than once\n --> Build:2:12")
+        .stderr("error: list value used where str is required\n --> Build:4:12")
+        // only the crate for the host target is tested
+        .stderr(&format!("error: tests for target \"riscv64gc-unknown-none-elf\" cannot be run, only those for the host target \"{host}\" or a target with `test`\n --> Build:6:12"))
+        .stderr("configuration failed with 3 errors");
+}
+
+#[test]
+fn target_test_runners() {
+    let project = Project::new("target-runners", &[("Build", "\
+crate app 'app.rs'
+    target ['vm', 'plain', host-target]
+    test
+target vm
+    inherit 'riscv64gc-unknown-none-elf'
+    test
+    runner ['./run.sh', '-m', 'virt']
+target plain
+    inherit 'x86_64-unknown-none'
+    test true
+"), ("run.sh", "")]);
+    let host = project.host();
+    let output = project.configure_with(NIGHTLY).ok();
+    // a test is named with its target unless it is the host target, and needs its runner
+    assert_contains(&output.ninja, "\nbuild test/app@vm: phony target/vm/test/app run.sh\n");
+    assert_contains(&output.ninja, "\nbuild test/app@plain: phony target/plain/test/app\n");
+    assert_contains(&output.ninja, &format!("\nbuild test/app: phony target/{host}/test/app\n"));
+    // the runner runs the harness, which is its last argument, while without one the harness runs directly
+    let database = std::fs::read(project.dir.join("target/build.db")).unwrap();
+    let strings = |strings: &[&str]| {
+        let mut bytes = (strings.len() as u32).to_le_bytes().to_vec();
+        for s in strings {
+            bytes.extend((s.len() as u32).to_le_bytes());
+            bytes.extend(s.as_bytes());
+        }
+        bytes
+    };
+    let contains = |needle: &[u8]| database.windows(needle.len()).any(|window| window == needle);
+    assert!(contains(&strings(&["./run.sh", "-m", "virt", "target/vm/test/app"])));
+    assert!(contains(&strings(&["./target/plain/test/app"])));
+}
+
+#[test]
+fn target_test_runner_errors() {
+    let project = Project::new("target-runner-errors", &[("Build", "\
+crate lib 'lib.rs'
+    target 'no-tests'
+    test
+target no-tests
+    inherit 'x86_64-unknown-none'
+    runner 'ignored'
+target bad
+    inherit 'x86_64-unknown-none'
+    test 'yes'
+    runner []
+")]);
+    let host = project.host();
+    project.configure_with(NIGHTLY).failed()
+        // a runner does not allow tests on its own
+        .stderr(&format!("error: tests for target \"no-tests\" cannot be run, only those for the host target \"{host}\" or a target with `test`\n --> Build:2:12"))
+        .stderr("error: str value used where bool is required\n --> Build:9:10")
+        .stderr("error: list value used where str or a list of str is required\n  --> Build:10:12")
+        .stderr("configuration failed with 3 errors");
+}
+
+#[test]
+fn target_override() {
+    let project = Project::new("target-override", &[("Build", "\
+crate app 'app.rs'
+    target ['riscv64gc-unknown-none-elf', host-target]
+    test
+target riscv64gc-unknown-none-elf
+    override
+    test
+    runner ['qemu-system-riscv64', '-kernel']
+")]);
+    let host = project.host();
+    let output = project.configure_with(NIGHTLY).ok();
+    // a builtin target keeps its specification, but can be tested
+    assert_contains(output.build("target/riscv64gc-unknown-none-elf/test/app"), "\
+    flags = --target=riscv64gc-unknown-none-elf -L dependency=target/riscv64gc-unknown-none-elf --test");
+    assert_contains(&output.ninja, "\nbuild test/app@riscv64gc-unknown-none-elf: phony target/riscv64gc-unknown-none-elf/test/app\n");
+    assert_contains(&output.ninja, &format!("\nbuild test/app: phony target/{host}/test/app\n"));
+    assert!(!project.dir.join("target/targets").exists());
+}
+
+#[test]
+fn target_override_errors() {
+    let project = Project::new("target-override-errors", &[("Build", "\
+target riscv64gc-unknown-none-elf
+    override
+    inherit 'x86_64-unknown-none'
+    os 'x'
+    test
+target riscv64gc-unknown-none
+    override
+target x86_64-unknown-none
+    os 'x'
+target riscv64gc-unknown-none-elf
+    override
+")]);
+    project.configure_with(NIGHTLY).failed()
+        // it cannot be used with the attributes which describe a specification
+        .stderr("error: attribute \"inherit\" cannot be used with `override`\n --> Build:3:5")
+        .stderr("error: attribute \"os\" cannot be used with `override`\n --> Build:4:5")
+        .stderr("error: unknown target \"riscv64gc-unknown-none\", did you mean \"riscv64gc-unknown-none-elf\"?\n --> Build:6:8")
+        .stderr("error: \"x86_64-unknown-none\" is the name of a builtin target, which can be changed with `override`\n --> Build:8:8")
+        .stderr("error: redeclaration of target \"riscv64gc-unknown-none-elf\"\n  --> Build:10:8")
+        .stderr("configuration failed with 5 errors");
+}
+
+#[test]
+fn attribute_comments() {
+    let project = Project::new("attribute-comments", &[("Build", "\
+declare size
+    # type 'str'
+    type 'unsigned'
+    #default 'x'
+    default 1
+# a comment
+crate app 'app.rs'
+    # use missing
+    default
+    #
+log note 'size is {size}'
+")]);
+    let host = project.host();
+    let output = project.configure().ok();
+    // an indented comment comments out an attribute, without ending the statement
+    output.stderr("note: size is 1\n");
+    assert_contains(&output.ninja, &format!("\ndefault target/{host}/libapp.rlib\n"));
+
+    // a comment must be at the indentation of an attribute
+    let project = Project::new("attribute-comment-errors", &[("Build", "crate bad 'bad.rs'\n        # too deep\n")]);
+    project.configure().failed()
+        .stderr("error: expected identifier\n --> Build:2:5")
+        .stderr("configuration failed with 1 error");
+}
+
+#[test]
+fn meta_for() {
+    let project = Project::new("meta-for", &[("Build", "\
+declare targets
+    default ['riscv64gc-unknown-none-elf', 'x86_64-unknown-none']
+@for t in targets
+crate k 'k.rs'
+    target t
+@for n in 1 2 [3, 4]
+@if n % 2 == 0
+log note 'even {n}'
+@for a in 'x' 'y'
+@for b in [1, 2]
+log note '{a}{b}'
+@for e in []
+log note 'never'
+@if false
+@for f in [missing]
+log note 'skipped'
+log note 'after'
+")]);
+    let output = project.configure().ok();
+    // the statement is processed for each value, with the meta-statements after the `@for`
+    let mut outputs = output.outputs();
+    outputs.sort();
+    assert_eq!(outputs, ["target/riscv64gc-unknown-none-elf/libk.rlib", "target/x86_64-unknown-none/libk.rlib"]);
+    output.stderr("note: even 2\n").stderr("note: even 4\n");
+    assert!(!output.stderr.contains("even 1") && !output.stderr.contains("even 3"), "{}", output.stderr);
+    // loops can be nested
+    output.stderr("note: x1\n").stderr("note: x2\n").stderr("note: y1\n").stderr("note: y2\n");
+    // without values, or in a skipped statement, nothing is processed or evaluated
+    assert!(!output.stderr.contains("never") && !output.stderr.contains("skipped"), "{}", output.stderr);
+    output.stderr("note: after\n");
+}
+
+#[test]
+fn meta_for_errors() {
+    let project = Project::new("meta-for-errors", &[("Build", "\
+@for x 1
+log note 'a'
+@for x in
+log note 'b'
+@for x in 1
+
+log note 'c'
+log note '{x}'
+")]);
+    let output = project.configure().failed();
+    output
+        .stderr("error: expected \"in\"\n --> Build:1:8")
+        .stderr("error: expected \" \"\n --> Build:3:10")
+        .stderr("error: expected statement on the line after a meta-statement\n --> Build:5:1")
+        // the property is only set for the statement
+        .stderr("error: no value for property \"x\"\n --> Build:8:12")
+        .stderr("configuration failed with 4 errors");
+    assert!(!output.stderr.contains("note: a\n") && !output.stderr.contains("note: b\n"), "{}", output.stderr);
+}
+
+#[test]
+fn meta_then() {
+    let project = Project::new("meta-then", &[("Build", "\
+declare x
+    default 0
+@for a in 1 2
+set x (x + a)
+@then
+log note 'inc {a}, total: {x}'
+@if x > 5
+log note 'big'
+@then
+log note 'also big'
+@else
+log note 'small'
+@then
+@if x == 3
+log note 'three'
+@then
+log note 'still three'
+@for a in []
+log note 'never'
+@then
+log note 'never either'
+log note 'end'
+")]);
+    let output = project.configure().ok();
+    // a chained statement is repeated by `@for` with the first
+    output.stderr("note: inc 1, total: 1\n").stderr("note: inc 2, total: 3\n");
+    // and is skipped with it, while `@else` applies to the whole chain
+    assert!(!output.stderr.contains("big"), "{}", output.stderr);
+    output.stderr("note: small\n");
+    // a chained statement can have its own meta-statements, which apply to the rest of the chain
+    output.stderr("note: three\n").stderr("note: still three\n");
+    assert!(!output.stderr.contains("never"), "{}", output.stderr);
+    output.stderr("note: end\n");
+}
+
+#[test]
+fn meta_then_errors() {
+    let project = Project::new("meta-then-errors", &[("Build", "\
+@then
+log note 'a'
+log note 'b'
+
+@then
+log note 'c'
+@then
+
+log note 'd'
+@then x
+log note 'e'
+")]);
+    let output = project.configure().failed();
+    output
+        .stderr("error: \"@then\" must be directly after a statement\n --> Build:1:1")
+        .stderr("note: b\n")
+        .stderr("error: \"@then\" must be directly after a statement\n --> Build:5:1")
+        .stderr("error: expected statement on the line after a meta-statement\n --> Build:7:1")
+        .stderr("error: expected \"\\n\"\n  --> Build:10:6")
+        .stderr("note: e\n")
+        .stderr("configuration failed with 4 errors");
+    assert!(!output.stderr.contains("note: a\n") && !output.stderr.contains("note: c\n"), "{}", output.stderr);
 }

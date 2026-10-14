@@ -132,6 +132,7 @@ impl Project {
         for (target, span) in targets {
             self.check_target(&target, span);
         }
+        self.add_crate_tests();
         for (name, &idx) in &self.values_idx {
             let value = &self.values[idx];
             if self.properties[value.property].is_none() {
@@ -315,37 +316,88 @@ impl Project {
             if parser.is_empty() {
                 break;
             }
-            if !self.parse_meta(&mut parser, &mut chain) {
-                parser.skip_statement();
-                continue;
-            }
-            let start = parser.offset;
-            let Some((keyword, span)) = self.parse_ident(&mut parser) else {
-                parser.skip_statement();
-                continue;
-            };
-            match keyword {
-                "declare" => self.parse_declare(&mut parser),
-                "use" => self.parse_use(&mut parser),
-                "set" => self.parse_set(&mut parser),
-                "log" => self.parse_log(&mut parser),
-                "crate" => self.parse_crate(&mut parser),
-                "custom" => self.parse_custom(&mut parser, false),
-                "test" => self.parse_custom(&mut parser, true),
-                "target" => self.parse_target(&mut parser),
-                _ => {
-                    parser.offset = start;
-                    let _ = parser.skip_statement();
-                    self.diagnostics.push(Diagnostic {
-                        span: Some(span),
-                        message: Message::UnknownStatement(keyword.into()),
-                        severity: Severity::Error,
-                    });
-                },
-            }
-
+            self.parse_statement(&mut parser, &mut chain);
         }
         self.files[idx].data = data;
+    }
+    /// Take a statement, with the meta-statements before it, and the statements chained after it with `@then`, which
+    /// are processed or skipped with it.
+    fn parse_statement(&mut self, parser: &mut Parser, chain: &mut Option<bool>) {
+        let process = match self.parse_meta(parser, chain) {
+            Meta::Skip => false,
+            // `@for` processes the chained statements too
+            Meta::Done => return,
+            Meta::Process => true,
+        };
+        if process {
+            self.parse_single_statement(parser);
+        } else {
+            parser.skip_statement();
+        }
+        while self.parse_then(parser) {
+            if process {
+                self.parse_statement(parser, &mut None);
+            } else {
+                Self::skip_chained(parser);
+            }
+        }
+    }
+    /// Take a `@then` directly after a statement, returning whether there is one.
+    fn parse_then(&mut self, parser: &mut Parser) -> bool {
+        let Some(rest) = parser.as_str().strip_prefix("@then") else {
+            return false;
+        };
+        if !rest.is_empty() && !rest.starts_with(['\n', ' ']) {
+            return false;
+        }
+        let span = Span { file: parser.file, offset: parser.offset, len: 5 };
+        parser.offset += 5;
+        if !self.parse_line_end(parser) {
+            parser.skip_line();
+        }
+        if matches!(parser.peek(), None | Some('\n' | '#')) {
+            self.diagnostics.push(Diagnostic {
+                span: Some(span),
+                message: Message::ExpectedStatementAfterMeta,
+                severity: Severity::Error,
+            });
+            return false;
+        }
+        true
+    }
+    /// Skip a statement chained with `@then` to a skipped statement, with its meta-statements.
+    fn skip_chained(parser: &mut Parser) {
+        while parser.peek() == Some('@') {
+            parser.skip_line();
+        }
+        parser.skip_statement();
+    }
+    /// Take a statement, after its meta-statements.
+    fn parse_single_statement(&mut self, parser: &mut Parser) {
+        let start = parser.offset;
+        let Some((keyword, span)) = self.parse_ident(parser) else {
+            parser.skip_statement();
+            return;
+        };
+        match keyword {
+            "declare" => self.parse_declare(parser),
+            "use" => self.parse_use(parser),
+            "set" => self.parse_set(parser),
+            "log" => self.parse_log(parser),
+            "crate" => self.parse_crate(parser),
+            "custom" => self.parse_custom(parser, false),
+            "test" => self.parse_custom(parser, true),
+            "target" => self.parse_target(parser),
+            _ => {
+                parser.offset = start;
+                let _ = parser.skip_statement();
+                self.diagnostics.push(Diagnostic {
+                    span: Some(span),
+                    message: Message::UnknownStatement(keyword.into()),
+                    severity: Severity::Error,
+                });
+            },
+        }
     }
     /// Take the meta-statements which precede a statement, returning whether the statement should be processed.
     ///
@@ -354,7 +406,9 @@ impl Project {
     ///
     /// `chain` is whether a statement has been processed in the current chain of conditional statements, which `@else`
     /// continues, or [`None`] if the previous statement was unconditional.
-    fn parse_meta(&mut self, parser: &mut Parser, chain: &mut Option<bool>) -> bool {
+    ///
+    /// `@for` processes the meta-statements and statement after it for each value, leaving nothing more to process.
+    fn parse_meta(&mut self, parser: &mut Parser, chain: &mut Option<bool>) -> Meta {
         let mut active = true;
         // whether the statement is conditional, so that it starts or continues a chain
         let mut conditional = false;
@@ -382,6 +436,59 @@ impl Project {
                     } else {
                         failed = true;
                     }
+                },
+                // a skipped statement is not repeated
+                "for" if !active || failed => {
+                    parser.skip_line();
+                },
+                "for" => {
+                    let Some((name, values)) = self.parse_for(parser) else {
+                        failed = true;
+                        continue;
+                    };
+                    if matches!(parser.peek(), None | Some('\n' | '#')) {
+                        self.diagnostics.push(Diagnostic {
+                            span: Some(meta_span),
+                            message: Message::ExpectedStatementAfterMeta,
+                            severity: Severity::Error,
+                        });
+                        *chain = None;
+                        return Meta::Skip;
+                    }
+                    *chain = match continues {
+                        Some(_) => Some(true),
+                        None if conditional => Some(true),
+                        None => None,
+                    };
+                    let body = parser.offset;
+                    let previous = self.files[parser.file].locals.get(&name).copied();
+                    for value in &values {
+                        parser.offset = body;
+                        self.set_local(&name, value.clone(), parser.file);
+                        self.parse_statement(parser, &mut None);
+                    }
+                    match previous {
+                        Some(previous) => self.files[parser.file].locals.insert(name, previous),
+                        None => self.files[parser.file].locals.remove(&name),
+                    };
+                    if !values.is_empty() {
+                        return Meta::Done;
+                    }
+                    // without any values, the rest is skipped
+                    while parser.peek() == Some('@') {
+                        parser.skip_line();
+                    }
+                    return Meta::Skip;
+                },
+                // `@then` is taken with the statement before it
+                "then" => {
+                    parser.skip_line();
+                    self.diagnostics.push(Diagnostic {
+                        span: Some(meta_span),
+                        message: Message::ThenWithoutStatement,
+                        severity: Severity::Error,
+                    });
+                    failed = true;
                 },
                 "else" | "else-if" => {
                     conditional = true;
@@ -435,19 +542,59 @@ impl Project {
                     severity: Severity::Error,
                 });
                 *chain = None;
-                return false;
+                return Meta::Skip;
             }
         }
         if failed {
             *chain = Some(true);
-            return false;
+            return Meta::Skip;
         }
         *chain = match continues {
             Some(processed) => Some(processed || active),
             None if conditional => Some(active),
             None => None,
         };
-        active
+        if active { Meta::Process } else { Meta::Skip }
+    }
+    /// Take the rest of a `@for`, a property and the values it takes, separated by spaces, where each item of a list is
+    /// a value.
+    fn parse_for(&mut self, parser: &mut Parser) -> Option<(String, Vec<Data>)> {
+        let header = (|| {
+            if !self.parse_space(parser) {
+                return None;
+            }
+            let (name, _, _) = self.parse_name(parser)?;
+            if !self.parse_space(parser) {
+                return None;
+            }
+            if !matches!(parser.as_str().strip_prefix("in"), Some(rest) if rest.starts_with([' ', '\n'])) {
+                self.diagnostics.push(Diagnostic {
+                    span: Some(parser.span_until(|c| c == ' ' || c == '\n')),
+                    message: Message::ExpectedExact("in"),
+                    severity: Severity::Error,
+                });
+                return None;
+            }
+            parser.offset += 2;
+            let mut values = Vec::new();
+            loop {
+                if !self.parse_space(parser) {
+                    return None;
+                }
+                match self.parse_expression(parser)?.data {
+                    Data::List(items) => values.extend(items),
+                    data => values.push(data),
+                }
+                if parser.peek() != Some(' ') {
+                    break;
+                }
+            }
+            self.parse_line_end(parser).then_some((name, values))
+        })();
+        if header.is_none() {
+            parser.skip_line();
+        }
+        header
     }
     /// Take the condition of an `@if` to the end of the line, returning [`None`] if it is invalid.
     fn parse_condition(&mut self, parser: &mut Parser) -> Option<bool> {
@@ -830,7 +977,16 @@ impl Project {
                 "default" => default = true,
                 "test" => test = true,
                 "target" | "use" => match attribute.data {
-                    Data::Str(string) if attribute.name == "target" => target = Some((string, attribute.data_span)),
+                    Data::Str(string) if attribute.name == "target" => {
+                        target = Some((vec![string], attribute.data_span));
+                    },
+                    // a crate is declared for each of a list of targets
+                    Data::List(items)
+                        if attribute.name == "target" && items.iter().all(|item| matches!(item, Data::Str(_))) =>
+                    {
+                        let targets = items.iter().map(Data::coerce_string).collect();
+                        target = Some((targets, attribute.data_span));
+                    },
                     Data::Str(string) => uses.push((string, attribute.data_span)),
                     data => self.diagnostics.push(Diagnostic {
                         span: Some(attribute.data_span),
@@ -853,54 +1009,62 @@ impl Project {
             }
         }
         // without an attribute, the crate is compiled for the `target` property in effect at its declaration
-        let (target, target_span) = target.unwrap_or_else(|| {
-            (self.property("target", span).map_or_default(|(data, _)| data.coerce_string()), span)
+        let (targets, target_span) = target.unwrap_or_else(|| {
+            (vec![self.property("target", span).map_or_default(|(data, _)| data.coerce_string())], span)
         });
-        // test harnesses are run where the build runs, as other environments are not supported yet
-        let host = self.property("host-target", span).map_or_default(|(data, _)| data.coerce_string());
-        if test && target != host {
-            self.diagnostics.push(Diagnostic {
-                span: Some(target_span),
-                message: Message::TestTarget { target: target.clone(), host },
-                severity: Severity::Error,
-            });
-        }
-        match self.crates.entry((name.clone(), target.clone())) {
-            Entry::Occupied(_) => self.diagnostics.push(Diagnostic {
-                span: Some(span),
-                message: Message::RedeclareCrate {
-                    name,
-                    target,
-                },
-                severity: Severity::Error,
-            }),
-            Entry::Vacant(entry) => {
-                let c = entry.insert(rust::Crate {
-                    name,
-                    name_span: span,
-                    path,
-                    path_span,
-                    target,
-                    target_span,
-                    kind: rust::Kind::Lib,
-                    output: None,
-                    builtin,
-                    implicit: false,
-                    default,
-                    test,
-                    uses,
+        for (i, target) in targets.iter().enumerate() {
+            if targets[..i].contains(target) {
+                self.diagnostics.push(Diagnostic {
+                    span: Some(target_span),
+                    message: Message::RepeatedTarget(target.clone()),
+                    severity: Severity::Error,
                 });
-                if test {
-                    let (name, harness) = (c.name.clone(), c.test_harness());
-                    self.add_crate_test(name, span, harness, Vec::new());
-                }
-            },
+                continue;
+            }
+            let target = target.clone();
+            // whether the tests can run depends on the target, which may be declared later, so they are registered by
+            // `check`
+            match self.crates.entry((name.clone(), target.clone())) {
+                Entry::Occupied(_) => self.diagnostics.push(Diagnostic {
+                    span: Some(span),
+                    message: Message::RedeclareCrate {
+                        name: name.clone(),
+                        target,
+                    },
+                    severity: Severity::Error,
+                }),
+                Entry::Vacant(entry) => {
+                    entry.insert(rust::Crate {
+                        name: name.clone(),
+                        name_span: span,
+                        path: path.clone(),
+                        path_span,
+                        target,
+                        target_span,
+                        kind: rust::Kind::Lib,
+                        output: None,
+                        builtin,
+                        implicit: false,
+                        default,
+                        test,
+                        uses: uses.clone(),
+                    });
+                },
+            }
         }
     }
     /// Register the test harness of a crate, like a `test` statement which runs it, which also needs `inputs`.
-    fn add_crate_test(&mut self, name: String, span: Span, harness: PathBuf, mut inputs: Vec<PathBuf>) {
-        let command = vec![Path::new(".").join(&harness).display().to_string()];
+    ///
+    /// The harness is run by the runner of its target, if it has one, with the harness as its last argument.
+    fn add_crate_test(&mut self, name: String, span: Span, harness: PathBuf, mut inputs: Vec<PathBuf>, runner: &Runner) {
+        let mut command = runner.command.clone();
+        if command.is_empty() {
+            command.push(Path::new(".").join(&harness).display().to_string());
+        } else {
+            command.push(harness.display().to_string());
+        }
         inputs.insert(0, harness);
+        inputs.extend(runner.program.clone());
         self.add_custom(Custom {
             name,
             name_span: span,
@@ -911,6 +1075,42 @@ impl Project {
             default: false,
             test: true,
         });
+    }
+    /// Register the tests of the crates with a `test` attribute, which run on the host target, or a custom target which
+    /// allows tests, by its runner.
+    ///
+    /// A test is named after its crate, or with its target too if that is not the host target.
+    fn add_crate_tests(&mut self) {
+        let host = self.values_idx.get("host-target").map_or_default(|&value| self.values[value].data.coerce_string());
+        // in the order they were declared, as the crates are not
+        let mut keys: Vec<_> = self.crates.iter()
+            .filter(|(_, c)| c.test && !c.implicit)
+            .map(|(key, c)| (key.clone(), (c.name_span.file, c.name_span.offset)))
+            .collect();
+        keys.sort_by(|(lhs, lhs_position), (rhs, rhs_position)| (lhs_position, lhs).cmp(&(rhs_position, rhs)));
+        for (key, _) in keys {
+            let c = &self.crates[&key];
+            let (name, span, target_span, harness) = (c.name.clone(), c.name_span, c.target_span, c.test_harness());
+            let custom = self.custom_targets.iter().find(|target| target.name == c.target);
+            let runner = match custom {
+                Some(target) if target.test => target.runner.clone(),
+                _ if c.target == host => Runner::default(),
+                // an unknown target is reported anyway
+                None if !self.targets.contains(&c.target) => continue,
+                _ => {
+                    self.diagnostics.push(Diagnostic {
+                        span: Some(target_span),
+                        message: Message::TestTarget { target: c.target.clone(), host: host.clone() },
+                        severity: Severity::Error,
+                    });
+                    // nor is its harness built
+                    self.crates.get_mut(&key).unwrap().test = false;
+                    continue;
+                },
+            };
+            let name = if c.target == host { name } else { format!("{name}@{}", c.target) };
+            self.add_crate_test(name, span, harness, Vec::new(), &runner);
+        }
     }
     /// Add a crate which is part of the build system rather than declared by the configuration, after reading it.
     ///
@@ -926,7 +1126,7 @@ impl Project {
             return;
         }
         if c.test {
-            self.add_crate_test(c.name.clone(), c.name_span, c.test_harness(), test_inputs);
+            self.add_crate_test(c.name.clone(), c.name_span, c.test_harness(), test_inputs, &Runner::default());
         }
         self.crates.insert(key, c);
     }
@@ -1021,18 +1221,22 @@ impl Project {
             });
             return;
         }
-        let mut command = command.unwrap_or_default();
-        // as in `run`, a program with a `/` is a path relative to the file, otherwise it is searched for in `PATH`
+        let Runner { command, program } = self.runner(command.unwrap_or_default(), parser.file);
+        self.add_custom(Custom { name, name_span: span, inputs, outputs, command, program, default, test });
+    }
+    /// Returns a command whose program, as in `run`, is a path relative to a file if it has a `/`, and which it then
+    /// depends on, while otherwise it is searched for in `PATH`.
+    fn runner(&self, mut command: Vec<String>, file: usize) -> Runner {
         let mut program = None;
         if command[0].contains('/') {
-            let mut path = normalize(&self.file(parser.file).relative_path(&command[0]));
+            let mut path = normalize(&self.file(file).relative_path(&command[0]));
             program = Some(path.clone());
             if path.is_relative() {
                 path = Path::new(".").join(path);
             }
             command[0] = path.display().to_string();
         }
-        self.add_custom(Custom { name, name_span: span, inputs, outputs, command, program, default, test });
+        Runner { command, program }
     }
     /// Add a custom build command or a test, unless one of the same kind has the same name.
     fn add_custom(&mut self, custom: Custom) {
@@ -1116,12 +1320,21 @@ impl Project {
         }
         let mut inherit = None;
         let mut fields: Vec<(String, Data)> = Vec::new();
+        let mut test = false;
+        let mut runner = Runner::default();
+        let mut overrides = false;
+        // the attributes which describe the specification, which a builtin target has already
+        let mut spec_attributes = Vec::new();
         while parser.indent().is_some() {
             let Some(attribute) = self.parse_attribute(parser, &[]) else {
                 parser.skip_line();
                 continue;
             };
+            if !matches!(attribute.name, "override" | "test" | "runner") {
+                spec_attributes.push((attribute.name, attribute.name_span));
+            }
             match (attribute.name, attribute.data) {
+                ("override", Data::None) => overrides = true,
                 ("inherit", Data::Str(base)) => {
                     if self.targets.contains(&base) {
                         inherit = Some(base);
@@ -1136,11 +1349,23 @@ impl Project {
                         });
                     }
                 },
-                ("inherit", data) => self.diagnostics.push(Diagnostic {
+                // tests are only run where they are allowed, and without a runner, they are run directly
+                ("test", Data::None) => test = true,
+                ("test", Data::Bool(value)) => test = value,
+                ("runner", Data::Str(program)) => runner = self.runner(vec![program], parser.file),
+                ("runner", Data::List(items)) if !items.is_empty() && items.iter().all(|item| matches!(item, Data::Str(_))) => {
+                    runner = self.runner(items.iter().map(Data::coerce_string).collect(), parser.file);
+                },
+                (name @ ("inherit" | "test" | "runner" | "override"), data) => self.diagnostics.push(Diagnostic {
                     span: Some(attribute.data_span),
                     message: Message::InvalidOperand {
                         ty: data.type_name(),
-                        expected: "str",
+                        expected: match name {
+                            "test" => "bool",
+                            "runner" => "str or a list of str",
+                            "override" => "none",
+                            _ => "str",
+                        },
                         coerce: false,
                         origin: attribute.origin,
                     },
@@ -1185,7 +1410,24 @@ impl Project {
                 },
             }
         }
-        if self.targets.contains(&name) {
+        if overrides {
+            // a builtin target is only given the attributes which do not describe its specification
+            for (attribute, attribute_span) in spec_attributes {
+                self.diagnostics.push(Diagnostic {
+                    span: Some(attribute_span),
+                    message: Message::OverrideAttribute(attribute.into()),
+                    severity: Severity::Error,
+                });
+            }
+            if !self.targets.contains(&name) {
+                self.diagnostics.push(Diagnostic {
+                    span: Some(span),
+                    message: Message::UnknownTarget { suggestion: suggest(&name, &self.targets), target: name },
+                    severity: Severity::Error,
+                });
+                return;
+            }
+        } else if self.targets.contains(&name) {
             self.diagnostics.push(Diagnostic {
                 span: Some(span),
                 message: Message::BuiltinTargetName(name),
@@ -1202,7 +1444,7 @@ impl Project {
             });
             return;
         }
-        self.custom_targets.push(CustomTarget { name, name_span: span, inherit, fields });
+        self.custom_targets.push(CustomTarget { name, name_span: span, overrides, inherit, fields, test, runner });
     }
     /// Report a target which is neither builtin nor declared, listing the builtin targets the first time.
     fn check_target(&mut self, target: &str, span: Span) {
@@ -1548,7 +1790,27 @@ impl Project {
         }
         let data = match name {
             "upper" => Data::Str(self.str_operand(arguments.next()?)?.to_uppercase()),
-            "len" => Data::Unsigned(self.list_operand(arguments.next()?)?.len() as u64),
+            // the number of items in a list, or bytes in a string
+            "len" => {
+                let operand = arguments.next()?;
+                match &operand.data {
+                    Data::Str(string) => Data::Unsigned(string.len() as u64),
+                    Data::List(items) => Data::Unsigned(items.len() as u64),
+                    data => {
+                        self.diagnostics.push(Diagnostic {
+                            span: Some(operand.span),
+                            message: Message::InvalidOperand {
+                                ty: data.type_name(),
+                                expected: "list or str",
+                                coerce: false,
+                                origin: operand.origin,
+                            },
+                            severity: Severity::Error,
+                        });
+                        return None;
+                    },
+                }
+            },
             "contains" => {
                 let items = self.list_operand(arguments.next()?)?;
                 let value = arguments.next()?.data;
@@ -2304,6 +2566,16 @@ fn invalid_ident_char(&(i, c): &(usize, char)) -> bool {
     }
 }
 
+/// What remains of a statement after its meta-statements.
+enum Meta {
+    /// The statement is skipped.
+    Skip,
+    /// The statement is processed.
+    Process,
+    /// The statement has been processed already, by `@for`.
+    Done,
+}
+
 /// An argument of the `run` function.
 enum RunArgument {
     Positional(Operand),
@@ -2475,6 +2747,7 @@ pub enum Message {
         present: bool,
     },
     ElseWithoutIf(String),
+    ThenWithoutStatement,
     ElseNotFirst(String),
     UnsetProperty(String),
     ExpectedIdentifier,
@@ -2554,6 +2827,8 @@ pub enum Message {
         target: String,
     },
     BuiltinTargetName(String),
+    OverrideAttribute(String),
+    RepeatedTarget(String),
     RedeclareCrate {
         name: String,
         target: String,
@@ -2605,6 +2880,7 @@ impl core::fmt::Display for Message {
                 write!(f, "environment variable {name:?} is not valid unicode")
             },
             Self::ExpectedStatementAfterMeta => write!(f, "expected statement on the line after a meta-statement"),
+            Self::ThenWithoutStatement => write!(f, "\"@then\" must be directly after a statement"),
             Self::ElseWithoutIf(name) => write!(f, "\"@{name}\" must follow a conditional statement"),
             Self::ElseNotFirst(name) => write!(f, "\"@{name}\" must be the first meta-statement of a statement"),
             Self::UnsetProperty(name) => write!(f, "no value for property {name:?}"),
@@ -2642,13 +2918,19 @@ impl core::fmt::Display for Message {
             Self::RedeclareCustom { statement: "target", name, .. } => write!(f, "redeclaration of target {name:?}"),
             Self::RedeclareCustom { name, .. } => write!(f, "redeclaration of custom command {name:?}"),
             Self::NewlineInArgument => write!(f, "command arguments cannot contain a newline"),
-            Self::BuiltinTargetName(name) => write!(f, "{name:?} is the name of a builtin target"),
+            Self::BuiltinTargetName(name) => {
+                write!(f, "{name:?} is the name of a builtin target, which can be changed with `override`")
+            },
+            Self::OverrideAttribute(name) => write!(f, "attribute {name:?} cannot be used with `override`"),
+            Self::RepeatedTarget(target) => write!(f, "target {target:?} is listed more than once"),
             Self::ReservedCrate { name, target } => {
                 write!(f, "crate {name:?} for target {target:?} is reserved for the build system")
             },
-            Self::TestTarget { target, host } => {
-                write!(f, "tests for target {target:?} cannot be run, only those for the host target {host:?}")
-            },
+            Self::TestTarget { target, host } => write!(
+                f,
+                "tests for target {target:?} cannot be run, only those for the host target {host:?} or a target with \
+                 `test`",
+            ),
             Self::UnknownCrate { name, target } => write!(f, "no crate {name:?} for target {target:?}"),
             Self::InvalidCrateName { name, character } => write!(f, "invalid character {character:?} in crate name {name:?}"),
             Self::RedeclareCrate { name, target } => write!(f, "redeclaration of crate {name:?} for target {target:?}"),
@@ -2716,10 +2998,24 @@ const TARGET_OPTIONS: &[(&str, &str, &str)] = &[
 pub struct CustomTarget {
     pub name: String,
     pub name_span: Span,
+    /// Whether this sets the attributes of the builtin target of the same name, rather than declaring a target with its
+    /// own specification.
+    pub overrides: bool,
     /// The builtin target whose specification is extended.
     pub inherit: Option<String>,
     /// Fields of the target specification, in order, which replace those inherited.
     pub fields: Vec<(String, Data)>,
+    /// Whether crates for the target can be tested.
+    pub test: bool,
+    /// The command which runs a test harness for the target, which is its last argument, or none to run it directly.
+    pub runner: Runner,
+}
+
+/// A command, with its program if that is a path, which it depends on.
+#[derive(Clone, Default)]
+pub struct Runner {
+    pub command: Vec<String>,
+    pub program: Option<PathBuf>,
 }
 
 /// A custom build command, or a test.
@@ -3001,7 +3297,11 @@ impl <'a> Parser<'a> {
             len: self.offset - offset,
         }
     }
+    /// Take the indentation of an attribute, skipping comments at that indentation, which comment out an attribute.
     pub fn indent(&mut self) -> Option<Span> {
+        while self.as_str().starts_with("    #") {
+            self.skip_line();
+        }
         if self.as_str().starts_with("    ") {
             let offset = self.offset;
             self.offset += 4;

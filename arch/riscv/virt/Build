@@ -1,2 +1,6 @@
+target riscv64gc-unknown-linux-gnu
+    override
+    test
+
 set target 'riscv64gc-unknown-linux-gnu'
 use '/sys'

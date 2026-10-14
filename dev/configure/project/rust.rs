@@ -32,10 +32,6 @@ pub enum Kind {
     Test,
 }
 
-pub struct Rule {
-
-}
-
 impl Crate {
     /// The `--crate-type` of the crate.
     pub fn crate_type(&self) -> &'static str {

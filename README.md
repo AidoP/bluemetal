@@ -53,6 +53,16 @@ set {'heap-{arch}'} 0x1000
 ```
 
 
+A line starting with `#` is a comment. Indented by 4 spaces, a comment can be among the attributes of a statement, to
+comment out one of them.
+
+```
+crate app
+    # use util
+    default
+```
+
+
 ### Meta-statements
 
 A meta-statement is a line starting with `@` which applies to the statement on the next line. There cannot be a blank
@@ -81,6 +91,28 @@ log note 'one'
 log note 'two'
 @else
 log note 'many'
+```
+
+- `@for <name> in <value> ...`: process the meta-statements and statement after it once for each of the values, which
+  are expressions separated by spaces, where each item of a list is a value. For each, the property `<name>` has the
+  value, within the file and until the end of the statement. Without any values, the statement is skipped
+
+```
+@for target in targets
+@if target != host-target
+crate kernel 'kernel.rs'
+    target target
+```
+
+- `@then`: chain the statement after it to the statement before it, which it must be directly after, so that the
+  statements are processed or skipped together, and repeated together by `@for`. The chained statement can have its
+  own meta-statements, which apply to it and the rest of the chain
+
+```
+@for a in 1 2
+set total (total + a)
+@then
+log note 'added {a}, the total is {total}'
 ```
 
 
@@ -116,7 +148,7 @@ Functions are called with their arguments in `()`, separated by `, `:
 - `select(name, ...)`: the value of the first of the named properties which has a value. Each property must be
   declared, or set before it is declared, so that a misspelt name is an error rather than ignored
 - `env(name)`: the value of an environment variable, which must be set. The build is not reconfigured when it changes
-- `len(list)`: the number of items in a list, as an `unsigned`
+- `len(value)`: the number of items in a list, or of bytes in a `str`, which is UTF-8, as an `unsigned`
 - `contains(list, value)`: whether a list has an item equal to a value, as a `bool`
 - `path(str)`: a path relative to the directory of the file containing the expression, as a `str`. An absolute path
   is not made relative. `.` and `..` are resolved without following symbolic links
@@ -176,15 +208,17 @@ A `declare` statement may be followed by indented attributes:
 
 A `crate` statement may be followed by indented attributes:
 
-- `target <string>`: the target triple to compile the crate for, which must be one supported by rustc. Without it, the
-  `target` property at the point of the declaration is used. A crate can be declared once for each target
+- `target <string>`: the target to compile the crate for, which is a builtin target or one declared by a `target`
+  statement, or a list of them to declare the crate for each. Without it, the `target` property at the point of the
+  declaration is used. A crate can be declared once for each target
 - `use <name>`: a crate for the same target which the crate depends on, passed to rustc with `--extern`. It can be
   repeated, and the crate can be declared later or in another file
 - `builtin`: pass the crate with `--extern` to every crate for the same target which is not builtin, like the standard
   library. Builtin crates are not passed to each other, so a builtin crate must `use` the ones it depends on
 - `default`: build the crate when `ninja` is run without targets
-- `test`: build the crate's tests with `--test` as `target/<target>/test/<name>`, and register a test named after the
-  crate which runs them. Only crates for the host target can be tested for now
+- `test`: build the crate's tests with `--test` as `target/<target>/test/<name>`, and register a test which runs them,
+  named after the crate, or as `<name>@<target>` if the target is not the host target. Only crates for the host target,
+  or a custom target with `test`, can be tested
 
 ```
 crate core '{rust-src}/library/core/src/lib.rs'
@@ -223,14 +257,25 @@ A `target` statement is followed by indented attributes, which describe the targ
 `target/targets/<name>.json`. Custom targets need a nightly toolchain.
 
 - `inherit <target>`: the builtin target whose specification it is based on
+- `override`: set the attributes of the builtin target with the name, rather than declaring a target. Only `test` and
+  `runner` can be used with it, as the builtin target keeps its specification
 - `env`, `os`, `arch`, `linker <str>`: replace the field of the specification
 - `code-model`, `relocation-model`, `target-cpu`, `linker-flavor`, `panic <str>`: replace the field of the
   specification for the codegen option
 - `target-feature <features>`: the features of the target, as a `str` separated by `,`, or a list of them
 - `no-redzone`: disable the red zone
 - `link-script <str>`: the linker script, which is usually a multi-line string, where braces must be doubled
+- `test <bool>`: whether crates for the target can be tested, which is `false` by default. Without a value, it is `true`
+- `runner <program>`: the program which runs a test harness for the target, given as its last argument, or a list of the
+  program and its first arguments. As with `run`, a program containing a `/` is a path relative to the file. Without
+  it, a test harness is run directly
 
 ```
+target riscv64gc-unknown-none-elf
+    override
+    test
+    runner ['qemu-system-riscv64', '-machine', 'virt', '-nographic', '-kernel']
+
 target bluemetal-riscv64
     inherit 'riscv64gc-unknown-none-elf'
     os 'bluemetal'

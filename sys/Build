@@ -17,5 +17,8 @@ declare device-tree
     info 'enable runtime device tree loading'
     default false
 
+# test clippy
+    cargo clippy
+
 @if device-tree
 crate dtb 'device-tree.rs'

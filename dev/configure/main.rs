@@ -128,7 +128,8 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
         }
     }
 
-    for target in &project.custom_targets {
+    // a builtin target which is overridden keeps its specification
+    for target in project.custom_targets.iter().filter(|target| !target.overrides) {
         let inherited = match &target.inherit {
             Some(base) => Some(target_spec_json(base)?),
             None => None,
@@ -148,7 +149,10 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
         }
     }
     // the flag for compiling for a target, and the specification of a custom target which it depends on
-    let custom_targets: Vec<_> = project.custom_targets.iter().map(|target| target.name.clone()).collect();
+    let custom_targets: Vec<_> = project.custom_targets.iter()
+        .filter(|target| !target.overrides)
+        .map(|target| target.name.clone())
+        .collect();
     let target_flag = |target: &str| -> (String, Option<PathBuf>) {
         if custom_targets.iter().any(|custom| custom == target) {
             let path = target_spec::path(target);
