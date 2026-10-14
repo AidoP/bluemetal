@@ -2,16 +2,17 @@ declare rust-src
     type 'str'
     default '{sysroot}/lib/rustlib/src/rust'
 
-crate 'core' '{rust-src}/library/core/src/lib.rs'
+crate core '{rust-src}/library/core/src/lib.rs'
     builtin
 
-crate 'core' '{rust-src}/library/core/src/lib.rs'
+crate core '{rust-src}/library/core/src/lib.rs'
     target '{host-target}'
     builtin
 
 declare device-tree
     type 'bool'
+    info 'enable runtime device tree loading'
     default false
 
 @if device-tree
-crate 'dtb' 'device-tree.rs'
+crate dtb 'device-tree.rs'

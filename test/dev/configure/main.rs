@@ -112,7 +112,7 @@ log warning 'careful'
 
 #[test]
 fn target_defaults_to_host() {
-    let project = Project::new("target-default", &[("Build", "crate 'app' 'app.rs'\n")]);
+    let project = Project::new("target-default", &[("Build", "crate app 'app.rs'\n")]);
     let host = project.host();
     let output = project.configure().ok();
     let build = output.build(&format!("target/{host}/libapp.rlib"));
@@ -124,12 +124,12 @@ fn target_defaults_to_host() {
 #[test]
 fn target_is_resolved_at_declaration() {
     let project = Project::new("target-resolve", &[("Build", "\
-crate 'before' 'x.rs'
+crate before 'x.rs'
 set target 'riscv64gc-unknown-none-elf'
-crate 'after' 'x.rs'
-crate 'attribute' 'x.rs'
+crate after 'x.rs'
+crate attribute 'x.rs'
     target 'aarch64-unknown-none'
-crate 'host' 'x.rs'
+crate host 'x.rs'
     target host-target
 log note 'host-target is {host-target}'
 ")]);
@@ -146,7 +146,7 @@ log note 'host-target is {host-target}'
 fn crate_default_path() {
     let project = Project::new("crate-path", &[
         ("Build", "use 'lib'\n"),
-        ("lib/Build", "declare suffix\n    type 'str'\n    default '2'\ncrate 'util{suffix}'\n"),
+        ("lib/Build", "declare suffix\n    type 'str'\n    default '2'\ncrate {'util{suffix}'}\n"),
     ]);
     let host = project.host();
     let output = project.configure().ok();
@@ -156,8 +156,8 @@ fn crate_default_path() {
 #[test]
 fn crates_are_keyed_by_target() {
     let project = Project::new("crate-key", &[("Build", "\
-crate 'core' 'core.rs'
-crate 'core' 'core.rs'
+crate core 'core.rs'
+crate core 'core.rs'
     target 'riscv64gc-unknown-none-elf'
 ")]);
     let host = project.host();
@@ -173,8 +173,8 @@ crate 'core' 'core.rs'
 #[test]
 fn crate_redeclaration() {
     let project = Project::new("crate-redeclare", &[("Build", "\
-crate 'dup' 'x.rs'
-crate 'dup' 'y.rs'
+crate dup 'x.rs'
+crate dup 'y.rs'
 ")]);
     project.configure().failed()
         .stderr("error: redeclaration of crate \"dup\"")
@@ -185,13 +185,13 @@ crate 'dup' 'y.rs'
 #[test]
 fn builtin_crates_are_extern_by_default() {
     let project = Project::new("builtin", &[("Build", "\
-crate 'core' 'core.rs'
+crate core 'core.rs'
     builtin
-crate 'compiler_builtins' 'cb.rs'
+crate compiler_builtins 'cb.rs'
     builtin
-    use 'core'
-crate 'app' 'app.rs'
-crate 'kernel' 'kernel.rs'
+    use core
+crate app 'app.rs'
+crate kernel 'kernel.rs'
     target 'riscv64gc-unknown-none-elf'
 ")]);
     let host = project.host();
@@ -216,8 +216,8 @@ crate 'kernel' 'kernel.rs'
 #[test]
 fn use_adds_dependency() {
     let project = Project::new("use", &[
-        ("Build", "crate 'app' 'app.rs'\n    use 'util'\nuse 'util'\n"),
-        ("util/Build", "crate 'util'\n"),
+        ("Build", "declare name\n    default 'util'\ncrate app 'app.rs'\n    use {name}\nuse 'util'\n"),
+        ("util/Build", "crate util\n"),
     ]);
     let host = project.host();
     let output = project.configure().ok();
@@ -230,24 +230,31 @@ fn use_adds_dependency() {
 #[test]
 fn use_unknown_crate() {
     let project = Project::new("use-unknown", &[("Build", "\
-crate 'util' 'u.rs'
-crate 'kernel' 'k.rs'
+crate util 'u.rs'
+crate kernel 'k.rs'
     target 'riscv64gc-unknown-none-elf'
-    use 'util'
-crate 'bad' 'b.rs'
+    use util
+crate bad 'b.rs'
     use 5
+    use 'quoted'
+    use
+    use {'a b'}
 ")]);
     project.configure().failed()
         .stderr("error: no crate \"util\" for target \"riscv64gc-unknown-none-elf\"\n --> Build:4:9")
-        .stderr("error: unsigned value used where str is required\n --> Build:6:9");
+        .stderr("error: invalid character '5' in identifier \"5\"\n --> Build:6:9")
+        .stderr("error: expected identifier\n --> Build:7:9")
+        .stderr("error: expected \" \"\n --> Build:8:8")
+        .stderr("error: invalid character ' ' in identifier \"a b\"\n --> Build:9:9")
+        .stderr("configuration failed with 5 errors");
 }
 
 #[test]
 fn unknown_target() {
     let project = Project::new("target-unknown", &[("Build", "\
-crate 'a' 'x.rs'
+crate a 'x.rs'
     target 'riscv64gc-unknown-none'
-crate 'b' 'x.rs'
+crate b 'x.rs'
     target 'nope'
 ")]);
     let output = project.configure().failed();
@@ -265,27 +272,31 @@ fn invalid_crate_name() {
 declare suffix
     type 'str'
     default 'x'
-crate 'host-tool' 'x.rs'
-crate 'a-{suffix}' 'x.rs'
-crate 'Upper' 'x.rs'
-crate '2fast' 'x.rs'
-crate 5 'x.rs'
-crate 'compiler_builtins2' 'x.rs'
+crate host-tool 'x.rs'
+crate {'a-{suffix}'} 'x.rs'
+crate Upper 'x.rs'
+crate 2fast 'x.rs'
+crate 'quoted' 'x.rs'
+crate {'a b'} 'x.rs'
+crate {''} 'x.rs'
+crate compiler_builtins2 'x.rs'
 ")]);
     project.configure().failed()
-        // a string literal points at the character, a template at the whole name
-        .stderr("error: invalid character '-' in crate name \"host-tool\"\n --> Build:4:12")
+        // an identifier points at the character, an expression at the whole name
+        .stderr("error: invalid character '-' in crate name \"host-tool\"\n --> Build:4:11")
         .stderr("error: invalid character '-' in crate name \"a-x\"\n --> Build:5:7")
-        .stderr("error: invalid character 'U' in crate name \"Upper\"")
-        .stderr("error: invalid character '2' in crate name \"2fast\"")
-        .stderr("error: unsigned value used where str is required\n --> Build:8:7")
-        .stderr("configuration failed with 5 errors");
+        .stderr("error: invalid character 'U' in identifier \"Upper\"\n --> Build:6:7")
+        .stderr("error: invalid character '2' in identifier \"2fast\"\n --> Build:7:7")
+        .stderr("error: expected identifier\n --> Build:8:7")
+        .stderr("error: invalid character ' ' in identifier \"a b\"\n --> Build:9:7")
+        .stderr("error: expected identifier\n  --> Build:10:7")
+        .stderr("configuration failed with 7 errors");
 }
 
 #[test]
 fn invalid_identifier() {
     let project = Project::new("ident", &[("Build", "\
-declare my_prop
+declare my.prop
 declare prop2
     type 'str'
     default 'v'
@@ -293,21 +304,43 @@ declare prop2
 Set prop2 'y'
 log note '{Prop}'
 declare 2go
+set {5} 1
 ")]);
     project.configure().failed()
-        .stderr("error: invalid character '_' in identifier \"my_prop\"\n --> Build:1:11")
+        .stderr("error: expected \"\\n\"\n --> Build:1:11")
         .stderr("error: invalid character 'D' in identifier \"Default\"\n --> Build:5:5")
         .stderr("error: invalid character 'S' in identifier \"Set\"\n --> Build:6:1")
         .stderr("error: invalid character 'P' in identifier \"Prop\"\n --> Build:7:12")
         .stderr("error: invalid character '2' in identifier \"2go\"\n --> Build:8:9")
-        .stderr("configuration failed with 5 errors");
+        .stderr("error: invalid character '5' in identifier \"5\"\n --> Build:9:5")
+        .stderr("configuration failed with 6 errors");
+}
+
+#[test]
+fn computed_names() {
+    let project = Project::new("names", &[("Build", "\
+declare my_prop
+    default 'core'
+declare suffix
+    default 2
+declare other_2
+set {'other_{suffix}'} 1
+log note 'other_2 is {other_2}'
+crate compiler_builtins 'x.rs'
+crate {'{my_prop}_ext'} 'y.rs'
+")]);
+    let host = project.host();
+    let output = project.configure().ok();
+    output.stderr("note: other_2 is 1");
+    output.build(&format!("target/{host}/libcompiler_builtins.rlib"));
+    output.build(&format!("target/{host}/libcore_ext.rlib"));
 }
 
 #[test]
 fn writes_depfile() {
     let project = Project::new("depfile", &[
         ("Build", "use 'a'\n"),
-        ("a/Build", "crate 'a' 'a.rs'\n"),
+        ("a/Build", "crate a 'a.rs'\n"),
     ]);
     project.configure().ok();
     let depfile = std::fs::read_to_string(Path::new(&project.dir).join("build.ninja.d")).unwrap();
@@ -356,8 +389,8 @@ log note 'early is {early}'
 ")]);
     let output = project.configure().failed();
     output
-        .stderr("error: cannot set read-only property \"host-target\"\n --> Build:1:5")
-        .stderr("note: this builtin property is read-only")
+        .stderr("error: cannot set read-only builtin property \"host-target\"\n --> Build:1:5")
+        .stderr("note: host-target: the target triple of the machine running the build\nerror")
         .stderr("error: cannot set read-only property \"version\"\n --> Build:5:5")
         .stderr("note: value assigned here\n --> Build:3:5")
         .stderr("note: declared read-only here\n --> Build:2:9")
@@ -389,8 +422,8 @@ log note 'size is {size}'
     project.configure().failed()
         .stderr("error: redeclaration of property \"size\"\n --> Build:6:9")
         .stderr("note: previously declared here\n --> Build:3:9")
-        .stderr("error: redeclaration of property \"host-target\"\n --> Build:9:9")
-        .stderr("note: this is a builtin property")
+        .stderr("error: redeclaration of builtin property \"host-target\"\n --> Build:9:9")
+        .stderr("note: host-target: the target triple of the machine running the build\nnote: size is 1")
         // the attributes of a duplicate are ignored
         .stderr("note: size is 1")
         .stderr("configuration failed with 2 errors");
@@ -409,10 +442,10 @@ set level 9
 log note 'release'
 @if level > 1
 @if {'true'}
-crate 'kept' 'x.rs'
+crate kept 'x.rs'
     target host-target
 @if false
-crate 'skipped' 'x.rs'
+crate skipped 'x.rs'
     target host-target
 @if false
 @if missing
@@ -485,7 +518,7 @@ log note 'final else'
 @if missing
 log note 'skipped'
 @else
-crate 'fallback' 'x.rs'
+crate fallback 'x.rs'
     target host-target
 ")]);
     let host = project.host();
@@ -584,4 +617,133 @@ log note 'else after bad condition'
     for skipped in ["no if", "not first", "bad condition", "else after bad condition"] {
         assert!(!output.stderr.contains(skipped), "{skipped:?} was not skipped:\n{}", output.stderr);
     }
+}
+
+#[test]
+fn property_info() {
+    let project = Project::new("property-info", &[("Build", "\
+declare pages
+    type 'unsigned'
+    info 'the number of pages in the heap'
+declare pages
+set pages 'many'
+declare later
+    info 'declared without a value'
+log note '{later}'
+set host-target 'x'
+declare bad
+    info 5
+declare plain
+declare plain
+")]);
+    let output = project.configure().failed();
+    output
+        .stderr("error: redeclaration of property \"pages\"\n --> Build:4:9")
+        .stderr("note: previously declared here\n --> Build:1:9\n  |\n1 | declare pages\n  |         ^^^^^\nnote: pages: the number of pages in the heap\n")
+        .stderr("error: invalid data type for property \"pages\"")
+        .stderr("error: no value for property \"later\"\n --> Build:8:12\n  |\n8 | log note '{later}'\n  |            ^^^^^\nnote: later: declared without a value\n")
+        .stderr("note: host-target: the target triple of the machine running the build")
+        .stderr("error: unsigned value used where str is required\n  --> Build:11:10")
+        .stderr("error: redeclaration of property \"plain\"\n  --> Build:13:9")
+        .stderr("configuration failed with 6 errors");
+    // once for each diagnostic about "pages"
+    assert_eq!(output.stderr.matches("note: pages:").count(), 2, "{}", output.stderr);
+    // no note for a property without info
+    assert!(!output.stderr.contains("note: plain:"), "{}", output.stderr);
+}
+
+#[test]
+fn type_error_origin() {
+    let project = Project::new("type-origin", &[("Build", "\
+declare level
+    type 'unsigned'
+    default 2
+declare name
+    default 'x'
+declare copy
+    default name
+declare count
+    type 'unsigned'
+set count copy
+@if level
+log note 'a'
+@if level == name
+log note 'b'
+crate app 'x.rs'
+    target level
+@if {target} == 1
+log note 'c'
+")]);
+    let output = project.configure().failed();
+    let default_level = "note: unsigned value set here\n --> Build:3:13\n  |\n3 |     default 2\n  |             ^\n";
+    // a reference to a reference is followed to where the data was written
+    let default_name = "note: str value set here\n --> Build:5:13\n  |\n5 |     default 'x'\n  |             ^^^\n";
+    output
+        .stderr(&format!("error: invalid data type for property \"count\"\n  --> Build:10:11\n   |\n10 | set count copy\n   |           ^^^^\n{default_name}"))
+        .stderr(&format!("error: unsigned value used where bool is required\n  --> Build:11:5\n   |\n11 | @if level\n   |     ^^^^^\n{default_level}"))
+        .stderr(&format!("^^^^^^^^^^^^^\n{default_level}{default_name}"))
+        .stderr(&format!("error: unsigned value used where str is required\n  --> Build:16:12\n   |\n16 |     target level\n   |            ^^^^^\n{default_level}"))
+        .stderr("configuration failed with 5 errors");
+    // a builtin value has no location
+    let builtin = "str value cannot be coerced to unsigned\n  --> Build:17:5\n   |\n17 | @if {target} == 1\n   |     ^^^^^^^^\n";
+    let after = &output.stderr[output.stderr.find(builtin).expect(&output.stderr) + builtin.len()..];
+    assert!(!after.starts_with("note"), "{}", output.stderr);
+}
+
+#[test]
+fn type_error_does_not_assign() {
+    let project = Project::new("type-assign", &[("Build", "\
+declare count
+    type 'unsigned'
+    default 3
+set count 'many'
+log note 'count is {count}'
+set early 'a'
+set early 5
+declare early
+    type 'unsigned'
+log note 'early is {early}'
+declare backwards
+    default 'x'
+    type 'unsigned'
+declare offset
+    type 'signed'
+    default 4
+@if offset > -1
+log note 'offset is signed'
+declare locked
+    default 'bad'
+    type 'bool'
+    read-only
+set locked true
+log note 'locked is {locked}'
+")]);
+    let output = project.configure().failed();
+    output
+        .stderr("error: invalid data type for property \"count\"\n --> Build:4:11")
+        .stderr("note: declared here\n --> Build:1:9")
+        .stderr("note: count is 3")
+        // a value set before the declaration is checked by it
+        .stderr("error: invalid data type for property \"early\"\n --> Build:6:11")
+        .stderr("note: declared here\n --> Build:8:9")
+        .stderr("note: early is 5")
+        // a default is checked against a type declared after it
+        .stderr("error: invalid data type for property \"backwards\"\n  --> Build:12:13")
+        // an unsigned value is converted for a signed property
+        .stderr("note: offset is signed")
+        // an invalid default is not an assignment of a read-only property
+        .stderr("error: invalid data type for property \"locked\"\n  --> Build:20:13")
+        .stderr("note: locked is true")
+        .stderr("configuration failed with 4 errors");
+}
+
+#[test]
+fn default_is_visible_to_later_attributes() {
+    let project = Project::new("default-visible", &[("Build", "\
+declare pages
+    default 4
+    info 'the number of pages, {pages} by default'
+declare pages
+")]);
+    project.configure().failed().stderr("note: pages: the number of pages, 4 by default");
 }

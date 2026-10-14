@@ -32,15 +32,29 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
         Ok(file) => file,
         Err(error) => return Err(Error::Read(input, error)),
     };
-    let id = project.declare("sysroot".into(), Some(project::Property::new("sysroot".into(), project::Type::String)));
-    project.set("sysroot".into(), project::Value::new(id, project::Data::Str(sysroot)));
-    // the target triple crates are compiled for, unless they have a `target` attribute
-    let id = project.declare("target".into(), Some(project::Property::new("target".into(), project::Type::String)));
-    project.set("target".into(), project::Value::new(id, project::Data::Str(host.clone())));
-    // the triple of the machine running the build, for crates such as tools which must run during it
-    let host_target = project::Property::new("host-target".into(), project::Type::String).read_only();
-    let id = project.declare("host-target".into(), Some(host_target));
-    project.set("host-target".into(), project::Value::new(id, project::Data::Str(host)));
+    let builtins = [
+        (
+            project::Property::new("sysroot".into(), project::Type::String)
+                .info("the sysroot of the Rust toolchain"),
+            sysroot,
+        ),
+        (
+            project::Property::new("target".into(), project::Type::String)
+                .info("the target triple for crates without a `target` attribute"),
+            host.clone(),
+        ),
+        (
+            project::Property::new("host-target".into(), project::Type::String)
+                .info("the target triple of the machine running the build")
+                .read_only(),
+            host,
+        ),
+    ];
+    for (property, value) in builtins {
+        let name = property.name().to_string();
+        let id = project.declare(name.clone(), Some(property));
+        project.set(name, project::Value::new(id, project::Data::Str(value)));
+    }
     project.parse(file);
     project.check();
 

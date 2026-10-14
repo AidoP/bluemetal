@@ -24,6 +24,15 @@ From now on just build with `ninja`.
 - `set <name> <value>`: assign a value to a property
 - `crate <name>`: introduces a crate named `<name>`
 
+A `<name>` is an identifier: lowercase letters, digits, `-` and `_`, not starting with a digit. Crate names cannot
+contain `-`, as rustc does not accept it. A name can instead be computed with an expression in `{}`, whose value must
+be a valid name.
+
+```
+crate compiler_builtins
+set {'heap-{arch}'} 0x1000
+```
+
 
 ### Meta-statements
 
@@ -88,6 +97,7 @@ A `declare` statement may be followed by indented attributes:
 
 - `type <type>`: the type of the property, one of `'str'`, `'bool'`, `'unsigned'` or `'signed'`
 - `default <value>`: the initial value of the property
+- `info <string>`: a description of the property, included in diagnostics about it
 - `read-only`: the property can only be assigned once, by its default or by a single `set` before or after the declaration
 
 ### Builtin properties
