@@ -86,11 +86,26 @@ set size {pages} * 0x1000 - 1
 set large size >= 0x10_0000 && !{small}
 ```
 
+Functions are called with their arguments in `()`, separated by `, `:
+
+- `upper(str)` and `lower(str)`: convert a `str` to upper or lower case
+- `starts-with(str, prefix)` and `ends-with(str, suffix)`: whether a `str` starts or ends with another, as a `bool`
+- `select(name, ...)`: the value of the first of the named properties which has a value. Each property must be
+  declared, or set before it is declared, so that a misspelt name is an error rather than ignored
+- `env(name)`: the value of an environment variable, which must be set. The build is not reconfigured when it changes
+
+```
+set board select(board, default-board)
+@if starts-with(target, 'riscv')
+use 'arch/riscv'
+```
+
 Within a string, an expression in `{}` is replaced with its value, and `{{` and `}}` with a single brace.
-The expression cannot contain a string, and cannot start with `{`.
+The expression cannot start with `{`, but can contain strings, which are templates themselves.
 
 ```
 log note 'size is {size} with {size / 0x1000} pages'
+log note 'home is {env('HOME')}'
 ```
 
 A `declare` statement may be followed by indented attributes:

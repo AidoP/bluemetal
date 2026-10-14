@@ -747,3 +747,95 @@ declare pages
 ")]);
     project.configure().failed().stderr("note: pages: the number of pages, 4 by default");
 }
+
+#[test]
+fn functions() {
+    let project = Project::new("functions", &[("Build", "\
+declare arch
+    default 'RiscV'
+declare board
+declare fallback
+    default 'virt'
+log note '{upper(arch)} {lower(arch)} {lower({5})}'
+log note 'board is {select(board, fallback)}'
+set board 'qemu'
+log note 'board is now {select(board, fallback)}'
+@if starts-with(lower(arch), 'risc') && ends-with(arch, 'V') && !ends-with(arch, 'x')
+log note 'nested calls'
+declare path
+set path env('PATH')
+log note 'path is {path}'
+")]);
+    let output = project.configure().ok();
+    output
+        .stderr("note: RISCV riscv 5")
+        // unset properties are skipped
+        .stderr("note: board is virt")
+        .stderr("note: board is now qemu")
+        .stderr("note: nested calls")
+        .stderr(&format!("note: path is {}\n", std::env::var("PATH").unwrap()));
+}
+
+#[test]
+fn function_errors() {
+    let project = Project::new("function-errors", &[("Build", "\
+declare a
+set a select(a, typo)
+set a select(a)
+set a select()
+set a upper('a', 'b')
+set a upper(5)
+set a nope(1)
+set a upper('a',' b')
+set a env('BLUEMETAL_CONFIGURE_TEST_UNSET')
+@if upper('a')
+log note 'x'
+")]);
+    project.configure().failed()
+        // a misspelt property is not ignored
+        .stderr("error: property \"typo\" is undeclared\n --> Build:2:17")
+        .stderr("error: no value for any of the properties \"a\"\n --> Build:3:7")
+        .stderr("error: function \"select\" takes at least 1 argument, but 0 were given\n --> Build:4:7")
+        .stderr("error: function \"upper\" takes 1 argument, but 2 were given\n --> Build:5:7")
+        .stderr("error: unsigned value used where str is required\n --> Build:6:13")
+        .stderr("error: unknown function \"nope\"\n --> Build:7:7")
+        .stderr("error: expected \", \" or \")\"\n --> Build:8:16")
+        .stderr("error: environment variable \"BLUEMETAL_CONFIGURE_TEST_UNSET\" is not set\n --> Build:9:11")
+        .stderr("error: str value used where bool is required\n  --> Build:10:5")
+        .stderr("configuration failed with 9 errors");
+}
+
+#[test]
+fn strings_in_templates() {
+    let project = Project::new("template-strings", &[("Build", "\
+declare arch
+    default 'riscv'
+log note 'path is {env('PATH')}'
+log note '{upper('x')} and {lower('{upper(arch)}')}'
+log note 'nested {'a {'b {upper('c')}'}'}'
+log note 'braces {'{{'}{'}}'} {{x}}'
+@if starts-with('{arch}64', 'riscv6')
+log note 'condition'
+")]);
+    let output = project.configure().ok();
+    output
+        .stderr(&format!("note: path is {}\n", std::env::var("PATH").unwrap()))
+        .stderr("note: X and riscv\n")
+        .stderr("note: nested a b C\n")
+        .stderr("note: braces {} {x}\n")
+        .stderr("note: condition\n");
+}
+
+#[test]
+fn strings_in_templates_errors() {
+    let project = Project::new("template-strings-errors", &[("Build", "\
+log note 'bad {upper(5)} here'
+log note 'inner {'{upper(5)}'}'
+log note 'unclosed {'a'
+")]);
+    project.configure().failed()
+        // spans within nested strings are relative to the file
+        .stderr("error: unsigned value used where str is required\n --> Build:1:22")
+        .stderr("error: unsigned value used where str is required\n --> Build:2:26")
+        .stderr("error: invalid string template\n --> Build:3:20");
+}

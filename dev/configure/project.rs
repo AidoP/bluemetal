@@ -1031,6 +1031,9 @@ impl Project {
             // any word is parsed as an identifier, to report its invalid characters
             Some(c) if c.is_alphabetic() || c == '_' => {
                 let (name, span) = self.parse_ident(parser)?;
+                if parser.peek() == Some('(') {
+                    return self.parse_call(parser, name, span);
+                }
                 let (data, origin) = match name {
                     "true" => (Data::Bool(true), None),
                     "false" => (Data::Bool(false), None),
@@ -1042,6 +1045,153 @@ impl Project {
                 self.diagnostics.push(Diagnostic {
                     span: Some(parser.span_until(|c| c == ' ' || c == '\n')),
                     message: Message::ExpectedExpression,
+                    severity: Severity::Error,
+                });
+                None
+            },
+        }
+    }
+    /// Take the arguments of a function call, and apply the function.
+    ///
+    /// Arguments are separated by `, ` and are expressions, except for `select`, which takes property names.
+    fn parse_call(&mut self, parser: &mut Parser, name: &str, name_span: Span) -> Option<Operand> {
+        parser.expect('(');
+        let expected = match name {
+            "upper" | "lower" | "env" => "1",
+            "starts-with" | "ends-with" => "2",
+            "select" => "at least 1",
+            _ => {
+                self.diagnostics.push(Diagnostic {
+                    span: Some(name_span),
+                    message: Message::UnknownFunction(name.into()),
+                    severity: Severity::Error,
+                });
+                return None;
+            },
+        };
+        if name == "select" {
+            let names = self.parse_arguments(parser, |this, parser| {
+                this.parse_ident(parser).map(|(name, span)| (name.to_string(), span))
+            })?;
+            let span = parser.span_from(name_span.offset);
+            if names.is_empty() {
+                self.argument_count(name, expected, 0, span);
+                return None;
+            }
+            return self.select(&names, span);
+        }
+        let mut arguments = self.parse_arguments(parser, |this, parser| this.parse_binary(parser, 0))?.into_iter();
+        let span = parser.span_from(name_span.offset);
+        if arguments.len().to_string() != expected {
+            self.argument_count(name, expected, arguments.len(), span);
+            return None;
+        }
+        let data = match name {
+            "upper" => Data::Str(self.str_operand(arguments.next()?)?.to_uppercase()),
+            "lower" => Data::Str(self.str_operand(arguments.next()?)?.to_lowercase()),
+            "starts-with" | "ends-with" => {
+                let string = self.str_operand(arguments.next()?)?;
+                let affix = self.str_operand(arguments.next()?)?;
+                Data::Bool(if name == "starts-with" { string.starts_with(&affix) } else { string.ends_with(&affix) })
+            },
+            _ => {
+                let variable = arguments.next()?;
+                let variable_span = variable.span;
+                let variable = self.str_operand(variable)?;
+                match std::env::var(&variable) {
+                    Ok(value) => Data::Str(value),
+                    Err(error) => {
+                        self.diagnostics.push(Diagnostic {
+                            span: Some(variable_span),
+                            message: Message::EnvironmentVariable {
+                                name: variable,
+                                present: matches!(error, std::env::VarError::NotUnicode(_)),
+                            },
+                            severity: Severity::Error,
+                        });
+                        return None;
+                    },
+                }
+            },
+        };
+        Some(Operand { data, span, coerce: Coercion::Strict, origin: None })
+    }
+    /// Take a parenthesised list of arguments separated by `, `, after the opening parenthesis.
+    fn parse_arguments<'a, T>(
+        &mut self,
+        parser: &mut Parser<'a>,
+        mut parse: impl FnMut(&mut Self, &mut Parser<'a>) -> Option<T>,
+    ) -> Option<Vec<T>> {
+        let mut arguments = Vec::new();
+        if parser.expect(')') {
+            return Some(arguments);
+        }
+        loop {
+            arguments.push(parse(self, parser)?);
+            if parser.expect(')') {
+                return Some(arguments);
+            }
+            if !parser.as_str().starts_with(", ") {
+                self.diagnostics.push(Diagnostic {
+                    span: Some(parser.span_char()),
+                    message: Message::ExpectedArgumentSeparator,
+                    severity: Severity::Error,
+                });
+                return None;
+            }
+            parser.offset += 2;
+        }
+    }
+    fn argument_count(&mut self, function: &str, expected: &'static str, found: usize, span: Span) {
+        self.diagnostics.push(Diagnostic {
+            span: Some(span),
+            message: Message::ArgumentCount { function: function.into(), expected, found },
+            severity: Severity::Error,
+        });
+    }
+    /// Returns the value of the first property which has one.
+    ///
+    /// Every property must have been declared, or forward declared by a `set`, so that a misspelling is not ignored.
+    fn select(&mut self, names: &[(String, Span)], span: Span) -> Option<Operand> {
+        let mut undeclared = false;
+        for (name, name_span) in names {
+            if !self.properties_idx.contains_key(name) {
+                self.diagnostics.push(Diagnostic {
+                    span: Some(*name_span),
+                    message: Message::UndeclaredProperty(name.clone()),
+                    severity: Severity::Error,
+                });
+                undeclared = true;
+            }
+        }
+        if undeclared {
+            return None;
+        }
+        let selected = names.iter().find_map(|(name, _)| self.value(name, span.file));
+        let Some(value) = selected else {
+            self.diagnostics.push(Diagnostic {
+                span: Some(span),
+                message: Message::NoneSelected(names.iter().map(|(name, _)| name.clone()).collect()),
+                severity: Severity::Error,
+            });
+            return None;
+        };
+        Some(Operand { data: value.data.clone(), span, coerce: Coercion::Strict, origin: value.origin })
+    }
+    /// Ensure an operand is a string, converting it if it permits coercion.
+    fn str_operand(&mut self, operand: Operand) -> Option<String> {
+        match operand.data {
+            Data::Str(string) => Some(string),
+            data if operand.coerce == Coercion::Any && data != Data::None => Some(data.coerce_string()),
+            data => {
+                self.diagnostics.push(Diagnostic {
+                    span: Some(operand.span),
+                    message: Message::InvalidOperand {
+                        ty: data.type_name(),
+                        expected: "str",
+                        coerce: operand.coerce == Coercion::Any,
+                        origin: operand.origin,
+                    },
                     severity: Severity::Error,
                 });
                 None
@@ -1306,18 +1456,7 @@ impl Project {
                 rest = after;
                 continue;
             }
-            // the expression may itself contain `{}` to coerce a property
-            let mut depth = 0usize;
-            let end = after.find(|c| {
-                match c {
-                    '{' => depth += 1,
-                    '}' if depth == 0 => return true,
-                    '}' => depth -= 1,
-                    _ => (),
-                }
-                false
-            });
-            let Some(end) = end else {
+            let Some(end) = expression_end(after) else {
                 self.diagnostics.push(Diagnostic {
                     span: Some(Span { file, offset: offset - 1, len: after.len() + 1 }),
                     message: Message::InvalidStringTemplate,
@@ -1347,6 +1486,51 @@ impl Project {
         string.push_str(rest);
         string
     }
+}
+
+/// Returns the index of the `'` which closes a string, given the text after the opening `'`.
+///
+/// A string is on a single line. An expression in `{}` within it may contain strings, so their quotes do not close it,
+/// while `{{` and `}}` are escaped braces. An unclosed `{` is ignored, so that it is reported as an invalid template.
+fn string_end(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => return None,
+            b'\'' => return Some(i),
+            b'{' | b'}' if bytes.get(i + 1) == Some(&bytes[i]) => i += 1,
+            b'{' => {
+                if let Some(end) = expression_end(&s[i + 1..]) {
+                    i += 1 + end;
+                }
+            },
+            _ => (),
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Returns the index of the `}` which closes an expression in a string template, given the text after the `{`.
+///
+/// The expression may itself contain `{}` to coerce a value, and strings, whose braces are not counted.
+fn expression_end(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => return None,
+            b'\'' => i += 1 + string_end(&s[i + 1..])?,
+            b'{' => depth += 1,
+            b'}' if depth == 0 => return Some(i),
+            b'}' => depth -= 1,
+            _ => (),
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Returns whether a character, at index `i`, cannot be part of an identifier.
@@ -1493,6 +1677,19 @@ pub enum Message {
     UnknownStatement(String),
     UnknownMetaStatement(String),
     ExpectedStatementAfterMeta,
+    UnknownFunction(String),
+    ExpectedArgumentSeparator,
+    ArgumentCount {
+        function: String,
+        expected: &'static str,
+        found: usize,
+    },
+    NoneSelected(Vec<String>),
+    EnvironmentVariable {
+        name: String,
+        /// Whether the variable is set, but is not valid unicode.
+        present: bool,
+    },
     ElseWithoutIf(String),
     ElseNotFirst(String),
     UnsetProperty(String),
@@ -1577,6 +1774,21 @@ impl core::fmt::Display for Message {
             Self::UnknownSeverity(name) => write!(f, "unknown severity {name:?}"),
             Self::UnknownStatement(name) => write!(f, "unknown statement {name:?}"),
             Self::UnknownMetaStatement(name) => write!(f, "unknown meta-statement \"@{name}\""),
+            Self::UnknownFunction(name) => write!(f, "unknown function {name:?}"),
+            Self::ExpectedArgumentSeparator => write!(f, "expected \", \" or \")\""),
+            Self::ArgumentCount { function, expected, found } => {
+                let suffix = if expected.ends_with(" 1") || *expected == "1" { "" } else { "s" };
+                let verb = if *found == 1 { "was" } else { "were" };
+                write!(f, "function {function:?} takes {expected} argument{suffix}, but {found} {verb} given")
+            },
+            Self::NoneSelected(names) => {
+                let names: Vec<_> = names.iter().map(|name| format!("{name:?}")).collect();
+                write!(f, "no value for any of the properties {}", names.join(", "))
+            },
+            Self::EnvironmentVariable { name, present: false } => write!(f, "environment variable {name:?} is not set"),
+            Self::EnvironmentVariable { name, present: true } => {
+                write!(f, "environment variable {name:?} is not valid unicode")
+            },
             Self::ExpectedStatementAfterMeta => write!(f, "expected statement on the line after a meta-statement"),
             Self::ElseWithoutIf(name) => write!(f, "\"@{name}\" must follow a conditional statement"),
             Self::ElseNotFirst(name) => write!(f, "\"@{name}\" must be the first meta-statement of a statement"),
@@ -1988,10 +2200,7 @@ impl <'a> Parser<'a> {
     pub fn string(&mut self) -> Option<(&'a str, Span)> {
         let data = self.as_str();
         let rest = data.strip_prefix('\'')?;
-        let end = rest.find(['\'', '\n'])?;
-        if !rest[end..].starts_with('\'') {
-            return None;
-        }
+        let end = string_end(rest)?;
         let start = self.offset;
         self.offset += end + 2;
         Some((&rest[..end], self.span_from(start)))
