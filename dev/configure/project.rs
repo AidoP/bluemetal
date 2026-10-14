@@ -105,9 +105,6 @@ impl Project {
         self.values_idx.insert(name, id);
         id
     }
-    pub fn get(&self, name: &str, file: usize) -> Option<&Data> {
-        Some(&self.value(name, file)?.data)
-    }
     fn value(&self, name: &str, file: usize) -> Option<&Value> {
         let mut idx = self.files[file].locals.get(name);
         if idx.is_none() {
@@ -195,6 +192,12 @@ impl Project {
                 if let Some(span) = &property.span {
                     writeln!(w, "{style_note}note{style_white}: attribute specified for declaration of {:?}{style_reset}", property.name)?;
                     self.write_location(w, span, style_note, style_reset)?;
+                }
+            },
+            Message::RunFailed { stderr, .. } if !stderr.is_empty() => {
+                writeln!(w, "{style_note}note{style_white}: stderr:{style_reset}")?;
+                for line in stderr.lines() {
+                    writeln!(w, "    {line}")?;
                 }
             },
             Message::InvalidOperand { ty, origin: Some(span), .. } => {
@@ -1057,9 +1060,9 @@ impl Project {
     fn parse_call(&mut self, parser: &mut Parser, name: &str, name_span: Span) -> Option<Operand> {
         parser.expect('(');
         let expected = match name {
-            "upper" | "lower" | "env" => "1",
+            "upper" | "lower" | "env" | "path" => "1",
             "starts-with" | "ends-with" => "2",
-            "select" => "at least 1",
+            "select" | "run" => "at least 1",
             _ => {
                 self.diagnostics.push(Diagnostic {
                     span: Some(name_span),
@@ -1069,6 +1072,11 @@ impl Project {
                 return None;
             },
         };
+        if name == "run" {
+            let arguments = self.parse_arguments(parser, Self::parse_run_argument)?;
+            let span = parser.span_from(name_span.offset);
+            return self.run(arguments, span);
+        }
         if name == "select" {
             let names = self.parse_arguments(parser, |this, parser| {
                 this.parse_ident(parser).map(|(name, span)| (name.to_string(), span))
@@ -1088,6 +1096,11 @@ impl Project {
         }
         let data = match name {
             "upper" => Data::Str(self.str_operand(arguments.next()?)?.to_uppercase()),
+            // relative to the directory of the file, where an absolute path stays absolute
+            "path" => {
+                let path = self.str_operand(arguments.next()?)?;
+                Data::Str(normalize(&self.file(name_span.file).relative_path(path)).display().to_string())
+            },
             "lower" => Data::Str(self.str_operand(arguments.next()?)?.to_lowercase()),
             "starts-with" | "ends-with" => {
                 let string = self.str_operand(arguments.next()?)?;
@@ -1115,6 +1128,84 @@ impl Project {
             },
         };
         Some(Operand { data, span, coerce: Coercion::Strict, origin: None })
+    }
+    /// Take an argument of `run`, which is an expression, or an environment variable as `name: expression`.
+    ///
+    /// The name of an environment variable is a name, as taken by [`Self::parse_name`]. As an expression can also be
+    /// an identifier or start with `{`, it is only a name if it is followed by `: `.
+    fn parse_run_argument(&mut self, parser: &mut Parser) -> Option<RunArgument> {
+        let rest = parser.as_str();
+        let len = match rest.strip_prefix('{') {
+            Some(inner) => expression_end(inner).map_or(0, |end| end + 2),
+            None => rest.find(|c: char| !c.is_alphanumeric() && c != '_' && c != '-').unwrap_or(rest.len()),
+        };
+        if len == 0 || !rest[len..].starts_with(": ") {
+            return Some(RunArgument::Positional(self.parse_binary(parser, 0)?));
+        }
+        let (name, _, _) = self.parse_name(parser)?;
+        parser.offset += 2;
+        Some(RunArgument::Env(name, self.parse_binary(parser, 0)?))
+    }
+    /// Run a program, returning its output without trailing newlines.
+    ///
+    /// The first argument is the program, followed by its arguments and then any environment variables.
+    fn run(&mut self, arguments: Vec<RunArgument>, span: Span) -> Option<Operand> {
+        let mut command_line = Vec::new();
+        let mut env = Vec::new();
+        let mut failed = false;
+        for argument in arguments {
+            match argument {
+                RunArgument::Positional(operand) if !env.is_empty() => {
+                    self.diagnostics.push(Diagnostic {
+                        span: Some(operand.span),
+                        message: Message::PositionalAfterEnv,
+                        severity: Severity::Error,
+                    });
+                    failed = true;
+                },
+                RunArgument::Positional(operand) => match self.str_operand(operand) {
+                    Some(string) => command_line.push(string),
+                    None => failed = true,
+                },
+                RunArgument::Env(name, operand) => match self.str_operand(operand) {
+                    Some(value) => env.push((name, value)),
+                    None => failed = true,
+                },
+            }
+        }
+        if failed {
+            return None;
+        }
+        let Some((program, args)) = command_line.split_first() else {
+            self.argument_count("run", "at least 1", 0, span);
+            return None;
+        };
+        let output = std::process::Command::new(program)
+            .args(args)
+            .envs(env)
+            .stdin(std::process::Stdio::null())
+            .output();
+        let message = match output {
+            Err(error) => Message::RunSpawn { program: program.clone(), error: error.to_string() },
+            Ok(output) if !output.status.success() => Message::RunFailed {
+                program: program.clone(),
+                status: output.status.to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim_end().into(),
+            },
+            Ok(output) => match String::from_utf8(output.stdout) {
+                Ok(stdout) => {
+                    let stdout = stdout.trim_end_matches(['\n', '\r']).into();
+                    return Some(Operand { data: Data::Str(stdout), span, coerce: Coercion::Strict, origin: None });
+                },
+                Err(_) => Message::RunOutput { program: program.clone() },
+            },
+        };
+        self.diagnostics.push(Diagnostic {
+            span: Some(span),
+            message,
+            severity: Severity::Error,
+        });
+        None
     }
     /// Take a parenthesised list of arguments separated by `, `, after the opening parenthesis.
     fn parse_arguments<'a, T>(
@@ -1488,6 +1579,31 @@ impl Project {
     }
 }
 
+/// Remove `.` and resolve `..` in a path without accessing the file system.
+///
+/// A `..` which cannot be resolved is kept in a relative path, and removed at the root of an absolute path.
+fn normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut normal = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => (),
+            Component::ParentDir => match normal.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normal.pop();
+                },
+                Some(Component::RootDir | Component::Prefix(_)) => (),
+                _ => normal.push(".."),
+            },
+            component => normal.push(component),
+        }
+    }
+    if normal.as_os_str().is_empty() {
+        normal.push(".");
+    }
+    normal
+}
+
 /// Returns the index of the `'` which closes a string, given the text after the opening `'`.
 ///
 /// A string is on a single line. An expression in `{}` within it may contain strings, so their quotes do not close it,
@@ -1536,11 +1652,18 @@ fn expression_end(s: &str) -> Option<usize> {
 /// Returns whether a character, at index `i`, cannot be part of an identifier.
 fn invalid_ident_char(&(i, c): &(usize, char)) -> bool {
     match c {
-        'a'..='z' | '-' | '_' => false,
+        'a'..='z' | 'A'..='Z' | '-' | '_' => false,
         // a leading digit would be an integer
         '0'..='9' => i == 0,
         _ => true,
     }
+}
+
+/// An argument of the `run` function.
+enum RunArgument {
+    Positional(Operand),
+    /// An environment variable for the program.
+    Env(String, Operand),
 }
 
 /// An evaluated part of an expression.
@@ -1685,6 +1808,19 @@ pub enum Message {
         found: usize,
     },
     NoneSelected(Vec<String>),
+    PositionalAfterEnv,
+    RunSpawn {
+        program: String,
+        error: String,
+    },
+    RunFailed {
+        program: String,
+        status: String,
+        stderr: String,
+    },
+    RunOutput {
+        program: String,
+    },
     EnvironmentVariable {
         name: String,
         /// Whether the variable is set, but is not valid unicode.
@@ -1781,6 +1917,10 @@ impl core::fmt::Display for Message {
                 let verb = if *found == 1 { "was" } else { "were" };
                 write!(f, "function {function:?} takes {expected} argument{suffix}, but {found} {verb} given")
             },
+            Self::PositionalAfterEnv => write!(f, "program arguments must come before environment variables"),
+            Self::RunSpawn { program, error } => write!(f, "failed to run {program:?}: {error}"),
+            Self::RunFailed { program, status, .. } => write!(f, "{program:?} failed with {status}"),
+            Self::RunOutput { program } => write!(f, "output of {program:?} is not valid unicode"),
             Self::NoneSelected(names) => {
                 let names: Vec<_> = names.iter().map(|name| format!("{name:?}")).collect();
                 write!(f, "no value for any of the properties {}", names.join(", "))
@@ -2121,7 +2261,7 @@ impl <'a> Parser<'a> {
         let mut i = self.offset;
         while i < data.len() {
             match data[i] {
-                b'a'..=b'z' | b'-' | b'_' => i += 1,
+                b'a'..=b'z' | b'A'..=b'Z' | b'-' | b'_' => i += 1,
                 // a leading digit would be an integer
                 b'0'..=b'9' if i > start => i += 1,
                 _ => break,

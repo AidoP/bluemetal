@@ -24,7 +24,7 @@ From now on just build with `ninja`.
 - `set <name> <value>`: assign a value to a property
 - `crate <name>`: introduces a crate named `<name>`
 
-A `<name>` is an identifier: lowercase letters, digits, `-` and `_`, not starting with a digit. Crate names cannot
+A `<name>` is an identifier: ASCII letters, digits, `-` and `_`, not starting with a digit. Crate names cannot
 contain `-`, as rustc does not accept it. A name can instead be computed with an expression in `{}`, whose value must
 be a valid name.
 
@@ -93,6 +93,12 @@ Functions are called with their arguments in `()`, separated by `, `:
 - `select(name, ...)`: the value of the first of the named properties which has a value. Each property must be
   declared, or set before it is declared, so that a misspelt name is an error rather than ignored
 - `env(name)`: the value of an environment variable, which must be set. The build is not reconfigured when it changes
+- `path(str)`: a path relative to the directory of the file containing the expression, as a `str`. An absolute path
+  is not made relative. `.` and `..` are resolved without following symbolic links
+- `run(program, argument, ..., NAME: value, ...)`: run a program and return its output, without trailing newlines. The
+  program inherits the environment, with any variables given as `NAME: value` after the arguments, where `NAME` is a
+  name like those of properties, so it can be computed with `{}`. The configuration fails if the program exits
+  unsuccessfully. The build is not reconfigured when its output would change
 
 ```
 set board select(board, default-board)

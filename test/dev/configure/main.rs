@@ -274,18 +274,19 @@ declare suffix
     default 'x'
 crate host-tool 'x.rs'
 crate {'a-{suffix}'} 'x.rs'
-crate Upper 'x.rs'
+crate café 'x.rs'
 crate 2fast 'x.rs'
 crate 'quoted' 'x.rs'
 crate {'a b'} 'x.rs'
 crate {''} 'x.rs'
 crate compiler_builtins2 'x.rs'
+crate Upper 'x.rs'
 ")]);
     project.configure().failed()
         // an identifier points at the character, an expression at the whole name
         .stderr("error: invalid character '-' in crate name \"host-tool\"\n --> Build:4:11")
         .stderr("error: invalid character '-' in crate name \"a-x\"\n --> Build:5:7")
-        .stderr("error: invalid character 'U' in identifier \"Upper\"\n --> Build:6:7")
+        .stderr("error: invalid character 'é' in identifier \"café\"\n --> Build:6:10")
         .stderr("error: invalid character '2' in identifier \"2fast\"\n --> Build:7:7")
         .stderr("error: expected identifier\n --> Build:8:7")
         .stderr("error: invalid character ' ' in identifier \"a b\"\n --> Build:9:7")
@@ -300,17 +301,17 @@ declare my.prop
 declare prop2
     type 'str'
     default 'v'
-    Default 'x'
-Set prop2 'y'
-log note '{Prop}'
+    défaut 'x'
+Sét prop2 'y'
+log note '{Prøp}'
 declare 2go
 set {5} 1
 ")]);
     project.configure().failed()
         .stderr("error: expected \"\\n\"\n --> Build:1:11")
-        .stderr("error: invalid character 'D' in identifier \"Default\"\n --> Build:5:5")
-        .stderr("error: invalid character 'S' in identifier \"Set\"\n --> Build:6:1")
-        .stderr("error: invalid character 'P' in identifier \"Prop\"\n --> Build:7:12")
+        .stderr("error: invalid character 'é' in identifier \"défaut\"\n --> Build:5:6")
+        .stderr("error: invalid character 'é' in identifier \"Sét\"\n --> Build:6:2")
+        .stderr("error: invalid character 'ø' in identifier \"Prøp\"\n --> Build:7:14")
         .stderr("error: invalid character '2' in identifier \"2go\"\n --> Build:8:9")
         .stderr("error: invalid character '5' in identifier \"5\"\n --> Build:9:5")
         .stderr("configuration failed with 6 errors");
@@ -838,4 +839,98 @@ log note 'unclosed {'a'
         .stderr("error: unsigned value used where str is required\n --> Build:1:22")
         .stderr("error: unsigned value used where str is required\n --> Build:2:26")
         .stderr("error: invalid string template\n --> Build:3:20");
+}
+
+#[test]
+fn run_function() {
+    let project = Project::new("run", &[("Build", "\
+declare name
+    default 'world'
+log note '{run('sh', '-c', 'echo \"hello $WHO\"; echo', WHO: name)}|'
+log note '{run('printf', '%s-%s', 'a', {5})}'
+@if starts-with(run('sh', '-c', 'pwd'), '/')
+log note 'condition'
+")]);
+    let output = project.configure().ok();
+    // trailing newlines are removed
+    output.stderr("note: hello world|\n").stderr("note: a-5\n").stderr("note: condition\n");
+}
+
+#[test]
+fn run_errors() {
+    let project = Project::new("run-errors", &[("Build", "\
+declare a
+set a run('sh', '-c', 'echo oops >&2; echo second >&2; exit 3')
+set a run('bluemetal-no-such-program')
+set a run('echo', X: 'a', 'late')
+set a run('echo', 5)
+set a run(X: 'a')
+set a run('sh', '-c', 'printf \"\\377\"')
+")]);
+    project.configure().failed()
+        .stderr("error: \"sh\" failed with exit status: 3\n --> Build:2:7")
+        .stderr("note: stderr:\n    oops\n    second\n")
+        .stderr("error: failed to run \"bluemetal-no-such-program\": ")
+        .stderr("error: program arguments must come before environment variables\n --> Build:4:27")
+        .stderr("error: unsigned value used where str is required\n --> Build:5:19")
+        .stderr("error: function \"run\" takes at least 1 argument, but 0 were given\n --> Build:6:7")
+        .stderr("error: output of \"sh\" is not valid unicode\n --> Build:7:7")
+        .stderr("configuration failed with 6 errors");
+}
+
+#[test]
+fn path_function() {
+    let project = Project::new("path", &[
+        ("Build", "log note 'root {path('x.rs')} {path('./a/../../b')} {path('a/..')} {path('/x/../../y')}'\nuse 'sub'\n"),
+        ("sub/Build", "\
+declare abs
+    default '/abs/file'
+log note 'sub {path('x.rs')} {path('../y')} {path(abs)} {'{path('t')}'}'
+log note '{path({5})}'
+"),
+    ]);
+    project.configure().ok()
+        // `..` is resolved, but kept if it leaves a relative path's start, and removed at the root of an absolute one
+        .stderr("note: root x.rs ../b . /y\n")
+        // relative to the file's directory, and an absolute path is unchanged
+        .stderr("note: sub sub/x.rs y /abs/file sub/t\n")
+        .stderr("note: sub/5\n");
+}
+
+#[test]
+fn uppercase_identifiers() {
+    let project = Project::new("uppercase", &[("Build", "\
+declare Board_Name
+    default 'virt'
+set {'Arch_{Board_Name}'} 'riscv'
+declare Arch_virt
+log note '{Board_Name} {Arch_virt}'
+crate Upper 'x.rs'
+")]);
+    let host = project.host();
+    let output = project.configure().ok();
+    output.stderr("note: virt riscv\n");
+    output.build(&format!("target/{host}/libUpper.rlib"));
+}
+
+#[test]
+fn run_environment_names() {
+    let project = Project::new("run-env-names", &[("Build", "\
+declare name
+    default 'world'
+log note '{run('printenv', target, {target}: 'computed')}'
+log note '{run('sh', '-c', 'echo $CC $X-Y', CC: 'clang', name: name)}'
+log note '{run('printenv', 'X-Y', X-Y: 'hyphen')}'
+log note '{run('printf', {5})}|{run('printf', '%s', {'{5}'})}'
+set name run('printenv', {'a b'}: 'x')
+")]);
+    project.configure().failed()
+        // a name in `{}` is computed, like the name of a property
+        .stderr("note: computed\n")
+        .stderr("note: clang -Y\n")
+        .stderr("note: hyphen\n")
+        // an expression in `{}` is still an argument unless it is followed by `: `
+        .stderr("note: 5|5\n")
+        .stderr("error: invalid character ' ' in identifier \"a b\"\n --> Build:7:26")
+        .stderr("configuration failed with 1 error");
 }
