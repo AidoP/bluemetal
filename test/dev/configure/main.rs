@@ -26,9 +26,14 @@ impl Project {
         Self { dir }
     }
     fn configure(&self) -> Output {
+        self.configure_with(&[])
+    }
+    /// Run `configure` with environment variables.
+    fn configure_with(&self, env: &[(&str, &str)]) -> Output {
         let configure = configure_path();
         let output = Command::new(&configure)
             .arg("Build")
+            .envs(env.iter().copied())
             .current_dir(&self.dir)
             .output()
             .unwrap_or_else(|error| panic!("failed to run {configure:?}: {error}"));
@@ -1600,4 +1605,130 @@ build target/configure: rustc dev/configure/main.rs
     std::fs::write(project.dir.join("Build"), "crate configure 'x.rs'\n").unwrap();
     project.configure().failed()
         .stderr(&format!("error: crate \"configure\" for target \"{host}\" is reserved for the build system\n --> Build:1:7"));
+}
+
+/// Custom targets need a nightly toolchain, which the project uses but a temporary directory may not.
+const NIGHTLY: &[(&str, &str)] = &[("RUSTUP_TOOLCHAIN", "nightly")];
+
+#[test]
+fn custom_target() {
+    let project = Project::new("custom-target", &[("Build", "\
+crate kernel 'kernel.rs'
+    target 'my-kernel'
+target my-kernel
+    inherit 'riscv64gc-unknown-none-elf'
+    code-model 'large'
+    no-redzone
+    target-feature ['+m', '+a']
+    os 'bluemetal'
+")]);
+    let output = project.configure_with(NIGHTLY).ok();
+    let spec = std::fs::read_to_string(project.dir.join("target/targets/my-kernel.json")).unwrap();
+    // inherited fields are kept, replaced in place, or added at the end
+    assert_contains(&spec, "{\n  \"arch\": \"riscv64\",\n");
+    assert_contains(&spec, "\n  \"code-model\": \"large\",\n");
+    assert_contains(&spec, "\n  \"features\": \"+m,+a\",\n");
+    assert_contains(&spec, "\n  \"metadata\": {\n");
+    assert!(spec.ends_with(",\n  \"disable-redzone\": true,\n  \"os\": \"bluemetal\"\n}\n"), "{spec}");
+    // crates for the target use its specification
+    assert_contains(output.build("target/my-kernel/libkernel.rlib"), "\
+build target/my-kernel/libkernel.rlib: rustc kernel.rs | target/targets/my-kernel.json
+    crate-name = kernel
+    crate-type = lib
+    flags = --target=target/targets/my-kernel.json -Zunstable-options -L dependency=target/my-kernel");
+
+    // an unchanged specification is not written again, as every crate for the target depends on it
+    let modified = std::fs::metadata(project.dir.join("target/targets/my-kernel.json")).unwrap().modified().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    project.configure_with(NIGHTLY).ok();
+    let again = std::fs::metadata(project.dir.join("target/targets/my-kernel.json")).unwrap().modified().unwrap();
+    assert_eq!(again, modified);
+}
+
+#[test]
+fn custom_target_errors() {
+    let project = Project::new("custom-target-errors", &[("Build", "\
+target bad
+    inherit 'riscv64gc-unknown-none'
+    max-atomic-width 32
+    code-model 5
+    no-redzone 'yes'
+    target-feature [1]
+target riscv64gc-unknown-none-elf
+    os 'x'
+target bad
+crate k 'k.rs'
+    target 'nonexistent'
+crate j 'j.rs'
+    target 'later'
+target later
+    inherit 'x86_64-unknown-none'
+")]);
+    let output = project.configure_with(NIGHTLY).failed();
+    output
+        .stderr("error: unknown target \"riscv64gc-unknown-none\", did you mean \"riscv64gc-unknown-none-elf\"?\n --> Build:2:13")
+        // only some fields can be replaced
+        .stderr("error: unknown target attribute \"max-atomic-width\"\n --> Build:3:5")
+        .stderr("error: unsigned value used where str is required\n --> Build:4:16")
+        .stderr("error: str value used where bool is required\n --> Build:5:16")
+        .stderr("error: list value used where str is required\n --> Build:6:20")
+        .stderr("error: \"riscv64gc-unknown-none-elf\" is the name of a builtin target\n --> Build:7:8")
+        .stderr("error: redeclaration of target \"bad\"\n --> Build:9:8")
+        .stderr("error: unknown target \"nonexistent\"\n  --> Build:11:12")
+        .stderr("configuration failed with 8 errors");
+    // a target can be declared after the crates which use it
+    assert!(!output.stderr.contains("\"later\""), "{}", output.stderr);
+}
+
+#[test]
+fn multi_line_strings() {
+    let project = Project::new("multi-line-strings", &[("Build", "\
+declare base
+    default '0x80000000'
+target kernel
+    inherit 'riscv64gc-unknown-none-elf'
+    link-script '''
+        ENTRY(_start)
+
+        SECTIONS {{
+            . = {base};
+        }}
+    '''
+log note '''
+    first
+# a comment, which is skipped
+      indented {upper('x')}
+    # not a comment
+'''
+log note '''
+    a
+''' == 'a'
+")]);
+    let output = project.configure_with(NIGHTLY).ok();
+    // the indentation of the lines is removed, except for any beyond it, and the lines are templates
+    output.stderr("note: first\n        indented X\n      # not a comment\n").stderr("note: true\n");
+    let spec = std::fs::read_to_string(project.dir.join("target/targets/kernel.json")).unwrap();
+    assert_contains(&spec, "\"link-script\": \"ENTRY(_start)\\n\\nSECTIONS {\\n    . = 0x80000000;\\n}\"");
+}
+
+#[test]
+fn multi_line_string_errors() {
+    let project = Project::new("multi-line-string-errors", &[("Build", "\
+log note '''
+    ok
+   bad
+      fine
+  '''
+log warning 'after'
+log note '''
+    never ended
+")]);
+    project.configure().failed()
+        .stderr("error: lines of a multi-line string must be indented by 4 spaces, or end it\n --> Build:3:1")
+        .stderr("error: lines of a multi-line string must be indented by 4 spaces, or end it\n --> Build:5:1")
+        .stderr("error: multi-line string is not terminated\n --> Build:1:10")
+        // the statement after it is still read
+        .stderr("warning: after\n --> Build:6:13")
+        .stderr("error: multi-line string is not terminated\n --> Build:7:10")
+        .stderr("configuration failed with 4 errors, 1 warning");
 }

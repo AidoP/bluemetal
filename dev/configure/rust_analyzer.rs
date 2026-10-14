@@ -38,7 +38,12 @@ fn entry(unit: &Unit, units: &[Unit]) -> String {
     entry.push_str(&format!("            \"display_name\": {},\n", string(&unit.name)));
     entry.push_str(&format!("            \"root_module\": {},\n", path(&unit.root)));
     entry.push_str("            \"edition\": \"2024\",\n");
-    entry.push_str(&format!("            \"target\": {},\n", string(&unit.target)));
+    // a custom target is given to rustc as its specification
+    let target = match &unit.spec {
+        Some(spec) => path(spec),
+        None => string(&unit.target),
+    };
+    entry.push_str(&format!("            \"target\": {target},\n"));
     entry.push_str(&format!("            \"is_workspace_member\": {},\n", unit.member));
     entry.push_str(&format!("            \"cfg\": [{cfg}],\n"));
     entry.push_str(&format!(
@@ -61,7 +66,7 @@ fn path(path: &Path) -> String {
 }
 
 /// Returns a string as a JSON string literal.
-fn string(s: &str) -> String {
+pub fn string(s: &str) -> String {
     let mut json = String::from("\"");
     for c in s.chars() {
         match c {

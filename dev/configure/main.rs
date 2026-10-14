@@ -4,6 +4,7 @@ mod database;
 mod ninja;
 mod project;
 mod rust_analyzer;
+mod target_spec;
 
 use ninja::NinjaFile;
 
@@ -80,6 +81,7 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
             path: path.into(),
             path_span: span,
             target: host.clone(),
+            target_span: span,
             kind,
             output: output.map(PathBuf::from),
             builtin: false,
@@ -125,6 +127,36 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
             }
         }
     }
+
+    for target in &project.custom_targets {
+        let inherited = match &target.inherit {
+            Some(base) => Some(target_spec_json(base)?),
+            None => None,
+        };
+        let path = target_spec::path(&target.name);
+        let spec = match target_spec::spec(target, inherited.as_deref()) {
+            Ok(spec) => spec,
+            Err(error) => return Err(Error::TargetSpec(target.name.clone(), error)),
+        };
+        // every crate for the target depends on its specification, so it is only written when it changes
+        if std::fs::read_to_string(&path).is_ok_and(|current| current == spec) {
+            continue;
+        }
+        let written = std::fs::create_dir_all(path.parent().unwrap()).and_then(|()| std::fs::write(&path, spec));
+        if let Err(error) = written {
+            return Err(Error::Write(path, error));
+        }
+    }
+    // the flag for compiling for a target, and the specification of a custom target which it depends on
+    let custom_targets: Vec<_> = project.custom_targets.iter().map(|target| target.name.clone()).collect();
+    let target_flag = |target: &str| -> (String, Option<PathBuf>) {
+        if custom_targets.iter().any(|custom| custom == target) {
+            let path = target_spec::path(target);
+            (format!("--target={} -Zunstable-options", path.display()), Some(path))
+        } else {
+            (format!("--target={target}"), None)
+        }
+    };
 
     let depfile_path = std::path::Path::new("build.ninja.d");
     let mut depfile = match std::fs::File::create(depfile_path) {
@@ -223,8 +255,9 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
     for c in &crates {
         // a dependency is a library, so it has an output
         let deps: Vec<_> = externs(c, &crates).map(|(_, d)| (d.name.as_str(), d.output().unwrap())).collect();
-        let flags = rustc_flags(&c.target, Path::new(&format!("target/{}", c.target)), &deps);
-        let deps: Vec<_> = deps.iter().map(|(_, path)| path.as_path()).collect();
+        let (target, spec) = target_flag(&c.target);
+        let flags = rustc_flags(&target, Path::new(&format!("target/{}", c.target)), &deps);
+        let deps: Vec<_> = deps.iter().map(|(_, path)| path.as_path()).chain(spec.as_deref()).collect();
         let crate_type = c.crate_type();
         let output = c.output();
         if let Some(output) = &output {
@@ -257,6 +290,7 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
         name: c.name.clone(),
         root: c.path.clone(),
         target: c.target.clone(),
+        spec: target_flag(&c.target).1,
         // a library is checked without `--test`, as its metadata is used by the crates which depend on it
         test: c.test && c.kind != project::rust::Kind::Lib,
         deps: externs(c, &crates).map(|(index, _)| index).collect(),
@@ -271,11 +305,12 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
         let deps: Vec<_> = unit.deps.iter()
             .map(|&index| (units[index].name.as_str(), units[index].check_rmeta()))
             .collect();
-        let mut flags = rustc_flags(&unit.target, &unit.check_dir(), &deps);
+        let (target, spec) = target_flag(&unit.target);
+        let mut flags = rustc_flags(&target, &unit.check_dir(), &deps);
         if unit.test {
             flags.push_str(" --test");
         }
-        let deps: Vec<_> = deps.iter().map(|(_, path)| path.as_path()).collect();
+        let deps: Vec<_> = deps.iter().map(|(_, path)| path.as_path()).chain(spec.as_deref()).collect();
         let output = unit.check_rmeta();
         let diagnostics = unit.diagnostics();
         let outdir = unit.check_dir();
@@ -352,6 +387,8 @@ pub struct Unit {
     pub name: String,
     pub root: PathBuf,
     pub target: String,
+    /// The specification of the target, if it is a custom target.
+    pub spec: Option<PathBuf>,
     /// Whether the crate is compiled as a test, as the configure tool is.
     pub test: bool,
     /// The indices of the crates passed with `--extern`.
@@ -504,11 +541,11 @@ fn test(names: &[String]) -> Result<(), Error> {
     if failures.is_empty() { Ok(()) } else { Err(Error::TestsFailed(failures.len())) }
 }
 
-/// Returns the flags for compiling a crate for a target with dependencies, as names and paths.
+/// Returns the flags for compiling a crate with the flag for its target and its dependencies, as names and paths.
 ///
 /// The outputs for a target share a directory, `search`, for the dependencies of `--extern` crates.
 fn rustc_flags(target: &str, search: &Path, deps: &[(&str, PathBuf)]) -> String {
-    let mut flags = format!("--target={target} -L dependency={}", search.display());
+    let mut flags = format!("{target} -L dependency={}", search.display());
     for (name, path) in deps {
         flags.push_str(&format!(" --extern {name}={}", path.display()));
     }
@@ -563,6 +600,7 @@ enum Error {
     Stderr(std::io::Error),
     InvalidOutput(std::process::Command),
     TestBuild,
+    TargetSpec(String, &'static str),
     UnknownTest(String),
     TestsFailed(usize),
     Exec(std::process::Command, std::io::Error),
@@ -586,11 +624,26 @@ impl core::fmt::Display for Error {
             Self::Stderr(error) => write!(f, "failed to write to stderr: {error}"),
             Self::InvalidOutput(cmd) => write!(f, "invalid output from command {cmd:?}"),
             Self::TestBuild => write!(f, "failed to build the tests"),
+            Self::TargetSpec(name, error) => write!(f, "failed to generate the specification of target {name:?}: {error}"),
             Self::UnknownTest(name) => write!(f, "no test named {name:?}"),
             Self::TestsFailed(1) => write!(f, "1 test failed"),
             Self::TestsFailed(count) => write!(f, "{count} tests failed"),
             Self::Exec(cmd, error) => write!(f, "failed to execute {cmd:?}: {error}"),
         }
+    }
+}
+
+/// Returns the specification of a builtin target, which is unstable.
+fn target_spec_json(target: &str) -> Result<String, Error> {
+    let mut cmd = std::process::Command::new("rustc");
+    cmd.args(["-Zunstable-options", "--print=target-spec-json", &format!("--target={target}")]);
+    let output = match cmd.output() {
+        Ok(output) => output,
+        Err(error) => return Err(Error::Exec(cmd, error)),
+    };
+    match String::from_utf8(output.stdout) {
+        Ok(json) if output.status.success() => Ok(json),
+        _ => Err(Error::InvalidOutput(cmd)),
     }
 }
 

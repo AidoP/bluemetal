@@ -22,6 +22,8 @@ pub struct Project {
     pub crates: HashMap<(String, String), rust::Crate>,
     /// Custom build commands, in the order they were declared.
     pub customs: Vec<Custom>,
+    /// Targets declared by `target` statements, in the order they were declared.
+    pub custom_targets: Vec<CustomTarget>,
 }
 impl Project {
     pub fn new(root: PathBuf, targets: Vec<String>) -> Self {
@@ -39,6 +41,7 @@ impl Project {
             targets_listed: false,
             crates: HashMap::new(),
             customs: Vec::new(),
+            custom_targets: Vec::new(),
         }
     }
     pub fn file(&self, idx: usize) -> &File {
@@ -119,9 +122,16 @@ impl Project {
         Some(&self.values[*idx?])
     }
     /// Check for various conditions that cannot be evaluated as errors until reading has completed.
+    /// - Unknown targets for crates, as a `target` statement may come later.
     /// - Missing declarations for `set` statements.
     /// - Missing crates for `use` attributes.
     pub fn check(&mut self) {
+        // in the order they were declared, as the crates are not
+        let mut targets: Vec<_> = self.crates.values().map(|c| (c.target.clone(), c.target_span)).collect();
+        targets.sort_by_key(|(_, span)| (span.file, span.offset));
+        for (target, span) in targets {
+            self.check_target(&target, span);
+        }
         for (name, &idx) in &self.values_idx {
             let value = &self.values[idx];
             if self.properties[value.property].is_none() {
@@ -322,6 +332,7 @@ impl Project {
                 "crate" => self.parse_crate(&mut parser),
                 "custom" => self.parse_custom(&mut parser, false),
                 "test" => self.parse_custom(&mut parser, true),
+                "target" => self.parse_target(&mut parser),
                 _ => {
                     parser.offset = start;
                     let _ = parser.skip_statement();
@@ -845,7 +856,6 @@ impl Project {
         let (target, target_span) = target.unwrap_or_else(|| {
             (self.property("target", span).map_or_default(|(data, _)| data.coerce_string()), span)
         });
-        self.check_target(&target, target_span);
         // test harnesses are run where the build runs, as other environments are not supported yet
         let host = self.property("host-target", span).map_or_default(|(data, _)| data.coerce_string());
         if test && target != host {
@@ -871,6 +881,7 @@ impl Project {
                     path,
                     path_span,
                     target,
+                    target_span,
                     kind: rust::Kind::Lib,
                     output: None,
                     builtin,
@@ -1086,9 +1097,116 @@ impl Project {
         self.values.push(Value { property: usize::MAX, span: None, data, data_span: None, origin: None, local: true });
         self.files[file].locals.insert(name.into(), id);
     }
-    /// Report a target which the compiler does not support, listing the supported targets the first time.
+    /// Take a custom target, whose attributes are `inherit`, the builtin target whose specification it is based on, and
+    /// the fields of its specification which may be replaced.
+    ///
+    /// Besides `env`, `os`, `arch` and `linker`, the fields are those with stable codegen options, named after the
+    /// options rather than the fields.
+    fn parse_target(&mut self, parser: &mut Parser) {
+        if !self.parse_space(parser) {
+            parser.skip_statement();
+            return;
+        }
+        let Some((name, span, _)) = self.parse_name(parser) else {
+            parser.skip_statement();
+            return;
+        };
+        if !self.parse_line_end(parser) {
+            parser.skip_statement();
+        }
+        let mut inherit = None;
+        let mut fields: Vec<(String, Data)> = Vec::new();
+        while parser.indent().is_some() {
+            let Some(attribute) = self.parse_attribute(parser, &[]) else {
+                parser.skip_line();
+                continue;
+            };
+            match (attribute.name, attribute.data) {
+                ("inherit", Data::Str(base)) => {
+                    if self.targets.contains(&base) {
+                        inherit = Some(base);
+                    } else {
+                        self.diagnostics.push(Diagnostic {
+                            span: Some(attribute.data_span),
+                            message: Message::UnknownTarget {
+                                suggestion: suggest(&base, &self.targets),
+                                target: base,
+                            },
+                            severity: Severity::Error,
+                        });
+                    }
+                },
+                ("inherit", data) => self.diagnostics.push(Diagnostic {
+                    span: Some(attribute.data_span),
+                    message: Message::InvalidOperand {
+                        ty: data.type_name(),
+                        expected: "str",
+                        coerce: false,
+                        origin: attribute.origin,
+                    },
+                    severity: Severity::Error,
+                }),
+                (option, data) => {
+                    let Some(&(_, field, ty)) = TARGET_OPTIONS.iter().find(|(name, ..)| *name == option) else {
+                        self.diagnostics.push(Diagnostic {
+                            span: Some(attribute.name_span),
+                            message: Message::UnknownAttribute { statement: "target", name: option.into() },
+                            severity: Severity::Error,
+                        });
+                        continue;
+                    };
+                    let data = match (ty, data) {
+                        // a flag without a value is set
+                        ("bool", Data::None) => Data::Bool(true),
+                        // features may be given separately
+                        ("features", Data::List(items)) if items.iter().all(|item| matches!(item, Data::Str(_))) => {
+                            let features: Vec<_> = items.iter().map(Data::coerce_string).collect();
+                            Data::Str(features.join(","))
+                        },
+                        ("str" | "features", data @ Data::Str(_)) | ("bool", data @ Data::Bool(_)) => data,
+                        (ty, data) => {
+                            self.diagnostics.push(Diagnostic {
+                                span: Some(attribute.data_span),
+                                message: Message::InvalidOperand {
+                                    ty: data.type_name(),
+                                    expected: if ty == "bool" { "bool" } else { "str" },
+                                    coerce: false,
+                                    origin: attribute.origin,
+                                },
+                                severity: Severity::Error,
+                            });
+                            continue;
+                        },
+                    };
+                    match fields.iter_mut().find(|(name, _)| name == field) {
+                        Some((_, value)) => *value = data,
+                        None => fields.push((field.into(), data)),
+                    }
+                },
+            }
+        }
+        if self.targets.contains(&name) {
+            self.diagnostics.push(Diagnostic {
+                span: Some(span),
+                message: Message::BuiltinTargetName(name),
+                severity: Severity::Error,
+            });
+            return;
+        }
+        if let Some(previous) = self.custom_targets.iter().find(|target| target.name == name) {
+            let previous = previous.name_span;
+            self.diagnostics.push(Diagnostic {
+                span: Some(span),
+                message: Message::RedeclareCustom { statement: "target", name, previous },
+                severity: Severity::Error,
+            });
+            return;
+        }
+        self.custom_targets.push(CustomTarget { name, name_span: span, inherit, fields });
+    }
+    /// Report a target which is neither builtin nor declared, listing the builtin targets the first time.
     fn check_target(&mut self, target: &str, span: Span) {
-        if self.targets.iter().any(|t| t == target) {
+        if self.targets.iter().any(|t| t == target) || self.custom_targets.iter().any(|t| t.name == target) {
             return;
         }
         self.diagnostics.push(Diagnostic {
@@ -1208,6 +1326,9 @@ impl Project {
     }
     /// Take the next string from the parser.
     fn parse_string(&mut self, parser: &mut Parser) -> Option<(String, Span)> {
+        if parser.as_str().starts_with("'''\n") {
+            return self.parse_multiline_string(parser);
+        }
         let Some((string, span)) = parser.string() else {
             self.diagnostics.push(Diagnostic {
                 span: Some(parser.span_until(|c| c == ' ' || c == '\n')),
@@ -1217,6 +1338,69 @@ impl Project {
             return None;
         };
         Some((self.evaluate_str(string, span.file, span.offset + 1), span))
+    }
+    /// Take a multi-line string, which starts with `'''` at the end of a line, and ends with `'''` at the
+    /// indentation of that line.
+    ///
+    /// Each line between must be indented by 4 spaces more than the line it starts on, which is removed, or be blank.
+    /// A comment, with `#` in the first column, is skipped.
+    /// The lines are templates, like other strings, and are joined by newlines, without one at the end.
+    fn parse_multiline_string(&mut self, parser: &mut Parser) -> Option<(String, Span)> {
+        let start = parser.offset;
+        let line_start = parser.data[..start].rfind('\n').map_or(0, |i| i + 1);
+        let indent = parser.data[line_start..start].len() - parser.data[line_start..start].trim_start_matches(' ').len();
+        let content_indent = " ".repeat(indent + 4);
+        let closing = format!("{}'''", " ".repeat(indent));
+        let span = Span { file: parser.file, offset: start, len: 3 };
+        parser.offset += 4;
+        let mut lines = Vec::new();
+        let mut valid = true;
+        loop {
+            let rest = parser.as_str();
+            let len = rest.find('\n').unwrap_or(rest.len());
+            let line = &rest[..len];
+            if line.starts_with(&closing) {
+                parser.offset += closing.len();
+                break;
+            }
+            // a comment in the first column is not part of the string
+            if line.starts_with('#') {
+                parser.offset += len + 1;
+                continue;
+            }
+            let spaces = line.len() - line.trim_start_matches(' ').len();
+            // a line which is not indented beyond the start is not part of the string, which was not ended
+            if rest.is_empty() || !line.trim().is_empty() && spaces <= indent {
+                self.diagnostics.push(Diagnostic {
+                    span: Some(span),
+                    message: Message::UnterminatedString,
+                    severity: Severity::Error,
+                });
+                // the end of the previous line, so that skipping the rest of the statement stops at this one
+                if !rest.is_empty() {
+                    parser.offset -= 1;
+                }
+                return None;
+            }
+            if line.trim().is_empty() {
+                lines.push(("", parser.offset));
+            } else if let Some(content) = line.strip_prefix(&content_indent) {
+                lines.push((content, parser.offset + content_indent.len()));
+            } else {
+                self.diagnostics.push(Diagnostic {
+                    span: Some(Span { file: parser.file, offset: parser.offset, len: spaces.max(1) }),
+                    message: Message::StringIndentation { expected: indent + 4 },
+                    severity: Severity::Error,
+                });
+                valid = false;
+            }
+            parser.offset += (len + 1).min(rest.len());
+        }
+        if !valid {
+            return None;
+        }
+        let lines: Vec<_> = lines.iter().map(|(line, offset)| self.evaluate_str(line, parser.file, *offset)).collect();
+        Some((lines.join("\n"), span))
     }
     /// Take the next expression from the parser and evaluate it.
     ///
@@ -2299,6 +2483,10 @@ pub enum Message {
         character: char,
     },
     ExpectedString,
+    UnterminatedString,
+    StringIndentation {
+        expected: usize,
+    },
     InvalidStringTemplate,
     InvalidInteger,
     InvalidOperand {
@@ -2365,6 +2553,7 @@ pub enum Message {
         name: String,
         target: String,
     },
+    BuiltinTargetName(String),
     RedeclareCrate {
         name: String,
         target: String,
@@ -2422,6 +2611,10 @@ impl core::fmt::Display for Message {
             Self::ExpectedIdentifier => write!(f, "expected identifier"),
             Self::InvalidIdentifier { name, character } => write!(f, "invalid character {character:?} in identifier {name:?}"),
             Self::ExpectedString => write!(f, "expected string"),
+            Self::UnterminatedString => write!(f, "multi-line string is not terminated"),
+            Self::StringIndentation { expected } => {
+                write!(f, "lines of a multi-line string must be indented by {expected} spaces, or end it")
+            },
             Self::InvalidStringTemplate { .. } => write!(f, "invalid string template"),
             Self::InvalidInteger => write!(f, "invalid integer"),
             Self::InvalidOperand { ty, expected, coerce: false, .. } => write!(f, "{ty} value used where {expected} is required"),
@@ -2446,8 +2639,10 @@ impl core::fmt::Display for Message {
             Self::RepeatedAttribute(name) => write!(f, "attribute {name:?} cannot be repeated"),
             Self::MissingAttribute(name) => write!(f, "missing required attribute {name:?}"),
             Self::RedeclareCustom { statement: "test", name, .. } => write!(f, "redeclaration of test {name:?}"),
+            Self::RedeclareCustom { statement: "target", name, .. } => write!(f, "redeclaration of target {name:?}"),
             Self::RedeclareCustom { name, .. } => write!(f, "redeclaration of custom command {name:?}"),
             Self::NewlineInArgument => write!(f, "command arguments cannot contain a newline"),
+            Self::BuiltinTargetName(name) => write!(f, "{name:?} is the name of a builtin target"),
             Self::ReservedCrate { name, target } => {
                 write!(f, "crate {name:?} for target {target:?} is reserved for the build system")
             },
@@ -2496,6 +2691,35 @@ fn edit_distance(a: &str, b: &str) -> usize {
         }
     }
     row[b.len()]
+}
+
+/// The attributes of a `target` statement which replace a field of its specification, with the field and the type of
+/// its value, where `features` is a `str` of features separated by `,`, or a list of them.
+const TARGET_OPTIONS: &[(&str, &str, &str)] = &[
+    ("env", "env", "str"),
+    ("os", "os", "str"),
+    ("arch", "arch", "str"),
+    ("linker", "linker", "str"),
+    // stable codegen options
+    ("code-model", "code-model", "str"),
+    ("relocation-model", "relocation-model", "str"),
+    ("target-cpu", "cpu", "str"),
+    ("target-feature", "features", "features"),
+    ("linker-flavor", "linker-flavor", "str"),
+    ("panic", "panic-strategy", "str"),
+    ("no-redzone", "disable-redzone", "bool"),
+    // the linker script, rather than its path
+    ("link-script", "link-script", "str"),
+];
+
+/// A target declared by a `target` statement.
+pub struct CustomTarget {
+    pub name: String,
+    pub name_span: Span,
+    /// The builtin target whose specification is extended.
+    pub inherit: Option<String>,
+    /// Fields of the target specification, in order, which replace those inherited.
+    pub fields: Vec<(String, Data)>,
 }
 
 /// A custom build command, or a test.

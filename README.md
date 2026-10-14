@@ -39,6 +39,7 @@ declares its crates, which are not passed builtin crates.
 - `log <severity> <expression>`: report the value of an expression as an `error`, `warning` or `note`
 - `custom <name>`: a custom build command, which ninja runs when its inputs change. Its outputs can be built with
   `ninja custom/<name>`
+- `target <name>`: a custom target, which crates can be compiled for. See below
 - `test <name>`: a test, which passes if its command succeeds. Like `custom`, it has `input` and `command` attributes,
   but no `output` or `default`. Its inputs are built with `ninja test/<name>`, or those of every test with `ninja test`
 
@@ -154,6 +155,18 @@ log note 'size is {size} with {size / 0x1000} pages'
 log note 'home is {env('HOME')}'
 ```
 
+A multi-line string starts with `'''` at the end of a line and ends with `'''` at the indentation of that line. The lines
+between are indented by 4 spaces more, which is removed, or are blank, and are joined by newlines, without one at the
+end. A line starting with `#`, in the first column, is a comment which is skipped. Like other strings, each line is a
+template.
+
+```
+log note '''
+    first line
+      indented line
+'''
+```
+
 A `declare` statement may be followed by indented attributes:
 
 - `type <type>`: the type of the property, one of `'str'`, `'bool'`, `'unsigned'`, `'signed'` or `'list'`
@@ -204,6 +217,30 @@ custom device-tree
     input 'virt.dts'
     output 'virt.dtb'
     command 'dtc' '-O' 'dtb' '-o' output input
+```
+
+A `target` statement is followed by indented attributes, which describe the target with a JSON target specification,
+`target/targets/<name>.json`. Custom targets need a nightly toolchain.
+
+- `inherit <target>`: the builtin target whose specification it is based on
+- `env`, `os`, `arch`, `linker <str>`: replace the field of the specification
+- `code-model`, `relocation-model`, `target-cpu`, `linker-flavor`, `panic <str>`: replace the field of the
+  specification for the codegen option
+- `target-feature <features>`: the features of the target, as a `str` separated by `,`, or a list of them
+- `no-redzone`: disable the red zone
+- `link-script <str>`: the linker script, which is usually a multi-line string, where braces must be doubled
+
+```
+target bluemetal-riscv64
+    inherit 'riscv64gc-unknown-none-elf'
+    os 'bluemetal'
+    code-model 'medium'
+    link-script '''
+        ENTRY(_start)
+        SECTIONS {{
+            . = 0x80000000;
+        }}
+    '''
 ```
 
 ### Builtin properties

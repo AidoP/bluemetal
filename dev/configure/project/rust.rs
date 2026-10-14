@@ -6,8 +6,9 @@ pub struct Crate {
     pub name_span: Span,
     pub path: PathBuf,
     pub path_span: Span,
-    /// The target triple the crate is compiled for.
+    /// The target the crate is compiled for, which is a builtin target or one declared by a `target` statement.
     pub target: String,
+    pub target_span: Span,
     pub kind: Kind,
     /// The path of the output, instead of the one in the target's directory.
     pub output: Option<PathBuf>,
