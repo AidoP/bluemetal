@@ -21,4 +21,10 @@ build target/test-configure: rust dev/configure/main.rs
     crate-name = test_configure
     flags = --test
 
+# integration tests, which run target/configure from the working directory, so run them from the project root
+build target/test/dev/configure: rust test/dev/configure/main.rs || target/configure
+    crate-type = bin
+    crate-name = test_dev_configure
+    flags = --test
+
 build build.ninja: configure Build | target/configure

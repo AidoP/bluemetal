@@ -1,6 +1,6 @@
 use std::{collections::{HashMap, hash_map::Entry}, path::{Path, PathBuf}};
 
-mod rust;
+pub mod rust;
 
 pub struct Project {
     root: PathBuf,
@@ -11,12 +11,16 @@ pub struct Project {
     values: Vec<Value>,
     values_idx: HashMap<String, usize>,
     pub diagnostics: Vec<Diagnostic>,
+    /// The target triples supported by the compiler.
+    targets: Vec<String>,
+    /// Whether the supported targets have been listed by a diagnostic.
+    targets_listed: bool,
 
     /// Crates keyed by name and target, as a crate may be compiled for several targets.
     pub crates: HashMap<(String, String), rust::Crate>,
 }
 impl Project {
-    pub fn new(root: PathBuf) -> Self {
+    pub fn new(root: PathBuf, targets: Vec<String>) -> Self {
         Self {
             root,
             files: Vec::new(),
@@ -26,6 +30,8 @@ impl Project {
             values: Vec::new(),
             values_idx: HashMap::new(),
             diagnostics: Vec::new(),
+            targets,
+            targets_listed: false,
             crates: HashMap::new(),
         }
     }
@@ -63,7 +69,7 @@ impl Project {
                 match &mut self.properties[id] {
                     Some(_) => self.diagnostics.push(Diagnostic {
                         span: property_ref.span,
-                        message: Message::RedeclareProperty { id },
+                        message: Message::RedeclareProperty { id, name: property_ref.name.clone() },
                         severity: Severity::Error,
                     }),
                     value @ None => {
@@ -105,6 +111,7 @@ impl Project {
     /// Check for various conditions that cannot be evaluated as errors until reading has completed.
     /// - Missing declarations for `set` statements.
     /// - Invalid data types for `set` statements.
+    /// - Missing crates for `use` attributes.
     pub fn check(&mut self) {
         for (name, &idx) in &self.values_idx {
             let value = &self.values[idx];
@@ -131,6 +138,20 @@ impl Project {
                 }),
             }
         }
+        for c in self.crates.values() {
+            for (name, span) in &c.uses {
+                if !self.crates.contains_key(&(name.clone(), c.target.clone())) {
+                    self.diagnostics.push(Diagnostic {
+                        span: Some(*span),
+                        message: Message::UnknownCrate {
+                            name: name.clone(),
+                            target: c.target.clone(),
+                        },
+                        severity: Severity::Error,
+                    });
+                }
+            }
+        }
     }
     /// Write a diagnostic in a human readable form.
     pub fn write_diagnostic(&self, w: &mut dyn std::io::Write, diagnostic: &Diagnostic, pretty: bool) -> std::io::Result<()> {
@@ -151,10 +172,27 @@ impl Project {
             self.write_location(w, span, style_accent, style_reset)?;
         }
         match &diagnostic.message {
-            Message::RedeclareProperty { id } => {
-                if let Some(span) = &self.properties[*id].as_ref().unwrap().span {
-                    writeln!(w, "{style_note}note{style_white}: previously declared here{style_reset}")?;
+            Message::RedeclareProperty { id, .. } => {
+                match &self.properties[*id].as_ref().unwrap().span {
+                    Some(span) => {
+                        writeln!(w, "{style_note}note{style_white}: previously declared here{style_reset}")?;
+                        self.write_location(w, span, style_note, style_reset)?;
+                    },
+                    None => writeln!(w, "{style_note}note{style_white}: this is a builtin property{style_reset}")?,
+                }
+            },
+            Message::ReadOnlyProperty { id, assigned, .. } => {
+                if let Some(span) = assigned {
+                    writeln!(w, "{style_note}note{style_white}: value assigned here{style_reset}")?;
                     self.write_location(w, span, style_note, style_reset)?;
+                }
+                let property = self.properties[*id].as_ref().unwrap();
+                match &property.span {
+                    Some(span) => {
+                        writeln!(w, "{style_note}note{style_white}: declared read-only here{style_reset}")?;
+                        self.write_location(w, span, style_note, style_reset)?;
+                    },
+                    None => writeln!(w, "{style_note}note{style_white}: this builtin property is read-only{style_reset}")?,
                 }
             },
             Message::RepeatedUse { file, .. } => {
@@ -211,19 +249,19 @@ impl Project {
     fn parse_file(&mut self, idx: usize) {
         let data = std::mem::take(&mut self.files[idx].data);
         let mut parser = Parser::new(idx, &data);
+        let mut chain = None;
         loop {
             parser.skip_empty();
             if parser.is_empty() {
                 break;
             }
+            if !self.parse_meta(&mut parser, &mut chain) {
+                parser.skip_statement();
+                continue;
+            }
             let start = parser.offset;
-            let Some((keyword, span)) = parser.ident() else {
-                let span = parser.skip_statement();
-                self.diagnostics.push(Diagnostic {
-                    span: Some(span),
-                    message: Message::ExpectedIdentifier,
-                    severity: Severity::Error,
-                });
+            let Some((keyword, span)) = self.parse_ident(&mut parser) else {
+                parser.skip_statement();
                 continue;
             };
             match keyword {
@@ -245,6 +283,124 @@ impl Project {
 
         }
         self.files[idx].data = data;
+    }
+    /// Take the meta-statements which precede a statement, returning whether the statement should be processed.
+    ///
+    /// Each meta-statement is a line starting with `@`, and must be followed directly by another meta-statement or by
+    /// the statement it applies to. Once the statement is known to be skipped, later conditions are not evaluated.
+    ///
+    /// `chain` is whether a statement has been processed in the current chain of conditional statements, which `@else`
+    /// continues, or [`None`] if the previous statement was unconditional.
+    fn parse_meta(&mut self, parser: &mut Parser, chain: &mut Option<bool>) -> bool {
+        let mut active = true;
+        // whether the statement is conditional, so that it starts or continues a chain
+        let mut conditional = false;
+        // whether the chain had already processed a statement, if this statement continues it with `@else`
+        let mut continues = None;
+        // an invalid meta-statement skips the statement, and any `@else` after it
+        let mut failed = false;
+        let mut first = true;
+        while parser.peek() == Some('@') {
+            let start = parser.offset;
+            parser.expect('@');
+            let Some((name, span)) = self.parse_ident(parser) else {
+                parser.skip_line();
+                failed = true;
+                continue;
+            };
+            let meta_span = Span { file: span.file, offset: start, len: span.offset + span.len - start };
+            match name {
+                "if" => {
+                    conditional = true;
+                    if !active {
+                        parser.skip_line();
+                    } else if let Some(condition) = self.parse_condition(parser) {
+                        active = condition;
+                    } else {
+                        failed = true;
+                    }
+                },
+                "else" | "else-if" => {
+                    conditional = true;
+                    match *chain {
+                        Some(processed) if first => {
+                            continues = Some(processed);
+                            active &= !processed;
+                        },
+                        _ => {
+                            let message = if first {
+                                Message::ElseWithoutIf(name.into())
+                            } else {
+                                Message::ElseNotFirst(name.into())
+                            };
+                            self.diagnostics.push(Diagnostic {
+                                span: Some(meta_span),
+                                message,
+                                severity: Severity::Error,
+                            });
+                            failed = true;
+                        },
+                    }
+                    if name == "else" {
+                        if !self.parse_line_end(parser) {
+                            parser.skip_line();
+                            failed = true;
+                        }
+                    } else if !active || failed {
+                        parser.skip_line();
+                    } else if let Some(condition) = self.parse_condition(parser) {
+                        active = condition;
+                    } else {
+                        failed = true;
+                    }
+                },
+                _ => {
+                    parser.skip_line();
+                    self.diagnostics.push(Diagnostic {
+                        span: Some(meta_span),
+                        message: Message::UnknownMetaStatement(name.into()),
+                        severity: Severity::Error,
+                    });
+                    failed = true;
+                },
+            }
+            first = false;
+            if matches!(parser.peek(), None | Some('\n' | '#')) {
+                self.diagnostics.push(Diagnostic {
+                    span: Some(meta_span),
+                    message: Message::ExpectedStatementAfterMeta,
+                    severity: Severity::Error,
+                });
+                *chain = None;
+                return false;
+            }
+        }
+        if failed {
+            *chain = Some(true);
+            return false;
+        }
+        *chain = match continues {
+            Some(processed) => Some(processed || active),
+            None if conditional => Some(active),
+            None => None,
+        };
+        active
+    }
+    /// Take the condition of an `@if` to the end of the line, returning [`None`] if it is invalid.
+    fn parse_condition(&mut self, parser: &mut Parser) -> Option<bool> {
+        if !self.parse_space(parser) {
+            parser.skip_line();
+            return None;
+        }
+        let Some(operand) = self.parse_binary(parser, 0) else {
+            parser.skip_line();
+            return None;
+        };
+        if !self.parse_line_end(parser) {
+            parser.skip_line();
+            return None;
+        }
+        self.bool_operand(operand)
     }
     fn parse_use(&mut self, parser: &mut Parser) {
         if !self.parse_space(parser) {
@@ -285,20 +441,29 @@ impl Project {
             parser.skip_statement();
             return;
         }
-        let Some((ident, span)) = parser.ident() else {
-            let span = parser.skip_statement();
-            self.diagnostics.push(Diagnostic {
-                span: Some(span),
-                message: Message::ExpectedIdentifier,
-                severity: Severity::Error,
-            });
+        let Some((ident, span)) = self.parse_ident(parser) else {
+            parser.skip_statement();
             return;
         };
         let idx = self.declare(ident.into(), None);
+        if self.properties[idx].is_some() {
+            // skip the attributes too, so that a duplicate cannot change the property or its value
+            parser.skip_statement();
+            self.diagnostics.push(Diagnostic {
+                span: Some(span),
+                message: Message::RedeclareProperty { id: idx, name: ident.into() },
+                severity: Severity::Error,
+            });
+            return;
+        }
         if !self.parse_line_end(parser) {
             parser.skip_statement();
         }
+        // values set before the declaration, which are errors if the property is read-only and already has a value
+        let set_before: Vec<_> = (0..self.values.len()).filter(|&value| self.values[value].property == idx).collect();
         let mut ty = Type::Any;
+        let mut read_only = false;
+        let mut default = None;
         while let Some(_) = parser.indent() {
             let Some(attribute) = self.parse_attribute(parser) else {
                 parser.skip_line();
@@ -319,7 +484,9 @@ impl Project {
                         }),
                     }
                 },
+                "read-only" => read_only = true,
                 "default" => {
+                    default = Some(attribute.name_span);
                     self.set(ident.into(), Value {
                         property: idx,
                         span: Some(attribute.name_span),
@@ -338,28 +505,53 @@ impl Project {
                 }),
             }
         }
-        let property = &mut self.properties[idx];
-        if property.is_some() {
-            return;
-        }
-        *property = Some(Property {
+        self.properties[idx] = Some(Property {
             span: Some(span),
             name: ident.into(),
             ty,
+            read_only,
         });
+        if !read_only {
+            return;
+        }
+        // a default leaves no room for any earlier `set`, otherwise only the first is permitted
+        let (assigned, invalid) = match default {
+            Some(span) => (Some(span), &set_before[..]),
+            None => match set_before.split_first() {
+                Some((first, rest)) => {
+                    // the rejected values were set before they were known to be invalid, so restore the first
+                    self.values_idx.insert(ident.into(), *first);
+                    (self.values[*first].span, rest)
+                },
+                None => return,
+            },
+        };
+        for &value in invalid {
+            self.diagnostics.push(Diagnostic {
+                span: self.values[value].span,
+                message: Message::ReadOnlyProperty { id: idx, name: ident.into(), assigned },
+                severity: Severity::Error,
+            });
+        }
+    }
+    /// Returns the span of the value of a read-only property which already has a value.
+    ///
+    /// A read-only property may be assigned once, by a `default` or a `set`, so further assignments are errors.
+    /// The span is [`None`] for a builtin value.
+    fn read_only_value(&self, id: usize, name: &str) -> Option<Option<Span>> {
+        if !self.properties[id].as_ref().is_some_and(|property| property.read_only) {
+            return None;
+        }
+        let value = self.values_idx.get(name)?;
+        Some(self.values[*value].span)
     }
     fn parse_set(&mut self, parser: &mut Parser) {
         if !self.parse_space(parser) {
             parser.skip_statement();
             return;
         }
-        let Some((ident, span)) = parser.ident() else {
-            let span = parser.skip_statement();
-            self.diagnostics.push(Diagnostic {
-                span: Some(span),
-                message: Message::ExpectedIdentifier,
-                severity: Severity::Error,
-            });
+        let Some((ident, span)) = self.parse_ident(parser) else {
+            parser.skip_statement();
             return;
         };
         if !self.parse_space(parser) {
@@ -374,6 +566,14 @@ impl Project {
             parser.skip_statement();
         }
         let property = self.declare(ident.into(), None);
+        if let Some(assigned) = self.read_only_value(property, ident) {
+            self.diagnostics.push(Diagnostic {
+                span: Some(span),
+                message: Message::ReadOnlyProperty { id: property, name: ident.into(), assigned },
+                severity: Severity::Error,
+            });
+            return;
+        }
         let value = Value {
             property,
             span: Some(span),
@@ -388,13 +588,8 @@ impl Project {
             parser.skip_statement();
             return;
         }
-        let Some((severity, span)) = parser.ident() else {
-            let span = parser.skip_statement();
-            self.diagnostics.push(Diagnostic {
-                span: Some(span),
-                message: Message::ExpectedIdentifier,
-                severity: Severity::Error,
-            });
+        let Some((severity, span)) = self.parse_ident(parser) else {
+            parser.skip_statement();
             return;
         };
         let severity = match severity {
@@ -432,22 +627,55 @@ impl Project {
             parser.skip_statement();
             return;
         }
-        let Some((name, span)) = parser.ident() else {
-            let span = parser.skip_statement();
+        let Some((name, span)) = self.parse_expression(parser) else {
+            parser.skip_statement();
+            return;
+        };
+        let name = match name {
+            Data::Str(name) => name,
+            data => {
+                parser.skip_statement();
+                self.diagnostics.push(Diagnostic {
+                    span: Some(span),
+                    message: Message::InvalidOperand {
+                        ty: data.type_name(),
+                        expected: "str",
+                        coerce: false,
+                    },
+                    severity: Severity::Error,
+                });
+                return;
+            },
+        };
+        // the name is passed to rustc, which only accepts alphanumerics and `_`
+        let invalid = |(i, c): &(usize, char)| match c {
+            'a'..='z' | '_' => false,
+            '0'..='9' => *i == 0,
+            _ => true,
+        };
+        if let Some((i, character)) = name.char_indices().find(invalid) {
+            // point at the character if the name is a string literal, otherwise the character's position is unknown
+            let literal = &parser.data[span.offset..span.offset + span.len];
+            let span = if literal.strip_prefix('\'').and_then(|l| l.strip_suffix('\'')) == Some(name.as_str()) {
+                Span { file: span.file, offset: span.offset + 1 + i, len: character.len_utf8() }
+            } else {
+                span
+            };
+            parser.skip_statement();
             self.diagnostics.push(Diagnostic {
                 span: Some(span),
-                message: Message::ExpectedIdentifier,
+                message: Message::InvalidCrateName { name, character },
                 severity: Severity::Error,
             });
             return;
-        };
+        }
         let path;
         let path_span;
         if parser.peek() == Some(' ') && self.parse_space(parser) && let Some((p, s)) = self.parse_path(parser) {
             path = p;
             path_span = s;
         } else {
-            let mut rel_path = self.files[parser.file].relative_path(name);
+            let mut rel_path = self.files[parser.file].relative_path(&name);
             rel_path.push("lib.rs");
             path = rel_path;
             path_span = span;
@@ -457,6 +685,7 @@ impl Project {
         }
         let mut builtin = false;
         let mut target = None;
+        let mut uses = Vec::new();
         while let Some(_) = parser.indent() {
             let Some(attribute) = self.parse_attribute(parser) else {
                 parser.skip_line();
@@ -464,8 +693,9 @@ impl Project {
             };
             match attribute.name {
                 "builtin" => builtin = true,
-                "target" => match attribute.data {
-                    Data::Str(string) => target = Some(string),
+                "target" | "use" => match attribute.data {
+                    Data::Str(string) if attribute.name == "target" => target = Some((string, attribute.data_span)),
+                    Data::Str(string) => uses.push((string, attribute.data_span)),
                     data => self.diagnostics.push(Diagnostic {
                         span: Some(attribute.data_span),
                         message: Message::InvalidOperand {
@@ -486,27 +716,84 @@ impl Project {
             }
         }
         // without an attribute, the crate is compiled for the `target` property in effect at its declaration
-        let target = target.unwrap_or_else(|| self.property("target", span).map_or_default(|data| data.coerce_string()));
-        match self.crates.entry((name.into(), target.clone())) {
+        let (target, target_span) = target.unwrap_or_else(|| {
+            (self.property("target", span).map_or_default(|data| data.coerce_string()), span)
+        });
+        self.check_target(&target, target_span);
+        match self.crates.entry((name.clone(), target.clone())) {
             Entry::Occupied(_) => self.diagnostics.push(Diagnostic {
                 span: Some(span),
                 message: Message::RedeclareCrate {
-                    name: name.into(),
+                    name,
                     target,
                 },
                 severity: Severity::Error,
             }),
             Entry::Vacant(entry) => {
                 entry.insert(rust::Crate {
-                    name: name.into(),
+                    name,
                     name_span: span,
                     path,
                     path_span,
                     target,
                     builtin,
+                    uses,
                 });
             },
         }
+    }
+    /// Report a target which the compiler does not support, listing the supported targets the first time.
+    fn check_target(&mut self, target: &str, span: Span) {
+        if self.targets.iter().any(|t| t == target) {
+            return;
+        }
+        self.diagnostics.push(Diagnostic {
+            span: Some(span),
+            message: Message::UnknownTarget {
+                target: target.into(),
+                suggestion: suggest(target, &self.targets),
+            },
+            severity: Severity::Error,
+        });
+        if !self.targets_listed {
+            self.targets_listed = true;
+            self.diagnostics.push(Diagnostic {
+                span: None,
+                message: Message::AvailableTargets(self.targets.clone()),
+                severity: Severity::Note,
+            });
+        }
+    }
+    /// Take the next identifier from the parser.
+    ///
+    /// If the parser is not pointing at an identifier, a diagnostic is created, naming the first invalid character if
+    /// the parser is pointing at a word.
+    fn parse_ident<'a>(&mut self, parser: &mut Parser<'a>) -> Option<(&'a str, Span)> {
+        let rest = parser.as_str();
+        let word = &rest[..rest.find(|c: char| !c.is_alphanumeric() && c != '_' && c != '-').unwrap_or(rest.len())];
+        let start = parser.offset;
+        if let Some((ident, span)) = parser.ident() && ident.len() == word.len() {
+            return Some((ident, span));
+        }
+        parser.offset = start;
+        let invalid = |(i, c): &(usize, char)| match c {
+            'a'..='z' | '-' => false,
+            '0'..='9' => *i == 0,
+            _ => true,
+        };
+        let (span, message) = match word.char_indices().find(invalid) {
+            Some((i, character)) => (
+                Span { file: parser.file, offset: start + i, len: character.len_utf8() },
+                Message::InvalidIdentifier { name: word.into(), character },
+            ),
+            None => (parser.span_until(|c| c == ' ' || c == '\n'), Message::ExpectedIdentifier),
+        };
+        self.diagnostics.push(Diagnostic {
+            span: Some(span),
+            message,
+            severity: Severity::Error,
+        });
+        None
     }
     /// Takes the next space from the parser and returns true.
     /// If the parser is not pointing at a space, a diagnostic is created and false is returned.
@@ -642,8 +929,9 @@ impl Project {
                 }
                 Some(Operand { data: inner.data, span: parser.span_from(start), coerce: Coercion::Any })
             },
-            Some('a'..='z') => {
-                let (name, span) = parser.ident()?;
+            // any word is parsed as an identifier, to report its invalid characters
+            Some(c) if c.is_alphabetic() || c == '_' => {
+                let (name, span) = self.parse_ident(parser)?;
                 let data = match name {
                     "true" => Data::Bool(true),
                     "false" => Data::Bool(false),
@@ -857,14 +1145,7 @@ impl Project {
         Some(if swap { (data, to.data) } else { (to.data, data) })
     }
     fn parse_attribute<'a>(&mut self, parser: &mut Parser<'a>) -> Option<Attribute<'a>> {
-        let Some((name, name_span)) = parser.ident() else {
-            self.diagnostics.push(Diagnostic {
-                span: Some(parser.span_until(|c| c == ' ' || c == '\n')),
-                message: Message::ExpectedIdentifier,
-                severity: Severity::Error,
-            });
-            return None;
-        };
+        let (name, name_span) = self.parse_ident(parser)?;
         let (data, data_span) = if parser.expect(' ') {
             let Some((data, data_span)) = self.parse_expression(parser) else {
                 return None;
@@ -1081,8 +1362,16 @@ pub enum Message {
     User(String),
     UnknownSeverity(String),
     UnknownStatement(String),
+    UnknownMetaStatement(String),
+    ExpectedStatementAfterMeta,
+    ElseWithoutIf(String),
+    ElseNotFirst(String),
     UnsetProperty(String),
     ExpectedIdentifier,
+    InvalidIdentifier {
+        name: String,
+        character: char,
+    },
     ExpectedString,
     InvalidStringTemplate,
     InvalidInteger,
@@ -1109,6 +1398,13 @@ pub enum Message {
     UndeclaredProperty(String),
     RedeclareProperty {
         id: usize,
+        name: String,
+    },
+    ReadOnlyProperty {
+        id: usize,
+        name: String,
+        /// The value already assigned, if it is not builtin.
+        assigned: Option<Span>,
     },
     UnknownDeclarationAttribute {
         property: usize,
@@ -1121,6 +1417,19 @@ pub enum Message {
         name: String,
         target: String,
     },
+    UnknownCrate {
+        name: String,
+        target: String,
+    },
+    InvalidCrateName {
+        name: String,
+        character: char,
+    },
+    UnknownTarget {
+        target: String,
+        suggestion: Option<String>,
+    },
+    AvailableTargets(Vec<String>),
     MismatchedType {
         value: usize,
         name: String,
@@ -1132,8 +1441,13 @@ impl core::fmt::Display for Message {
             Self::User(string) => f.write_str(string),
             Self::UnknownSeverity(name) => write!(f, "unknown severity {name:?}"),
             Self::UnknownStatement(name) => write!(f, "unknown statement {name:?}"),
+            Self::UnknownMetaStatement(name) => write!(f, "unknown meta-statement \"@{name}\""),
+            Self::ExpectedStatementAfterMeta => write!(f, "expected statement on the line after a meta-statement"),
+            Self::ElseWithoutIf(name) => write!(f, "\"@{name}\" must follow a conditional statement"),
+            Self::ElseNotFirst(name) => write!(f, "\"@{name}\" must be the first meta-statement of a statement"),
             Self::UnsetProperty(name) => write!(f, "no value for property {name:?}"),
             Self::ExpectedIdentifier => write!(f, "expected identifier"),
+            Self::InvalidIdentifier { name, character } => write!(f, "invalid character {character:?} in identifier {name:?}"),
             Self::ExpectedString => write!(f, "expected string"),
             Self::InvalidStringTemplate { .. } => write!(f, "invalid string template"),
             Self::InvalidInteger => write!(f, "invalid integer"),
@@ -1149,19 +1463,60 @@ impl core::fmt::Display for Message {
             Self::RepeatedUse { path, .. } => write!(f, "file {path:?} is already used"),
             Self::ReadFailure(path, error) => write!(f, "failed to read {path:?}: {error}"),
             Self::UndeclaredProperty(name) => write!(f, "property {name:?} is undeclared"),
-            Self::RedeclareProperty { .. } => write!(f, "redeclaration of property"),
+            Self::RedeclareProperty { name, .. } => write!(f, "redeclaration of property {name:?}"),
+            Self::ReadOnlyProperty { name, .. } => write!(f, "cannot set read-only property {name:?}"),
             Self::UnknownDeclarationAttribute { name, .. } => write!(f, "unknown declare attribute {name:?}"),
             Self::UnknownCrateAttribute { name, .. } => write!(f, "unknown crate attribute {name:?}"),
+            Self::UnknownCrate { name, target } => write!(f, "no crate {name:?} for target {target:?}"),
+            Self::InvalidCrateName { name, character } => write!(f, "invalid character {character:?} in crate name {name:?}"),
             Self::RedeclareCrate { name, target } => write!(f, "redeclaration of crate {name:?} for target {target:?}"),
+            Self::UnknownTarget { target, suggestion: None } => write!(f, "unknown target {target:?}"),
+            Self::UnknownTarget { target, suggestion: Some(suggestion) } => {
+                write!(f, "unknown target {target:?}, did you mean {suggestion:?}?")
+            },
+            Self::AvailableTargets(targets) => {
+                write!(f, "available targets are:")?;
+                for target in targets {
+                    write!(f, "\n    {target}")?;
+                }
+                Ok(())
+            },
             Self::MismatchedType { name, .. } => write!(f, "invalid data type for property {name:?}"),
         }
     }
+}
+
+/// Returns the candidate closest to `s`, if it is close enough to be a likely misspelling.
+fn suggest(s: &str, candidates: &[String]) -> Option<String> {
+    let (distance, candidate) = candidates.iter()
+        .map(|candidate| (edit_distance(s, candidate), candidate))
+        .min_by_key(|(distance, _)| *distance)?;
+    (distance <= s.chars().count() / 3).then(|| candidate.clone())
+}
+
+/// Returns the Levenshtein distance between two strings.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    // the distances from the prefix of `a` processed so far to each prefix of `b`
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let substitute = diagonal + (ca != cb) as usize;
+            diagonal = row[j + 1];
+            row[j + 1] = substitute.min(row[j] + 1).min(diagonal + 1);
+        }
+    }
+    row[b.len()]
 }
 
 pub struct Property {
     span: Option<Span>,
     name: String,
     ty: Type,
+    /// Whether `set` is forbidden, leaving the property with its default or builtin value.
+    read_only: bool,
 }
 impl Property {
     pub fn new(name: String, ty: Type) -> Self {
@@ -1169,7 +1524,11 @@ impl Property {
             span: None,
             name,
             ty,
+            read_only: false,
         }
+    }
+    pub fn read_only(self) -> Self {
+        Self { read_only: true, ..self }
     }
 }
 
@@ -1386,7 +1745,8 @@ impl <'a> Parser<'a> {
         while i < data.len() {
             match data[i] {
                 b'a'..=b'z' | b'-' => i += 1,
-
+                // a leading digit would be an integer
+                b'0'..=b'9' if i > start => i += 1,
                 _ => break,
             }
         }

@@ -25,6 +25,37 @@ From now on just build with `ninja`.
 - `crate <name>`: introduces a crate named `<name>`
 
 
+### Meta-statements
+
+A meta-statement is a line starting with `@` which applies to the statement on the next line. There cannot be a blank
+line or a comment between them, but several meta-statements can apply to the same statement.
+
+- `@if <expression>`: skip the statement, including its attributes, unless the expression is `true`. The expression
+  must be a `bool`, or coerced to one with `{}`. Once a statement is skipped, the conditions of later meta-statements
+  are not evaluated
+
+```
+@if {device-tree}
+@if target == 'riscv64gc-unknown-none-elf'
+use 'dtb'
+```
+
+- `@else`: process the statement only if no statement has been processed in the chain of conditional statements before
+  it. A chain starts with a statement with `@if` and is continued by each statement with `@else`, so `@else` followed
+  by `@if` is an else-if. Blank lines and comments may separate the statements of a chain, but another statement ends
+  it. `@else` must be the first meta-statement of its statement
+- `@else-if <expression>`: the same as `@else` followed by `@if <expression>`
+
+```
+@if level == 1
+log note 'one'
+@else-if level == 2
+log note 'two'
+@else
+log note 'many'
+```
+
+
 ### Expressions
 
 An expression is a string, `true`, `false`, an integer or the name of a property.
@@ -53,6 +84,14 @@ The expression cannot contain a string, and cannot start with `{`.
 log note 'size is {size} with {size / 0x1000} pages'
 ```
 
+A `declare` statement may be followed by indented attributes:
+
+- `type <type>`: the type of the property, one of `'str'`, `'bool'`, `'unsigned'` or `'signed'`
+- `default <value>`: the initial value of the property
+- `read-only`: the property can only be assigned once, by its default or by a single `set` before or after the declaration
+
 ### Builtin properties
 
 - `sysroot`: the sysroot of the Rust toolchain, as printed by `rustc --print=sysroot`
+- `target`: the target triple for crates without a `target` attribute, initially the host
+- `host-target`: the target triple of the host, as printed by `rustc --print=host-tuple`, which is read-only

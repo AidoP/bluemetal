@@ -25,8 +25,9 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
 
     let sysroot = rustc_print("sysroot")?;
     let host = rustc_print("host-tuple")?;
+    let targets = rustc_print("target-list")?.lines().map(String::from).collect();
 
-    let mut project = project::Project::new(input.parent().map_or_default(|path| path.into()));
+    let mut project = project::Project::new(input.parent().map_or_default(|path| path.into()), targets);
     let file = match project::File::read(input.clone()) {
         Ok(file) => file,
         Err(error) => return Err(Error::Read(input, error)),
@@ -37,7 +38,8 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
     let id = project.declare("target".into(), Some(project::Property::new("target".into(), project::Type::String)));
     project.set("target".into(), project::Value::new(id, project::Data::Str(host.clone())));
     // the triple of the machine running the build, for crates such as tools which must run during it
-    let id = project.declare("host-target".into(), Some(project::Property::new("host-target".into(), project::Type::String)));
+    let host_target = project::Property::new("host-target".into(), project::Type::String).read_only();
+    let id = project.declare("host-target".into(), Some(host_target));
     project.set("host-target".into(), project::Value::new(id, project::Data::Str(host)));
     project.parse(file);
     project.check();
@@ -94,13 +96,27 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
 
     let mut crates: Vec<_> = project.crates.into_values().collect();
     crates.sort_unstable_by(|lhs, rhs| (&lhs.name, &lhs.target).cmp(&(&rhs.name, &rhs.target)));
-    for c in crates {
-        let output = PathBuf::from(format!("target/{}/lib{}.rlib", c.target, c.name));
-        let flags = format!("--target={}", c.target);
+    let rlib = |c: &project::rust::Crate| PathBuf::from(format!("target/{}/lib{}.rlib", c.target, c.name));
+    for c in &crates {
+        let output = rlib(c);
+        // the outputs for a target share a directory, so it is searched for the dependencies of `--extern` crates
+        let mut flags = format!("--target={} -L dependency=target/{}", c.target, c.target);
+        // builtin crates are passed to every other crate for the same target, but not to each other as that would be a
+        // cycle, so a builtin crate must `use` the others it depends on
+        let externs = crates.iter().filter(|d| {
+            d.target == c.target && ((d.builtin && !c.builtin) || c.uses.iter().any(|(name, _)| *name == d.name))
+        });
+        let externs: Vec<_> = externs.map(|d| {
+            let path = rlib(d);
+            flags.push_str(&format!(" --extern {}={}", d.name, path.display()));
+            path
+        }).collect();
+        let externs: Vec<_> = externs.iter().map(PathBuf::as_path).collect();
         build_ninja.build(&ninja::Build {
             rule: "rustc",
             outputs: &[&output],
             inputs: &[&c.path],
+            implicit: &externs,
             variables: &[("crate-name", &c.name), ("crate-type", "lib"), ("flags", &flags)],
             ..Default::default()
         })?;
