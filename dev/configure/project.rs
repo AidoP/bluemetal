@@ -20,6 +20,8 @@ pub struct Project {
 
     /// Crates keyed by name and target, as a crate may be compiled for several targets.
     pub crates: HashMap<(String, String), rust::Crate>,
+    /// Custom build commands, in the order they were declared.
+    pub customs: Vec<Custom>,
 }
 impl Project {
     pub fn new(root: PathBuf, targets: Vec<String>) -> Self {
@@ -36,6 +38,7 @@ impl Project {
             targets,
             targets_listed: false,
             crates: HashMap::new(),
+            customs: Vec::new(),
         }
     }
     pub fn file(&self, idx: usize) -> &File {
@@ -190,6 +193,10 @@ impl Project {
                     self.write_location(w, span, style_note, style_reset)?;
                 }
             },
+            Message::RedeclareCustom { previous, .. } => {
+                writeln!(w, "{style_note}note{style_white}: previously declared here{style_reset}")?;
+                self.write_location(w, previous, style_note, style_reset)?;
+            },
             Message::RepeatedUse { file, .. } => {
                 if let Some(span) = &self.files[*file].used {
                     writeln!(w, "{style_note}note{style_white}: first used here{style_reset}")?;
@@ -313,6 +320,8 @@ impl Project {
                 "set" => self.parse_set(&mut parser),
                 "log" => self.parse_log(&mut parser),
                 "crate" => self.parse_crate(&mut parser),
+                "custom" => self.parse_custom(&mut parser, false),
+                "test" => self.parse_custom(&mut parser, true),
                 _ => {
                     parser.offset = start;
                     let _ = parser.skip_statement();
@@ -529,6 +538,7 @@ impl Project {
                         "bool" => ty = Type::Bool,
                         "unsigned" => ty = Type::Unsigned,
                         "signed" => ty = Type::Signed,
+                        "list" => ty = Type::List,
                         _ => self.diagnostics.push(Diagnostic {
                             span: Some(attribute.data_span),
                             message: Message::InvalidType(name),
@@ -795,6 +805,8 @@ impl Project {
             parser.skip_statement();
         }
         let mut builtin = false;
+        let mut default = false;
+        let mut test = false;
         let mut target = None;
         let mut uses = Vec::new();
         while let Some(_) = parser.indent() {
@@ -804,6 +816,8 @@ impl Project {
             };
             match attribute.name {
                 "builtin" => builtin = true,
+                "default" => default = true,
+                "test" => test = true,
                 "target" | "use" => match attribute.data {
                     Data::Str(string) if attribute.name == "target" => target = Some((string, attribute.data_span)),
                     Data::Str(string) => uses.push((string, attribute.data_span)),
@@ -832,6 +846,15 @@ impl Project {
             (self.property("target", span).map_or_default(|(data, _)| data.coerce_string()), span)
         });
         self.check_target(&target, target_span);
+        // test harnesses are run where the build runs, as other environments are not supported yet
+        let host = self.property("host-target", span).map_or_default(|(data, _)| data.coerce_string());
+        if test && target != host {
+            self.diagnostics.push(Diagnostic {
+                span: Some(target_span),
+                message: Message::TestTarget { target: target.clone(), host },
+                severity: Severity::Error,
+            });
+        }
         match self.crates.entry((name.clone(), target.clone())) {
             Entry::Occupied(_) => self.diagnostics.push(Diagnostic {
                 span: Some(span),
@@ -842,17 +865,226 @@ impl Project {
                 severity: Severity::Error,
             }),
             Entry::Vacant(entry) => {
-                entry.insert(rust::Crate {
+                let c = entry.insert(rust::Crate {
                     name,
                     name_span: span,
                     path,
                     path_span,
                     target,
+                    kind: rust::Kind::Lib,
+                    output: None,
                     builtin,
+                    implicit: false,
+                    default,
+                    test,
                     uses,
                 });
+                if test {
+                    let (name, harness) = (c.name.clone(), c.test_harness());
+                    self.add_crate_test(name, span, harness, Vec::new());
+                }
             },
         }
+    }
+    /// Register the test harness of a crate, like a `test` statement which runs it, which also needs `inputs`.
+    fn add_crate_test(&mut self, name: String, span: Span, harness: PathBuf, mut inputs: Vec<PathBuf>) {
+        let command = vec![Path::new(".").join(&harness).display().to_string()];
+        inputs.insert(0, harness);
+        self.add_custom(Custom {
+            name,
+            name_span: span,
+            inputs,
+            outputs: Vec::new(),
+            command,
+            program: None,
+            default: false,
+            test: true,
+        });
+    }
+    /// Add a crate which is part of the build system rather than declared by the configuration, after reading it.
+    ///
+    /// Its test, if it has one, also needs `test_inputs`. A declared crate with the same name and target is reported.
+    pub fn add_implicit_crate(&mut self, c: rust::Crate, test_inputs: Vec<PathBuf>) {
+        let key = (c.name.clone(), c.target.clone());
+        if let Some(declared) = self.crates.get(&key) {
+            self.diagnostics.push(Diagnostic {
+                span: Some(declared.name_span),
+                message: Message::ReservedCrate { name: c.name, target: c.target },
+                severity: Severity::Error,
+            });
+            return;
+        }
+        if c.test {
+            self.add_crate_test(c.name.clone(), c.name_span, c.test_harness(), test_inputs);
+        }
+        self.crates.insert(key, c);
+    }
+    /// Take a custom build command, with `input`, `output`, `command` and `default` attributes, or a test, which has
+    /// `input` and `command` attributes.
+    ///
+    /// While its attributes are evaluated, the paths of the inputs and outputs before them are the values of the
+    /// `input` and `output` properties, as lists.
+    fn parse_custom(&mut self, parser: &mut Parser, test: bool) {
+        let statement = if test { "test" } else { "custom" };
+        if !self.parse_space(parser) {
+            parser.skip_statement();
+            return;
+        }
+        let Some((name, span, _)) = self.parse_name(parser) else {
+            parser.skip_statement();
+            return;
+        };
+        if !self.parse_line_end(parser) {
+            parser.skip_statement();
+        }
+        let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
+        let mut command: Option<Vec<String>> = None;
+        let mut default = false;
+        // an attribute which failed has been reported, so it is not also reported as missing
+        let mut failed = false;
+        while parser.indent().is_some() {
+            let Some((attribute, attribute_span)) = self.parse_ident(parser) else {
+                parser.skip_line();
+                continue;
+            };
+            match attribute {
+                "input" | "output" if attribute == "input" || !test => {
+                    let Some(new) = self.parse_custom_paths(parser) else {
+                        parser.skip_line();
+                        failed = true;
+                        continue;
+                    };
+                    let paths = if attribute == "input" { &mut inputs } else { &mut outputs };
+                    paths.extend(new);
+                    let value = paths.iter().map(|path: &PathBuf| Data::Str(path.display().to_string())).collect();
+                    self.set_local(attribute, Data::List(value), parser.file);
+                },
+                "default" if !test => default = true,
+                "command" => {
+                    let Some(arguments) = self.parse_command(parser) else {
+                        parser.skip_line();
+                        failed = true;
+                        continue;
+                    };
+                    if command.replace(arguments).is_some() {
+                        self.diagnostics.push(Diagnostic {
+                            span: Some(attribute_span),
+                            message: Message::RepeatedAttribute(attribute.into()),
+                            severity: Severity::Error,
+                        });
+                    }
+                },
+                name => {
+                    parser.skip_line();
+                    self.diagnostics.push(Diagnostic {
+                        span: Some(attribute_span),
+                        message: Message::UnknownAttribute { statement, name: name.into() },
+                        severity: Severity::Error,
+                    });
+                    continue;
+                },
+            }
+            if !self.parse_line_end(parser) {
+                parser.skip_line();
+            }
+        }
+        for local in ["input", "output"] {
+            self.files[parser.file].locals.remove(local);
+        }
+        let missing = if outputs.is_empty() && !test {
+            Some("output")
+        } else if command.is_none() {
+            Some("command")
+        } else {
+            None
+        };
+        if let Some(attribute) = missing {
+            if failed {
+                return;
+            }
+            self.diagnostics.push(Diagnostic {
+                span: Some(span),
+                message: Message::MissingAttribute(attribute),
+                severity: Severity::Error,
+            });
+            return;
+        }
+        let mut command = command.unwrap_or_default();
+        // as in `run`, a program with a `/` is a path relative to the file, otherwise it is searched for in `PATH`
+        let mut program = None;
+        if command[0].contains('/') {
+            let mut path = normalize(&self.file(parser.file).relative_path(&command[0]));
+            program = Some(path.clone());
+            if path.is_relative() {
+                path = Path::new(".").join(path);
+            }
+            command[0] = path.display().to_string();
+        }
+        self.add_custom(Custom { name, name_span: span, inputs, outputs, command, program, default, test });
+    }
+    /// Add a custom build command or a test, unless one of the same kind has the same name.
+    fn add_custom(&mut self, custom: Custom) {
+        let previous = self.customs.iter().find(|previous| previous.name == custom.name && previous.test == custom.test);
+        if let Some(previous) = previous {
+            let previous = previous.name_span;
+            self.diagnostics.push(Diagnostic {
+                span: Some(custom.name_span),
+                message: Message::RedeclareCustom {
+                    statement: if custom.test { "test" } else { "custom" },
+                    name: custom.name,
+                    previous,
+                },
+                severity: Severity::Error,
+            });
+            return;
+        }
+        self.customs.push(custom);
+    }
+    /// Take the paths of an `input` or `output` attribute, a path or a list of them, which are relative to the file.
+    fn parse_custom_paths(&mut self, parser: &mut Parser) -> Option<Vec<PathBuf>> {
+        if !self.parse_space(parser) {
+            return None;
+        }
+        let operand = self.parse_expression(parser)?;
+        let paths = match operand.data {
+            Data::List(items) => items.iter().map(Data::coerce_string).collect(),
+            _ => vec![self.str_operand(operand)?],
+        };
+        Some(paths.iter().map(|path| normalize(&self.file(parser.file).relative_path(path))).collect())
+    }
+    /// Take the arguments of a `command` attribute, which are expressions separated by spaces.
+    ///
+    /// Any value is an argument, converted to a string as in a string template, while each item of a list is a separate
+    /// argument.
+    fn parse_command(&mut self, parser: &mut Parser) -> Option<Vec<String>> {
+        let mut arguments = Vec::new();
+        while parser.peek() == Some(' ') || arguments.is_empty() {
+            if !self.parse_space(parser) {
+                return None;
+            }
+            let operand = self.parse_expression(parser)?;
+            for argument in operand.data.spread() {
+                // an argument is written to `build.ninja` on a single line
+                if argument.contains('\n') {
+                    self.diagnostics.push(Diagnostic {
+                        span: Some(operand.span),
+                        message: Message::NewlineInArgument,
+                        severity: Severity::Error,
+                    });
+                    return None;
+                }
+                arguments.push(argument);
+            }
+        }
+        Some(arguments)
+    }
+    /// Give a property a value until the end of the statement in a file, without declaring it.
+    fn set_local(&mut self, name: &str, data: Data, file: usize) {
+        let id = self.values.len();
+        // the value is not a property's, so it has no declaration
+        self.values.push(Value { property: usize::MAX, span: None, data, data_span: None, origin: None, local: true });
+        self.files[file].locals.insert(name.into(), id);
     }
     /// Report a target which the compiler does not support, listing the supported targets the first time.
     fn check_target(&mut self, target: &str, span: Span) {
@@ -1044,6 +1276,12 @@ impl Project {
                 }
                 Some(Operand { span: parser.span_from(start), ..inner })
             },
+            Some('[') => {
+                parser.expect('[');
+                let items = self.parse_arguments(parser, ']', |this, parser| this.parse_binary(parser, 0))?;
+                let data = Data::List(items.into_iter().map(|item| item.data).collect());
+                Some(Operand { data, span: parser.span_from(start), coerce: Coercion::Strict, origin: None })
+            },
             Some('{') => {
                 parser.expect('{');
                 let inner = self.parse_binary(parser, 0)?;
@@ -1086,8 +1324,8 @@ impl Project {
     fn parse_call(&mut self, parser: &mut Parser, name: &str, name_span: Span) -> Option<Operand> {
         parser.expect('(');
         let expected = match name {
-            "upper" | "lower" | "env" | "path" | "read" | "exists" | "which" => "1",
-            "starts-with" | "ends-with" => "2",
+            "upper" | "lower" | "env" | "path" | "read" | "exists" | "which" | "len" => "1",
+            "starts-with" | "ends-with" | "contains" => "2",
             "select" | "run" => "at least 1",
             "try" => "1",
             _ => {
@@ -1103,12 +1341,12 @@ impl Project {
             return self.parse_try(parser, name_span);
         }
         if name == "run" {
-            let arguments = self.parse_arguments(parser, Self::parse_run_argument)?;
+            let arguments = self.parse_arguments(parser, ')', Self::parse_run_argument)?;
             let span = parser.span_from(name_span.offset);
             return self.run(arguments, span);
         }
         if name == "select" {
-            let names = self.parse_arguments(parser, |this, parser| {
+            let names = self.parse_arguments(parser, ')', |this, parser| {
                 this.parse_ident(parser).map(|(name, span)| (name.to_string(), span))
             })?;
             let span = parser.span_from(name_span.offset);
@@ -1118,7 +1356,7 @@ impl Project {
             }
             return self.select(&names, span);
         }
-        let mut arguments = self.parse_arguments(parser, |this, parser| this.parse_binary(parser, 0))?.into_iter();
+        let mut arguments = self.parse_arguments(parser, ')', |this, parser| this.parse_binary(parser, 0))?.into_iter();
         let span = parser.span_from(name_span.offset);
         if arguments.len().to_string() != expected {
             self.argument_count(name, expected, arguments.len(), span);
@@ -1126,6 +1364,13 @@ impl Project {
         }
         let data = match name {
             "upper" => Data::Str(self.str_operand(arguments.next()?)?.to_uppercase()),
+            "len" => Data::Unsigned(self.list_operand(arguments.next()?)?.len() as u64),
+            "contains" => {
+                let items = self.list_operand(arguments.next()?)?;
+                let value = arguments.next()?.data;
+                // as with `==`, integers are equal regardless of their sign
+                Data::Bool(items.iter().any(|item| *item == value || item.convert_sign().is_some_and(|item| item == value)))
+            },
             // relative to the directory of the file, where an absolute path stays absolute
             "path" => {
                 let path = self.str_operand(arguments.next()?)?;
@@ -1267,6 +1512,10 @@ impl Project {
                     });
                     failed = true;
                 },
+                // each item of a list is a separate argument
+                RunArgument::Positional(Operand { data: Data::List(items), .. }) => {
+                    command_line.extend(Data::List(items).spread());
+                },
                 RunArgument::Positional(operand) => match self.str_operand(operand) {
                     Some(string) => command_line.push(string),
                     None => failed = true,
@@ -1360,25 +1609,26 @@ impl Project {
             self.dependencies.push(path);
         }
     }
-    /// Take a parenthesised list of arguments separated by `, `, after the opening parenthesis.
+    /// Take a list of arguments separated by `, `, after the opening parenthesis or bracket, up to the closing one.
     fn parse_arguments<'a, T>(
         &mut self,
         parser: &mut Parser<'a>,
+        close: char,
         mut parse: impl FnMut(&mut Self, &mut Parser<'a>) -> Option<T>,
     ) -> Option<Vec<T>> {
         let mut arguments = Vec::new();
-        if parser.expect(')') {
+        if parser.expect(close) {
             return Some(arguments);
         }
         loop {
             arguments.push(parse(self, parser)?);
-            if parser.expect(')') {
+            if parser.expect(close) {
                 return Some(arguments);
             }
             if !parser.as_str().starts_with(", ") {
                 self.diagnostics.push(Diagnostic {
                     span: Some(parser.span_char()),
-                    message: Message::ExpectedArgumentSeparator,
+                    message: Message::ExpectedSeparator(close),
                     severity: Severity::Error,
                 });
                 return None;
@@ -1423,6 +1673,25 @@ impl Project {
         Some(Operand { data: value.data.clone(), span, coerce: Coercion::Strict, origin: value.origin })
     }
     /// Ensure an operand is a string, converting it if it permits coercion.
+    /// Ensure an operand is a list.
+    fn list_operand(&mut self, operand: Operand) -> Option<Vec<Data>> {
+        match operand.data {
+            Data::List(items) => Some(items),
+            data => {
+                self.diagnostics.push(Diagnostic {
+                    span: Some(operand.span),
+                    message: Message::InvalidOperand {
+                        ty: data.type_name(),
+                        expected: "list",
+                        coerce: false,
+                        origin: operand.origin,
+                    },
+                    severity: Severity::Error,
+                });
+                None
+            },
+        }
+    }
     fn str_operand(&mut self, operand: Operand) -> Option<String> {
         match operand.data {
             Data::Str(string) => Some(string),
@@ -1491,6 +1760,24 @@ impl Project {
                     Operator::Greater => ordering.is_gt(),
                     _ => ordering.is_ge(),
                 })
+            },
+            // lists are concatenated, but only with other lists
+            Operator::Add if matches!(lhs.data, Data::List(_)) || matches!(rhs.data, Data::List(_)) => {
+                let (Data::List(mut lhs_items), Data::List(rhs_items)) = (lhs.data.clone(), rhs.data.clone()) else {
+                    self.diagnostics.push(Diagnostic {
+                        span: Some(span),
+                        message: Message::MismatchedOperands {
+                            lhs: lhs.data.type_name(),
+                            rhs: rhs.data.type_name(),
+                            lhs_origin: lhs.origin,
+                            rhs_origin: rhs.origin,
+                        },
+                        severity: Severity::Error,
+                    });
+                    return None;
+                };
+                lhs_items.extend(rhs_items);
+                Data::List(lhs_items)
             },
             Operator::Add | Operator::Subtract | Operator::Multiply | Operator::Divide | Operator::Remainder => {
                 coerce = lhs.coerce.min(rhs.coerce);
@@ -1975,7 +2262,8 @@ pub enum Message {
     UnknownMetaStatement(String),
     ExpectedStatementAfterMeta,
     UnknownFunction(String),
-    ExpectedArgumentSeparator,
+    /// A separator or the closing character of a list.
+    ExpectedSeparator(char),
     ArgumentCount {
         function: String,
         expected: &'static str,
@@ -2057,6 +2345,26 @@ pub enum Message {
     UnknownCrateAttribute {
         name: String,
     },
+    UnknownAttribute {
+        statement: &'static str,
+        name: String,
+    },
+    RepeatedAttribute(String),
+    MissingAttribute(&'static str),
+    RedeclareCustom {
+        statement: &'static str,
+        name: String,
+        previous: Span,
+    },
+    NewlineInArgument,
+    TestTarget {
+        target: String,
+        host: String,
+    },
+    ReservedCrate {
+        name: String,
+        target: String,
+    },
     RedeclareCrate {
         name: String,
         target: String,
@@ -2087,7 +2395,7 @@ impl core::fmt::Display for Message {
             Self::UnknownStatement(name) => write!(f, "unknown statement {name:?}"),
             Self::UnknownMetaStatement(name) => write!(f, "unknown meta-statement \"@{name}\""),
             Self::UnknownFunction(name) => write!(f, "unknown function {name:?}"),
-            Self::ExpectedArgumentSeparator => write!(f, "expected \", \" or \")\""),
+            Self::ExpectedSeparator(close) => write!(f, "expected \", \" or \"{close}\""),
             Self::ArgumentCount { function, expected, found } => {
                 let suffix = if expected.ends_with(" 1") || *expected == "1" { "" } else { "s" };
                 let verb = if *found == 1 { "was" } else { "were" };
@@ -2134,6 +2442,18 @@ impl core::fmt::Display for Message {
             Self::ReadOnlyProperty { name, builtin: true, .. } => write!(f, "cannot set read-only builtin property {name:?}"),
             Self::UnknownDeclarationAttribute { name, .. } => write!(f, "unknown declare attribute {name:?}"),
             Self::UnknownCrateAttribute { name, .. } => write!(f, "unknown crate attribute {name:?}"),
+            Self::UnknownAttribute { statement, name } => write!(f, "unknown {statement} attribute {name:?}"),
+            Self::RepeatedAttribute(name) => write!(f, "attribute {name:?} cannot be repeated"),
+            Self::MissingAttribute(name) => write!(f, "missing required attribute {name:?}"),
+            Self::RedeclareCustom { statement: "test", name, .. } => write!(f, "redeclaration of test {name:?}"),
+            Self::RedeclareCustom { name, .. } => write!(f, "redeclaration of custom command {name:?}"),
+            Self::NewlineInArgument => write!(f, "command arguments cannot contain a newline"),
+            Self::ReservedCrate { name, target } => {
+                write!(f, "crate {name:?} for target {target:?} is reserved for the build system")
+            },
+            Self::TestTarget { target, host } => {
+                write!(f, "tests for target {target:?} cannot be run, only those for the host target {host:?}")
+            },
             Self::UnknownCrate { name, target } => write!(f, "no crate {name:?} for target {target:?}"),
             Self::InvalidCrateName { name, character } => write!(f, "invalid character {character:?} in crate name {name:?}"),
             Self::RedeclareCrate { name, target } => write!(f, "redeclaration of crate {name:?} for target {target:?}"),
@@ -2178,6 +2498,22 @@ fn edit_distance(a: &str, b: &str) -> usize {
     row[b.len()]
 }
 
+/// A custom build command, or a test.
+pub struct Custom {
+    pub name: String,
+    pub name_span: Span,
+    pub inputs: Vec<PathBuf>,
+    pub outputs: Vec<PathBuf>,
+    /// The program and its arguments, where a program with a `/` is relative to the project root.
+    pub command: Vec<String>,
+    /// The program, if it is a path, which the outputs depend on.
+    pub program: Option<PathBuf>,
+    /// Whether the outputs are built by `ninja` without targets.
+    pub default: bool,
+    /// Whether this is a test, which has no outputs and is run by `configure --test` rather than ninja.
+    pub test: bool,
+}
+
 pub struct Property {
     span: Option<Span>,
     name: String,
@@ -2214,6 +2550,7 @@ pub enum Type {
     Bool,
     Unsigned,
     Signed,
+    List,
 }
 impl Type {
     /// Returns the data if it has this type, or returns it as an error.
@@ -2225,7 +2562,8 @@ impl Type {
             | (Type::String, data @ Data::Str(_))
             | (Type::Bool, data @ Data::Bool(_))
             | (Type::Unsigned, data @ Data::Unsigned(_))
-            | (Type::Signed, data @ Data::Signed(_)) => Ok(data),
+            | (Type::Signed, data @ Data::Signed(_))
+            | (Type::List, data @ Data::List(_)) => Ok(data),
             (Type::Signed, Data::Unsigned(i)) => i64::try_from(i).map(Data::Signed).map_err(|_| Data::Unsigned(i)),
             (_, data) => Err(data),
         }
@@ -2261,6 +2599,7 @@ pub enum Data {
     Bool(bool),
     Unsigned(u64),
     Signed(i64),
+    List(Vec<Data>),
 }
 impl Data {
     /// Returns the name of the type as used by `declare`.
@@ -2271,6 +2610,7 @@ impl Data {
             Self::Bool(_) => "bool",
             Self::Unsigned(_) => "unsigned",
             Self::Signed(_) => "signed",
+            Self::List(_) => "list",
         }
     }
     pub fn is_integer(&self) -> bool {
@@ -2289,6 +2629,7 @@ impl Data {
             },
             Self::Bool(value) => Some(Self::Unsigned(*value as u64)),
             Self::Unsigned(_) | Self::Signed(_) => Some(self.clone()),
+            Self::List(_) => None,
         }
     }
     /// Convert to a boolean: an integer is true if it is not zero and a `str` must be `true` or `false`.
@@ -2303,6 +2644,7 @@ impl Data {
             Self::Bool(value) => Some(*value),
             Self::Unsigned(i) => Some(*i != 0),
             Self::Signed(i) => Some(*i != 0),
+            Self::List(_) => None,
         }
     }
     /// Convert to the type of `other`.
@@ -2319,6 +2661,8 @@ impl Data {
                     integer.convert_sign()
                 }
             },
+            // a single value is not converted to a list, as it would be ambiguous with a list of values
+            Self::List(_) => None,
         }
     }
     /// Convert between a signed and unsigned integer, if the value can be represented.
@@ -2329,6 +2673,7 @@ impl Data {
             _ => None,
         }
     }
+    /// Convert to a string, where the items of a list are separated by spaces.
     pub fn coerce_string(&self) -> String {
         match self {
             Self::None => String::new(),
@@ -2336,6 +2681,18 @@ impl Data {
             Self::Bool(b) => b.to_string(),
             Self::Unsigned(i) => i.to_string(),
             Self::Signed(i) => i.to_string(),
+            Self::List(items) => {
+                let items: Vec<_> = items.iter().map(Self::coerce_string).collect();
+                items.join(" ")
+            },
+        }
+    }
+    /// Returns the strings of a value which is spread into several, such as arguments: each item of a list, or a single
+    /// value.
+    pub fn spread(&self) -> Vec<String> {
+        match self {
+            Self::List(items) => items.iter().flat_map(Self::spread).collect(),
+            data => vec![data.coerce_string()],
         }
     }
 }

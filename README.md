@@ -8,18 +8,25 @@ Typically, this will set some values then include a the build definition for a p
 include arch/riscv/virt
 ```
 
-Now the build system can be bootstrapped.
+Now the build system can be bootstrapped, which builds the configure tool, `target/configure`, and runs it to generate
+`build.ninja`. This is only needed once.
 
 ```
 ninja -f bootstrap.ninja
 ```
 
-From now on just build with `ninja`.
+From now on just build with `ninja`, which rebuilds the configure tool and regenerates `build.ninja` when needed. Without targets, it builds the crates and custom commands with a `default`
+attribute, or everything if there are none.
 
 Configuring also writes `.rust-project.json`, which describes the crates to rust-analyzer. Its flycheck runs
 `target/configure --check <label>`, which brings the crate's checks up to date with ninja, then prints their saved
 diagnostics, so an up to date crate keeps its warnings without being checked again. The configuration is not evaluated
-again for a flycheck, which reads what it needs from `target/flycheck.db`.
+again for a flycheck, which reads what it needs from the build database, `target/build.db`.
+
+Run the tests with `target/configure --test`, or only some of them with `target/configure --test <name> ...`. What
+they need is built with ninja first, then each test runs from the project root, and its output is shown if it fails.
+The configure tool's own tests are the `configure` and `test_dev_configure` tests, as the build system implicitly
+declares its crates, which are not passed builtin crates.
 
 
 ### Statements
@@ -30,6 +37,10 @@ again for a flycheck, which reads what it needs from `target/flycheck.db`.
 - `crate <name> [<path>]`: introduce a Rust library crate named `<name>`, with its root at `<path>`, or at
   `<name>/lib.rs` relative to the file without one
 - `log <severity> <expression>`: report the value of an expression as an `error`, `warning` or `note`
+- `custom <name>`: a custom build command, which ninja runs when its inputs change. Its outputs can be built with
+  `ninja custom/<name>`
+- `test <name>`: a test, which passes if its command succeeds. Like `custom`, it has `input` and `command` attributes,
+  but no `output` or `default`. Its inputs are built with `ninja test/<name>`, or those of every test with `ninja test`
 
 A `<name>` is an identifier: ASCII letters, digits, `-` and `_`, not starting with a digit. Crate names cannot
 contain `-`, as rustc does not accept it. A name can instead be computed with an expression in `{}`, whose value must
@@ -74,7 +85,11 @@ log note 'many'
 
 ### Expressions
 
-An expression is a string, `true`, `false`, an integer or the name of a property.
+An expression is a string, `true`, `false`, an integer, a list or the name of a property.
+
+A list is written as expressions in `[]`, separated by `, `, such as `['-O', 'dtb']`, and its items can have any type.
+Lists can be joined with `+` and compared with `==` and `!=`. As a string, such as in a string template, the items of
+a list are separated by spaces, while each item is a separate argument of a command, such as for `run`.
 
 Integers and integer properties can be combined with `+`, `-`, `*`, `/` and `%`, with a single space on either side
 of the operator, and grouped with `(` and `)`. Both operands must have the same type, `unsigned` or `signed`.
@@ -100,6 +115,8 @@ Functions are called with their arguments in `()`, separated by `, `:
 - `select(name, ...)`: the value of the first of the named properties which has a value. Each property must be
   declared, or set before it is declared, so that a misspelt name is an error rather than ignored
 - `env(name)`: the value of an environment variable, which must be set. The build is not reconfigured when it changes
+- `len(list)`: the number of items in a list, as an `unsigned`
+- `contains(list, value)`: whether a list has an item equal to a value, as a `bool`
 - `path(str)`: a path relative to the directory of the file containing the expression, as a `str`. An absolute path
   is not made relative. `.` and `..` are resolved without following symbolic links
 - `read(path)`: the contents of a file, without trailing newlines, where the path is relative to the file containing
@@ -139,7 +156,7 @@ log note 'home is {env('HOME')}'
 
 A `declare` statement may be followed by indented attributes:
 
-- `type <type>`: the type of the property, one of `'str'`, `'bool'`, `'unsigned'` or `'signed'`
+- `type <type>`: the type of the property, one of `'str'`, `'bool'`, `'unsigned'`, `'signed'` or `'list'`
 - `default <value>`: the initial value of the property
 - `info <string>`: a description of the property, included in diagnostics about it
 - `read-only`: the property can only be assigned once, by its default or by a single `set` before or after the declaration
@@ -152,6 +169,9 @@ A `crate` statement may be followed by indented attributes:
   repeated, and the crate can be declared later or in another file
 - `builtin`: pass the crate with `--extern` to every crate for the same target which is not builtin, like the standard
   library. Builtin crates are not passed to each other, so a builtin crate must `use` the ones it depends on
+- `default`: build the crate when `ninja` is run without targets
+- `test`: build the crate's tests with `--test` as `target/<target>/test/<name>`, and register a test named after the
+  crate which runs them. Only crates for the host target can be tested for now
 
 ```
 crate core '{rust-src}/library/core/src/lib.rs'
@@ -163,6 +183,27 @@ crate compiler_builtins
 
 crate build_tool
     target host-target
+```
+
+A `custom` statement is followed by indented attributes:
+
+- `input <path>`: a file the command reads, or a list of them, relative to the file containing the statement. It can be
+  repeated
+- `output <path>`: a file the command writes, or a list of them, relative to the file containing the statement. It is
+  required, and can be repeated
+- `command <program> <argument> ...`: the command, as expressions separated by spaces, each of which is a single
+  argument, except for a list, each item of which is an argument. As with `run`, a program containing a `/` is a path relative to the file, and the outputs are rebuilt when
+  it changes, while any other program is found in `PATH`. It is required
+- `default`: run the command when `ninja` is run without targets
+
+While the attributes are evaluated, the `input` and `output` properties are lists of the paths of the inputs and
+outputs before them.
+
+```
+custom device-tree
+    input 'virt.dts'
+    output 'virt.dtb'
+    command 'dtc' '-O' 'dtb' '-o' output input
 ```
 
 ### Builtin properties

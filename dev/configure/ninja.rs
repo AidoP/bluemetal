@@ -39,13 +39,6 @@ impl NinjaFile {
         }
         new(path.as_ref())
     }
-    /// Add a `subninja` statement to include another ninja file with variable scoping.
-    pub fn subninja(&mut self, name: &str) -> Result<(), Error> {
-        let mut statement = b"subninja ".to_vec();
-        push_path(&mut statement, Path::new(name));
-        statement.push(b'\n');
-        self.write(&statement)
-    }
     /// Write a top-level variable.
     ///
     /// `value` is written verbatim, so it may reference other variables with `$`.

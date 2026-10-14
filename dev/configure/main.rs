@@ -1,6 +1,6 @@
 use std::{io::IsTerminal, path::{Path, PathBuf}};
 
-mod flycheck;
+mod database;
 mod ninja;
 mod project;
 mod rust_analyzer;
@@ -29,6 +29,10 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
         };
         check(&label.to_string_lossy());
         return Ok(());
+    }
+    if input == "--test" {
+        let names: Vec<_> = args.map(|name| name.to_string_lossy().into_owned()).collect();
+        return test(&names);
     }
     let input = PathBuf::from(input);
 
@@ -65,6 +69,31 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
         project.set(name, project::Value::new(id, project::Data::Str(value)));
     }
     project.parse(file);
+    // the configure tool builds itself, and runs its tests, when its source is part of the project
+    let self_hosted = Path::new(CONFIGURE_SOURCE).exists();
+    if self_hosted {
+        // the root build file, as the crates are not declared by one
+        let span = project::Span { file: 0, offset: 0, len: 0 };
+        let implicit = |name: &str, path: &str, kind, output: Option<&str>| project::rust::Crate {
+            name: name.into(),
+            name_span: span,
+            path: path.into(),
+            path_span: span,
+            target: host.clone(),
+            kind,
+            output: output.map(PathBuf::from),
+            builtin: false,
+            implicit: true,
+            default: false,
+            test: true,
+            uses: Vec::new(),
+        };
+        let configure = implicit("configure", CONFIGURE_SOURCE, project::rust::Kind::Bin, Some(CONFIGURE));
+        project.add_implicit_crate(configure, Vec::new());
+        // the integration tests run the configure tool
+        let tests = implicit("test_dev_configure", "test/dev/configure/main.rs", project::rust::Kind::Test, None);
+        project.add_implicit_crate(tests, vec![CONFIGURE.into()]);
+    }
     project.check();
 
     if !project.diagnostics.is_empty() {
@@ -107,7 +136,31 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
     }
 
     let mut build_ninja = NinjaFile::new("build.ninja")?;
-    build_ninja.subninja("bootstrap.ninja")?;
+
+    // `build.ninja` regenerates itself with the configure tool, which it also builds if it is part of the project, so
+    // `bootstrap.ninja` is only needed the first time
+    let configure = if self_hosted {
+        PathBuf::from(CONFIGURE)
+    } else {
+        std::env::current_exe().unwrap_or_else(|_| CONFIGURE.into())
+    };
+    let command = format!("{} $in $out", shell_quote(&configure.display().to_string()).replace('$', "$$"));
+    build_ninja.rule("configure", &[
+        ("command", &command),
+        ("description", "CONFIGURE $out"),
+        ("pool", "console"),
+        ("deps", "gcc"),
+        ("depfile", "$out.d"),
+        ("generator", "1"),
+    ])?;
+    let configure_dependency: Vec<_> = self_hosted.then_some(Path::new(CONFIGURE)).into_iter().collect();
+    build_ninja.build(&ninja::Build {
+        rule: "configure",
+        outputs: &[Path::new("build.ninja")],
+        inputs: &[&input],
+        implicit: &configure_dependency,
+        ..Default::default()
+    })?;
 
     build_ninja.variable("edition", "2024")?;
     build_ninja.rule("rustc", &[
@@ -124,48 +177,93 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
         ("depfile", "$out.d"),
     ])?;
 
-    let mut crates: Vec<_> = project.crates.into_values().collect();
-    crates.sort_unstable_by(|lhs, rhs| (&lhs.name, &lhs.target).cmp(&(&rhs.name, &rhs.target)));
-    let rlib = |c: &project::rust::Crate| PathBuf::from(format!("target/{}/lib{}.rlib", c.target, c.name));
-    for c in &crates {
-        let output = rlib(c);
-        let deps: Vec<_> = externs(c, &crates).map(|(_, d)| (d.name.as_str(), rlib(d))).collect();
-        let flags = rustc_flags(&c.target, Path::new(&format!("target/{}", c.target)), &deps);
-        let deps: Vec<_> = deps.iter().map(|(_, path)| path.as_path()).collect();
+    // the targets built by `ninja` without any, which are all targets if there are none
+    let mut defaults: Vec<PathBuf> = Vec::new();
+
+    build_ninja.rule("custom", &[("command", "$command"), ("description", "CUSTOM $name")])?;
+    let mut tests = Vec::new();
+    for custom in &project.customs {
+        // a test is run by `configure --test`, which builds its inputs and program with this target first
+        if custom.test {
+            let phony = Path::new("test").join(&custom.name);
+            let inputs: Vec<_> = custom.inputs.iter().chain(&custom.program).map(PathBuf::as_path).collect();
+            build_ninja.build(&ninja::Build { rule: "phony", outputs: &[&phony], inputs: &inputs, ..Default::default() })?;
+            tests.push(phony);
+            continue;
+        }
+        // ninja runs commands with `sh`, which must not split or expand the arguments
+        let command: Vec<_> = custom.command.iter().map(|argument| shell_quote(argument)).collect();
+        let command = command.join(" ").replace('$', "$$");
+        let outputs: Vec<_> = custom.outputs.iter().map(PathBuf::as_path).collect();
+        let inputs: Vec<_> = custom.inputs.iter().map(PathBuf::as_path).collect();
+        let program: Vec<_> = custom.program.iter().map(PathBuf::as_path).collect();
         build_ninja.build(&ninja::Build {
-            rule: "rustc",
-            outputs: &[&output],
-            inputs: &[&c.path],
-            implicit: &deps,
-            variables: &[("crate-name", &c.name), ("crate-type", "lib"), ("flags", &flags)],
+            rule: "custom",
+            outputs: &outputs,
+            inputs: &inputs,
+            implicit: &program,
+            variables: &[("command", &command), ("name", &custom.name)],
             ..Default::default()
         })?;
+        // so that the outputs can be built by name
+        let phony = Path::new("custom").join(&custom.name);
+        build_ninja.build(&ninja::Build {
+            rule: "phony",
+            outputs: &[&phony],
+            inputs: &outputs,
+            ..Default::default()
+        })?;
+        if custom.default {
+            defaults.push(phony);
+        }
     }
 
-    let mut units: Vec<_> = crates.iter().map(|c| Unit {
+    let mut crates: Vec<_> = project.crates.into_values().collect();
+    crates.sort_unstable_by(|lhs, rhs| (&lhs.name, &lhs.target).cmp(&(&rhs.name, &rhs.target)));
+    for c in &crates {
+        // a dependency is a library, so it has an output
+        let deps: Vec<_> = externs(c, &crates).map(|(_, d)| (d.name.as_str(), d.output().unwrap())).collect();
+        let flags = rustc_flags(&c.target, Path::new(&format!("target/{}", c.target)), &deps);
+        let deps: Vec<_> = deps.iter().map(|(_, path)| path.as_path()).collect();
+        let crate_type = c.crate_type();
+        let output = c.output();
+        if let Some(output) = &output {
+            build_ninja.build(&ninja::Build {
+                rule: "rustc",
+                outputs: &[output],
+                inputs: &[&c.path],
+                implicit: &deps,
+                variables: &[("crate-name", &c.name), ("crate-type", crate_type), ("flags", &flags)],
+                ..Default::default()
+            })?;
+        }
+        if c.test {
+            build_ninja.build(&ninja::Build {
+                rule: "rustc",
+                outputs: &[&c.test_harness()],
+                inputs: &[&c.path],
+                implicit: &deps,
+                variables: &[("crate-name", &c.name), ("crate-type", crate_type), ("flags", &format!("{flags} --test"))],
+                ..Default::default()
+            })?;
+        }
+        if c.default && let Some(output) = output {
+            defaults.push(output);
+        }
+    }
+
+    let units: Vec<_> = crates.iter().map(|c| Unit {
         label: format!("{}@{}", c.name, c.target),
         name: c.name.clone(),
         root: c.path.clone(),
         target: c.target.clone(),
-        test: false,
+        // a library is checked without `--test`, as its metadata is used by the crates which depend on it
+        test: c.test && c.kind != project::rust::Kind::Lib,
         deps: externs(c, &crates).map(|(index, _)| index).collect(),
         // crates from the toolchain, such as `core`, are not edited
-        member: !rust_analyzer::absolute(&c.path).starts_with(&sysroot),
+        member: c.implicit || !rust_analyzer::absolute(&c.path).starts_with(&sysroot),
         build_file: project.files[c.name_span.file].path.clone(),
     }).collect();
-    // the configure tool is not declared by the configuration, but is checked like the crates which are
-    for (name, root) in [("configure", "dev/configure/main.rs"), ("test_dev_configure", "test/dev/configure/main.rs")] {
-        units.push(Unit {
-            label: name.into(),
-            name: name.into(),
-            root: root.into(),
-            target: host.clone(),
-            test: true,
-            deps: Vec::new(),
-            member: true,
-            build_file: "bootstrap.ninja".into(),
-        });
-    }
 
     // each check is an ordinary edge which saves its diagnostics, so that a flycheck can replay them when it is up to
     // date, as rust-analyzer only shows the diagnostics from the latest flycheck
@@ -204,6 +302,15 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
         })?;
     }
 
+    // builds what all of the tests need
+    let tests: Vec<_> = tests.iter().map(PathBuf::as_path).collect();
+    build_ninja.build(&ninja::Build { rule: "phony", outputs: &[Path::new("test")], inputs: &tests, ..Default::default() })?;
+
+    if !defaults.is_empty() {
+        let defaults: Vec<_> = defaults.iter().map(PathBuf::as_path).collect();
+        build_ninja.default(&defaults)?;
+    }
+
     build_ninja.sync_all()?;
 
     let rust_project_path = Path::new(".rust-project.json");
@@ -218,15 +325,19 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
     let diagnostics: Vec<Vec<_>> = units.iter()
         .map(|unit| replayed(unit, &units).iter().map(|path| path.display().to_string()).collect())
         .collect();
-    let entries: Vec<_> = units.iter().zip(&diagnostics).map(|(unit, diagnostics)| flycheck::Entry {
+    let flychecks = units.iter().zip(&diagnostics).map(|(unit, diagnostics)| database::Flycheck {
         label: &unit.label,
         diagnostics: diagnostics.iter().map(String::as_str).collect(),
-    }).collect();
-    let mut database = Vec::new();
-    let _ = flycheck::write(&mut database, &entries);
-    let database_path = Path::new(flycheck::PATH);
+    });
+    let tests = project.customs.iter().filter(|custom| custom.test).map(|test| database::Test {
+        name: &test.name,
+        command: test.command.iter().map(String::as_str).collect(),
+    });
+    let mut bytes = Vec::new();
+    let _ = database::write(&mut bytes, &database::Database { flychecks: flychecks.collect(), tests: tests.collect() });
+    let database_path = Path::new(database::PATH);
     let written = std::fs::create_dir_all(database_path.parent().unwrap())
-        .and_then(|()| std::fs::write(database_path, database));
+        .and_then(|()| std::fs::write(database_path, bytes));
     if let Err(error) = written {
         return Err(Error::Write(database_path.into(), error));
     }
@@ -296,22 +407,22 @@ fn check(label: &str) {
         eprintln!("failed to run ninja: {error}");
     }
     // read after ninja, which reconfigures if needed, so that it is current
-    let bytes = match std::fs::read(flycheck::PATH) {
+    let bytes = match std::fs::read(database::PATH) {
         Ok(bytes) => bytes,
         Err(error) => {
-            eprintln!("failed to read {}: {error}", flycheck::PATH);
+            eprintln!("failed to read {}: {error}", database::PATH);
             return;
         },
     };
     // the entries borrow from the bytes
-    let entries = match flycheck::read(&bytes) {
-        Ok(entries) => entries,
+    let database = match database::read(&bytes) {
+        Ok(database) => database,
         Err(error) => {
-            eprintln!("failed to read {}: {error}", flycheck::PATH);
+            eprintln!("failed to read {}: {error}", database::PATH);
             return;
         },
     };
-    let Some(entry) = entries.iter().find(|entry| entry.label == label) else {
+    let Some(entry) = database.flychecks.iter().find(|entry| entry.label == label) else {
         eprintln!("no crate with the label {label:?}");
         return;
     };
@@ -322,6 +433,75 @@ fn check(label: &str) {
             let _ = std::io::copy(&mut file, &mut stdout);
         }
     }
+}
+
+/// Run tests, or all of them if no names are given, without evaluating the configuration.
+///
+/// What the tests need is built by ninja first, then each is run in turn from the project root with its output captured,
+/// which is shown if it fails.
+fn test(names: &[String]) -> Result<(), Error> {
+    let targets: Vec<_> = if names.is_empty() {
+        vec!["test".to_string()]
+    } else {
+        names.iter().map(|name| format!("test/{name}")).collect()
+    };
+    let mut ninja = std::process::Command::new("ninja");
+    ninja.args(&targets);
+    let built = match ninja.status() {
+        Ok(status) => status.success(),
+        Err(error) => return Err(Error::Exec(ninja, error)),
+    };
+    // read after ninja, which reconfigures if needed, so that it is current
+    let bytes = match std::fs::read(database::PATH) {
+        Ok(bytes) => bytes,
+        Err(error) => return Err(Error::Read(database::PATH.into(), error)),
+    };
+    let database = match database::read(&bytes) {
+        Ok(database) => database,
+        Err(error) => return Err(Error::Read(database::PATH.into(), error)),
+    };
+    // an unknown test also fails the build, as it has no target, but is the more useful error
+    let mut tests = Vec::new();
+    for name in names {
+        match database.tests.iter().find(|test| test.name == name) {
+            Some(test) => tests.push(test),
+            None => return Err(Error::UnknownTest(name.clone())),
+        }
+    }
+    if !built {
+        return Err(Error::TestBuild);
+    }
+    if names.is_empty() {
+        tests = database.tests.iter().collect();
+    }
+
+    let mut failures = Vec::new();
+    for test in &tests {
+        let output = std::process::Command::new(test.command[0])
+            .args(&test.command[1..])
+            .stdin(std::process::Stdio::null())
+            .output();
+        let failure = match output {
+            Ok(output) if output.status.success() => None,
+            Ok(output) => {
+                let mut report = format!("{}\n", output.status);
+                report.push_str(&String::from_utf8_lossy(&output.stdout));
+                report.push_str(&String::from_utf8_lossy(&output.stderr));
+                Some(report)
+            },
+            Err(error) => Some(format!("failed to run {:?}: {error}\n", test.command[0])),
+        };
+        println!("test {} ... {}", test.name, if failure.is_some() { "FAILED" } else { "ok" });
+        if let Some(report) = failure {
+            failures.push((test.name, report));
+        }
+    }
+    for (name, report) in &failures {
+        println!("\n---- {name} ----\n{}", report.trim_end());
+    }
+    let result = if failures.is_empty() { "ok" } else { "FAILED" };
+    println!("\ntest result: {result}. {} passed; {} failed", tests.len() - failures.len(), failures.len());
+    if failures.is_empty() { Ok(()) } else { Err(Error::TestsFailed(failures.len())) }
 }
 
 /// Returns the flags for compiling a crate for a target with dependencies, as names and paths.
@@ -335,16 +515,27 @@ fn rustc_flags(target: &str, search: &Path, deps: &[(&str, PathBuf)]) -> String 
     flags
 }
 
+/// The configure tool, which is built by `build.ninja` from its source when that is part of the project.
+const CONFIGURE: &str = "target/configure";
+const CONFIGURE_SOURCE: &str = "dev/configure/main.rs";
+
+/// Quote a string as a single argument for `sh`.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Returns the crates passed to a crate with `--extern`, with their indices in `crates`.
 ///
 /// Builtin crates are passed to every other crate for the same target, but not to each other as that would be a cycle,
-/// so a builtin crate must `use` the others it depends on.
+/// so a builtin crate must `use` the others it depends on. They are not passed to the implicit crates of the build
+/// system either, which use the toolchain's standard library.
 fn externs<'a>(
     c: &'a project::rust::Crate,
     crates: &'a [project::rust::Crate],
 ) -> impl Iterator<Item = (usize, &'a project::rust::Crate)> {
     crates.iter().enumerate().filter(move |(_, d)| {
-        d.target == c.target && ((d.builtin && !c.builtin) || c.uses.iter().any(|(name, _)| *name == d.name))
+        let builtin = d.builtin && !c.builtin && !c.implicit;
+        d.target == c.target && (builtin || c.uses.iter().any(|(name, _)| *name == d.name))
     })
 }
 
@@ -371,6 +562,9 @@ enum Error {
     },
     Stderr(std::io::Error),
     InvalidOutput(std::process::Command),
+    TestBuild,
+    UnknownTest(String),
+    TestsFailed(usize),
     Exec(std::process::Command, std::io::Error),
 }
 impl core::fmt::Display for Error {
@@ -391,6 +585,10 @@ impl core::fmt::Display for Error {
             },
             Self::Stderr(error) => write!(f, "failed to write to stderr: {error}"),
             Self::InvalidOutput(cmd) => write!(f, "invalid output from command {cmd:?}"),
+            Self::TestBuild => write!(f, "failed to build the tests"),
+            Self::UnknownTest(name) => write!(f, "no test named {name:?}"),
+            Self::TestsFailed(1) => write!(f, "1 test failed"),
+            Self::TestsFailed(count) => write!(f, "{count} tests failed"),
             Self::Exec(cmd, error) => write!(f, "failed to execute {cmd:?}: {error}"),
         }
     }

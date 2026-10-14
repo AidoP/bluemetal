@@ -38,14 +38,6 @@ impl Project {
             ninja: std::fs::read_to_string(self.dir.join("build.ninja")).unwrap_or_default(),
         }
     }
-    /// Write a `bootstrap.ninja` which regenerates `build.ninja`, which `build.ninja` includes, so that ninja can be run.
-    fn bootstrap(&self) {
-        let bootstrap = format!(
-            "rule configure\n    command = {} $in $out\n    deps = gcc\n    depfile = $out.d\nbuild build.ninja: configure Build\n",
-            configure_path().display(),
-        );
-        std::fs::write(self.dir.join("bootstrap.ninja"), bootstrap).unwrap();
-    }
     /// Run `configure --check` for a label, returning stdout and stderr.
     #[track_caller]
     fn check(&self, label: &str) -> (String, String) {
@@ -1184,15 +1176,8 @@ crate app 'app\"s.rs'
         }},", dir.display(), dir.display()));
     assert_contains(&json, "\"display_name\": \"core\",");
     assert_contains(&json, &format!("\"root_module\": \"{}/util.rs\"", dir.display()));
-    // the configure tool is checked as a test
-    assert_contains(&json, &format!("\
-            \"display_name\": \"configure\",
-            \"root_module\": \"{}/dev/configure/main.rs\",
-            \"edition\": \"2024\",
-            \"target\": \"{host}\",
-            \"is_workspace_member\": true,
-            \"cfg\": [\"test\"],
-            \"build\": {{ \"label\": \"configure\", \"build_file\": \"{}/bootstrap.ninja\", \"target_kind\": \"bin\" }},", dir.display(), dir.display()));
+    // the configure tool is only part of a project with its source
+    assert!(!json.contains("\"display_name\": \"configure\""), "{json}");
     assert_contains(&json, "\"sysroot_src\": \"");
     // the flycheck for a label replays its saved diagnostics
     assert_contains(&json, &format!("\
@@ -1213,7 +1198,6 @@ fn flycheck_replays_diagnostics() {
         ("util.rs", "pub fn f() -> u32 { let unused = 1; 2 }\n"),
         ("app.rs", "pub fn g() -> u32 { util::f() }\n"),
     ]);
-    project.bootstrap();
     let host = project.host();
     project.configure().ok();
     let ninja = project.configure().ninja;
@@ -1249,11 +1233,371 @@ fn flycheck_problems() {
     // without a configuration
     let (stdout, stderr) = project.check("app");
     assert_eq!(stdout, "");
-    assert_contains(&stderr, "failed to read target/flycheck.db");
+    assert_contains(&stderr, "failed to read target/build.db");
     // with an unknown label
-    project.bootstrap();
     project.configure().ok();
     let (stdout, stderr) = project.check("nope");
     assert_eq!(stdout, "");
     assert_contains(&stderr, "no crate with the label \"nope\"");
+}
+
+#[test]
+fn custom_command() {
+    let project = Project::new("custom", &[
+        ("Build", "use 'sub'\n"),
+        ("sub/Build", "\
+custom copy
+    input 'in.txt'
+    output '../out/copy.txt'
+    command 'sh' '-c' 'cat \"$1\" > \"$2\"; echo \"a  b\" >> \"$2\"' 'sh' input output
+custom tool
+    output '../out/tool.txt'
+    command './tool.sh' output 'a b' 4 * 2
+"),
+        ("sub/in.txt", "hello\n"),
+        ("sub/tool.sh", "#!/bin/sh\necho \"tool: $*\" > \"$1\"\n"),
+    ]);
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(project.dir.join("sub/tool.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = project.configure().ok();
+    // `input` and `output` are the paths, and the arguments are quoted for `sh`, with `$` escaped for ninja
+    assert_contains(output.build("out/copy.txt"), "\
+build out/copy.txt: custom sub/in.txt
+    command = 'sh' '-c' 'cat \"$$1\" > \"$$2\"; echo \"a  b\" >> \"$$2\"' 'sh' 'sub/in.txt' 'out/copy.txt'
+    name = copy");
+    // a program which is a path is relative to the file, and a dependency
+    assert_contains(output.build("out/tool.txt"), "\
+build out/tool.txt: custom | sub/tool.sh
+    command = './sub/tool.sh' 'out/tool.txt' 'a b' '8'");
+    // a command's outputs can be built by its name
+    assert_contains(&output.ninja, "\nbuild custom/copy: phony out/copy.txt\n");
+    let ninja = Command::new("ninja").args(["custom/copy", "custom/tool"]).current_dir(&project.dir).output().unwrap();
+    assert!(ninja.status.success(), "{}", String::from_utf8_lossy(&ninja.stdout));
+    assert_eq!(std::fs::read_to_string(project.dir.join("out/copy.txt")).unwrap(), "hello\na  b\n");
+    assert_eq!(std::fs::read_to_string(project.dir.join("out/tool.txt")).unwrap(), "tool: out/tool.txt a b 8\n");
+}
+
+#[test]
+fn custom_errors() {
+    let project = Project::new("custom-errors", &[("Build", "\
+custom a
+    output 'x'
+custom b
+    command 'true'
+custom c
+    output 'y'
+    command 'true'
+    command 'false'
+    bogus 1
+custom c
+    output 'z'
+    command 'true'
+custom d
+    command 'echo' input
+    input 'late'
+    output 'w'
+log note '{try(input)}'
+")]);
+    project.configure().failed()
+        .stderr("error: missing required attribute \"command\"\n --> Build:1:8")
+        .stderr("error: missing required attribute \"output\"\n --> Build:3:8")
+        .stderr("error: attribute \"command\" cannot be repeated\n --> Build:8:5")
+        .stderr("error: unknown custom attribute \"bogus\"\n --> Build:9:5")
+        .stderr("error: redeclaration of custom command \"c\"\n  --> Build:10:8")
+        .stderr("note: previously declared here\n --> Build:5:8")
+        // `input` is only set by the attributes before it, and only within the statement
+        .stderr("error: no value for property \"input\"\n  --> Build:14:20")
+        .stderr("note: false")
+        .stderr("configuration failed with 6 errors");
+}
+
+#[test]
+fn default_targets() {
+    let project = Project::new("default", &[("Build", "\
+crate kept 'kept.rs'
+    default
+crate other 'other.rs'
+custom made
+    output 'made.txt'
+    command 'touch' output
+    default
+custom skipped
+    output 'skipped.txt'
+    command 'touch' output
+"), ("kept.rs", ""), ("other.rs", "")]);
+    let host = project.host();
+    let output = project.configure().ok();
+    assert_contains(&output.ninja, &format!("\ndefault custom/made target/{host}/libkept.rlib\n"));
+    // `ninja` without targets only builds the defaults, once it has recorded how `build.ninja` was generated
+    Command::new("ninja").arg("build.ninja").current_dir(&project.dir).output().unwrap();
+    let ninja = Command::new("ninja").arg("-n").current_dir(&project.dir).output().unwrap();
+    let ninja = String::from_utf8(ninja.stdout).unwrap();
+    assert_contains(&ninja, "CUSTOM made");
+    assert_contains(&ninja, &format!("RUSTC target/{host}/libkept.rlib"));
+    assert!(!ninja.contains("skipped") && !ninja.contains("other"), "{ninja}");
+
+    // without defaults, there is no `default` statement, so everything is built
+    let project = Project::new("no-default", &[("Build", "crate other 'other.rs'\n")]);
+    assert!(!project.configure().ok().ninja.contains("\ndefault "));
+}
+
+#[test]
+fn lists() {
+    let project = Project::new("lists", &[("Build", "\
+declare flags
+    type 'list'
+    default ['-O', 'dtb']
+declare more
+    default flags + ['-o', 1 + 1, true]
+log note '{more} | {flags == ['-O', 'dtb']} | {[] == []} | {[[1], 'x']}'
+log note run('printf', '%s,', flags, ['a b', []])
+custom pack
+    input ['a.dts', 'b.dtsi']
+    input 'c.dtsi'
+    output 'out.bin'
+    command 'tool' flags '-o' output input
+")]);
+    let output = project.configure().ok();
+    // as a string, the items of a list are separated by spaces
+    output.stderr("note: -O dtb -o 2 true | true | true | 1 x\n");
+    // each item of a list is a separate argument
+    output.stderr("note: -O,dtb,a b,\n");
+    assert_contains(output.build("out.bin"), "\
+build out.bin: custom a.dts b.dtsi c.dtsi
+    command = 'tool' '-O' 'dtb' '-o' 'out.bin' 'a.dts' 'b.dtsi' 'c.dtsi'");
+}
+
+#[test]
+fn list_errors() {
+    let project = Project::new("list-errors", &[("Build", "\
+declare flags
+    type 'list'
+    default ['a']
+declare bad
+    type 'list'
+    default 'x'
+log note [1, 2
+log note [1,2]
+log note flags + 'x'
+@if flags
+log note 'x'
+")]);
+    project.configure().failed()
+        .stderr("error: invalid data type for property \"bad\"\n --> Build:6:13")
+        .stderr("error: expected \", \" or \"]\"\n --> Build:7:15")
+        .stderr("error: expected \", \" or \"]\"\n --> Build:8:12")
+        .stderr("error: mismatched operand types list and str\n --> Build:9:10")
+        .stderr("note: list value set here\n --> Build:3:13")
+        .stderr("error: list value used where bool is required\n  --> Build:10:5")
+        .stderr("configuration failed with 5 errors");
+}
+
+#[test]
+fn list_functions() {
+    let project = Project::new("list-functions", &[("Build", "\
+declare flags
+    default ['-O', 'dtb', 2, -1]
+log note '{len(flags)} {len([])} {len([[1, 2]])}'
+log note '{contains(flags, 'dtb')} {contains(flags, 'x')} {contains(flags, 2)} {contains(flags, -1)} {contains([[1]], [1])}'
+@if len(flags) > 3 && contains(flags, '-O')
+log note 'condition'
+declare a
+set a len('abc')
+set a contains('abc', 'a')
+set a contains(flags)
+")]);
+    project.configure().failed()
+        .stderr("note: 4 0 1\n")
+        .stderr("note: true false true true true\n")
+        .stderr("note: condition\n")
+        .stderr("error: str value used where list is required\n --> Build:8:11")
+        .stderr("error: str value used where list is required\n --> Build:9:16")
+        .stderr("error: function \"contains\" takes 2 arguments, but 1 was given")
+        .stderr("configuration failed with 3 errors");
+}
+
+#[test]
+fn tests() {
+    let project = Project::new("tests", &[
+        ("Build", "use 'sub'\n"),
+        ("sub/Build", "\
+custom gen
+    output 'gen.txt'
+    command 'sh' '-c' 'echo hello > \"$1\"' 'sh' output
+test generated
+    input 'gen.txt'
+    command './check.sh' input
+test fails
+    command 'sh' '-c' 'echo some output; echo an error >&2; exit 3'
+test passes
+    command 'true'
+"),
+        ("sub/check.sh", "#!/bin/sh\ngrep -q hello \"$1\"\n"),
+    ]);
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(project.dir.join("sub/check.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = project.configure().ok();
+    // a test's target builds its inputs and program, and `test` builds those of every test
+    assert_contains(&output.ninja, "\nbuild test/generated: phony sub/gen.txt sub/check.sh\n");
+    assert_contains(&output.ninja, "\nbuild test: phony test/generated test/fails test/passes\n");
+
+    let run = |names: &[&str]| {
+        let output = Command::new(configure_path()).arg("--test").args(names).current_dir(&project.dir).output().unwrap();
+        (output.status.success(), String::from_utf8(output.stdout).unwrap(), String::from_utf8(output.stderr).unwrap())
+    };
+    // the inputs are built before the tests run, and the output of a failed test is shown
+    let (success, stdout, stderr) = run(&[]);
+    assert!(!success);
+    assert_contains(&stdout, "\
+test generated ... ok
+test fails ... FAILED
+test passes ... ok
+
+---- fails ----
+exit status: 3
+some output
+an error
+
+test result: FAILED. 2 passed; 1 failed
+");
+    assert_contains(&stderr, "1 test failed");
+    // tests can be chosen by name
+    let (success, stdout, _) = run(&["passes", "generated"]);
+    assert!(success);
+    assert_contains(&stdout, "test passes ... ok\ntest generated ... ok\n\ntest result: ok. 2 passed; 0 failed\n");
+    let (success, _, stderr) = run(&["nope"]);
+    assert!(!success);
+    assert_contains(&stderr, "no test named \"nope\"");
+}
+
+#[test]
+fn test_errors() {
+    let project = Project::new("test-errors", &[("Build", "\
+test bad
+    output 'x'
+    default
+    command 'true'
+test a
+    command 'true'
+test a
+    command 'false'
+custom a
+    output 'y'
+    command 'true'
+test empty
+    input 'x'
+")]);
+    project.configure().failed()
+        .stderr("error: unknown test attribute \"output\"\n --> Build:2:5")
+        .stderr("error: unknown test attribute \"default\"\n --> Build:3:5")
+        // tests and custom commands have separate names
+        .stderr("error: redeclaration of test \"a\"\n --> Build:7:6")
+        .stderr("error: missing required attribute \"command\"\n  --> Build:12:6")
+        .stderr("configuration failed with 4 errors");
+}
+
+#[test]
+fn crate_tests() {
+    let project = Project::new("crate-tests", &[
+        ("Build", "crate util 'util.rs'\ncrate app 'app.rs'\n    use util\n    test\n"),
+        ("util.rs", "pub fn two() -> u32 { 2 }\n"),
+        ("app.rs", "\
+pub fn four() -> u32 { util::two() * 2 }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn works() { assert_eq!(super::four(), 4); }
+    #[test]
+    fn broken() { assert_eq!(super::four(), 5); }
+}
+"),
+    ]);
+    let host = project.host();
+    let output = project.configure().ok();
+    // the test harness is built like the crate, with `--test`, and is registered as a test named after the crate
+    assert_contains(output.build(&format!("target/{host}/test/app")), &format!(
+        "--extern util=target/{host}/libutil.rlib --test",
+    ));
+    assert_contains(&output.ninja, &format!("\nbuild test/app: phony target/{host}/test/app\n"));
+    let run = Command::new(configure_path()).arg("--test").current_dir(&project.dir).output().unwrap();
+    let stdout = String::from_utf8(run.stdout).unwrap();
+    assert!(!run.status.success());
+    assert_contains(&stdout, "test app ... FAILED\n");
+    // the harness's own output is shown, where its tests run in any order
+    assert_contains(&stdout, "test tests::works ... ok\n");
+    assert_contains(&stdout, "test tests::broken ... FAILED\n");
+    assert_contains(&stdout, "\ntest result: FAILED. 0 passed; 1 failed\n");
+}
+
+#[test]
+fn crate_test_errors() {
+    let project = Project::new("crate-test-errors", &[("Build", "\
+crate k 'k.rs'
+    target 'riscv64gc-unknown-none-elf'
+    test
+crate app 'app.rs'
+    test
+test app
+    command 'true'
+")]);
+    let host = project.host();
+    project.configure().failed()
+        // other environments are not supported yet
+        .stderr(&format!("error: tests for target \"riscv64gc-unknown-none-elf\" cannot be run, only those for the host target \"{host}\"\n --> Build:2:12"))
+        .stderr("error: redeclaration of test \"app\"\n --> Build:6:6")
+        .stderr("note: previously declared here\n --> Build:4:7");
+}
+
+#[test]
+fn regenerates_itself() {
+    // without the configure tool's source, `build.ninja` regenerates itself with the configure tool which made it
+    let project = Project::new("regenerate", &[("Build", "crate app 'app.rs'\n"), ("app.rs", "")]);
+    let output = project.configure().ok();
+    assert_contains(&output.ninja, &format!("\
+rule configure
+    command = '{}' $in $out
+", configure_path().display()));
+    assert_contains(&output.ninja, "\nbuild build.ninja: configure Build\n");
+    assert!(!output.ninja.contains("subninja"), "{}", output.ninja);
+    // and ninja can use it on its own, regenerating it first as it has not recorded how it was made
+    let host = project.host();
+    let ninja = Command::new("ninja").arg(format!("target/{host}/libapp.rlib")).current_dir(&project.dir).output().unwrap();
+    let stdout = String::from_utf8_lossy(&ninja.stdout);
+    assert!(ninja.status.success(), "{stdout}");
+    assert_contains(&stdout, "CONFIGURE build.ninja");
+    assert!(project.dir.join(format!("target/{host}/libapp.rlib")).exists());
+}
+
+#[test]
+fn self_hosted() {
+    // with the configure tool's source, `build.ninja` builds it, and its tests, as implicit crates
+    let project = Project::new("self-hosted", &[
+        ("Build", "crate core 'core.rs'\n    target host-target\n    builtin\n"),
+        ("dev/configure/main.rs", "fn main() {}\n"),
+        ("test/dev/configure/main.rs", ""),
+    ]);
+    let host = project.host();
+    let output = project.configure().ok();
+    assert_contains(&output.ninja, "\
+rule configure
+    command = 'target/configure' $in $out
+");
+    assert_contains(&output.ninja, "\nbuild build.ninja: configure Build | target/configure\n");
+    // the toolchain's standard library is used, rather than builtin crates
+    assert_contains(output.build("target/configure"), &format!("\
+build target/configure: rustc dev/configure/main.rs
+    crate-name = configure
+    crate-type = bin
+    flags = --target={host} -L dependency=target/{host}"));
+    assert_contains(output.build(&format!("target/{host}/test/configure")), "--test");
+    // the integration tests need the configure tool, and have no output other than their harness
+    assert_contains(&output.ninja, &format!(
+        "\nbuild test/test_dev_configure: phony target/{host}/test/test_dev_configure target/configure\n",
+    ));
+    assert_contains(&output.ninja, &format!("\nbuild test/configure: phony target/{host}/test/configure\n"));
+    assert!(!output.ninja.contains("libtest_dev_configure.rlib"), "{}", output.ninja);
+    // a declared crate cannot take the place of one
+    std::fs::write(project.dir.join("Build"), "crate configure 'x.rs'\n").unwrap();
+    project.configure().failed()
+        .stderr(&format!("error: crate \"configure\" for target \"{host}\" is reserved for the build system\n --> Build:1:7"));
 }

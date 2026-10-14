@@ -1,7 +1,9 @@
-edition = 2024
+# Builds the configure tool and the first `build.ninja`, with `ninja -f bootstrap.ninja`. After that, `build.ninja`
+# rebuilds the configure tool and regenerates itself, so this is not needed again.
 
-rule rust
-    command = rustc --color=always --out-dir=target/tmp --emit=link=$out --emit=metadata=$out.rmeta --emit=dep-info=$depfile --crate-type=$crate-type --crate-name=$crate-name --edition=$edition $flags $in
+rule rustc
+    command = rustc --color=always --out-dir=target/tmp --emit=link=$out --emit=dep-info=$out.d --crate-type=bin --crate-name=configure --edition=2024 $in
+    description = RUSTC $out
     deps = gcc
     depfile = $out.d
 
@@ -11,20 +13,8 @@ rule configure
     pool = console
     deps = gcc
     depfile = $out.d
+    generator = 1
 
-build target/configure: rust dev/configure/main.rs
-    crate-type = bin
-    crate-name = configure
-
-build target/test-configure: rust dev/configure/main.rs
-    crate-type = bin
-    crate-name = test_configure
-    flags = --test
-
-# integration tests, which run target/configure from the working directory, so run them from the project root
-build target/test/dev/configure: rust test/dev/configure/main.rs || target/configure
-    crate-type = bin
-    crate-name = test_dev_configure
-    flags = --test
+build target/configure: rustc dev/configure/main.rs
 
 build build.ninja: configure Build | target/configure
