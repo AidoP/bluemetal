@@ -143,8 +143,11 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
 
 fn write_depfile(w: &mut dyn std::io::Write, project: &project::Project) -> Result<(), std::io::Error> {
     write!(w, "build.ninja:")?;
-    for file in &project.files {
-        write!(w, " {}", file.path.display())?;
+    let paths = project.files.iter().map(|file| &file.path).chain(&project.dependencies);
+    for path in paths {
+        // escape the characters which are special in a depfile
+        let path = path.display().to_string().replace(' ', "\\ ").replace('#', "\\#").replace('$', "$$");
+        write!(w, " {path}")?;
     }
     writeln!(w)?;
     Ok(())

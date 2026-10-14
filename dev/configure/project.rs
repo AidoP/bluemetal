@@ -5,6 +5,8 @@ pub mod rust;
 pub struct Project {
     root: PathBuf,
     pub files: Vec<File>,
+    /// Files read by expressions, which the configuration depends on as well as `files`.
+    pub dependencies: Vec<PathBuf>,
     files_idx: HashMap<PathBuf, usize>,
     properties: Vec<Option<Property>>,
     properties_idx: HashMap<String, usize>,
@@ -24,6 +26,7 @@ impl Project {
         Self {
             root,
             files: Vec::new(),
+            dependencies: Vec::new(),
             files_idx: HashMap::new(),
             properties: Vec::new(),
             properties_idx: HashMap::new(),
@@ -155,7 +158,18 @@ impl Project {
             style_reset = "\x1b[0m";
         }
 
-        writeln!(w, "{style_accent}{severity}{style_white}: {}{style_reset}", diagnostic.message)?;
+        // the lines of a multi-line message, such as the output of a program, are aligned with the first
+        let message = diagnostic.message.to_string();
+        let mut lines = message.lines();
+        writeln!(w, "{style_accent}{severity}{style_white}: {}{style_reset}", lines.next().unwrap_or_default())?;
+        let indent = " ".repeat(severity.to_string().len() + 2);
+        for line in lines {
+            if line.is_empty() {
+                writeln!(w)?;
+            } else {
+                writeln!(w, "{indent}{style_white}{line}{style_reset}")?;
+            }
+        }
         if let Some(span) = diagnostic.span.as_ref() {
             self.write_location(w, span, style_accent, style_reset)?;
         }
@@ -195,10 +209,21 @@ impl Project {
                 }
             },
             Message::RunFailed { stderr, .. } if !stderr.is_empty() => {
-                writeln!(w, "{style_note}note{style_white}: stderr:{style_reset}")?;
+                // shown like a location, with a gutter as wide as the one before it
+                let width = diagnostic.span.map_or(1, |span| {
+                    self.files[span.file].position(span.offset).0.to_string().len()
+                });
+                let gutter = " ".repeat(width);
+                writeln!(w, "{gutter}--> stderr")?;
+                writeln!(w, "{gutter} |")?;
                 for line in stderr.lines() {
-                    writeln!(w, "    {line}")?;
+                    if line.is_empty() {
+                        writeln!(w, "{gutter} |")?;
+                    } else {
+                        writeln!(w, "{gutter} | {line}")?;
+                    }
                 }
+                writeln!(w, "{gutter} |")?;
             },
             Message::InvalidOperand { ty, origin: Some(span), .. } => {
                 writeln!(w, "{style_note}note{style_white}: {ty} value set here{style_reset}")?;
@@ -716,16 +741,17 @@ impl Project {
             parser.skip_statement();
             return;
         }
-        let Some((string, span)) = self.parse_string(parser) else {
+        let Some(operand) = self.parse_expression(parser) else {
             parser.skip_statement();
             return;
         };
         if !self.parse_line_end(parser) {
             parser.skip_statement();
         }
+        // any value can be logged, as it would be in a string template
         self.diagnostics.push(Diagnostic {
-            span: Some(span),
-            message: Message::User(string),
+            span: Some(operand.span),
+            message: Message::User(operand.data.coerce_string()),
             severity,
         });
     }
@@ -1060,9 +1086,10 @@ impl Project {
     fn parse_call(&mut self, parser: &mut Parser, name: &str, name_span: Span) -> Option<Operand> {
         parser.expect('(');
         let expected = match name {
-            "upper" | "lower" | "env" | "path" => "1",
+            "upper" | "lower" | "env" | "path" | "read" | "exists" | "which" => "1",
             "starts-with" | "ends-with" => "2",
             "select" | "run" => "at least 1",
+            "try" => "1",
             _ => {
                 self.diagnostics.push(Diagnostic {
                     span: Some(name_span),
@@ -1072,6 +1099,9 @@ impl Project {
                 return None;
             },
         };
+        if name == "try" {
+            return self.parse_try(parser, name_span);
+        }
         if name == "run" {
             let arguments = self.parse_arguments(parser, Self::parse_run_argument)?;
             let span = parser.span_from(name_span.offset);
@@ -1101,6 +1131,47 @@ impl Project {
                 let path = self.str_operand(arguments.next()?)?;
                 Data::Str(normalize(&self.file(name_span.file).relative_path(path)).display().to_string())
             },
+            "which" => {
+                let argument = arguments.next()?;
+                let argument_span = argument.span;
+                let name = self.str_operand(argument)?;
+                match self.which(&name) {
+                    Ok(path) => Data::Str(path.display().to_string()),
+                    Err(message) => {
+                        self.diagnostics.push(Diagnostic {
+                            span: Some(argument_span),
+                            message,
+                            severity: Severity::Error,
+                        });
+                        return None;
+                    },
+                }
+            },
+            "exists" => {
+                let path = self.str_operand(arguments.next()?)?;
+                let path = normalize(&self.file(name_span.file).relative_path(path));
+                self.depend_on_path(&path);
+                Data::Bool(path.exists())
+            },
+            "read" => {
+                let argument = arguments.next()?;
+                let argument_span = argument.span;
+                let path = self.str_operand(argument)?;
+                let path = normalize(&self.file(name_span.file).relative_path(path));
+                // depend on the file even if it cannot be read, in case the error is suppressed by `try`
+                self.depend_on_path(&path);
+                match std::fs::read_to_string(&path) {
+                    Ok(contents) => Data::Str(contents.trim_end_matches(['\n', '\r']).into()),
+                    Err(error) => {
+                        self.diagnostics.push(Diagnostic {
+                            span: Some(argument_span),
+                            message: Message::ReadFailure(path, error),
+                            severity: Severity::Error,
+                        });
+                        return None;
+                    },
+                }
+            },
             "lower" => Data::Str(self.str_operand(arguments.next()?)?.to_lowercase()),
             "starts-with" | "ends-with" => {
                 let string = self.str_operand(arguments.next()?)?;
@@ -1128,6 +1199,39 @@ impl Project {
             },
         };
         Some(Operand { data, span, coerce: Coercion::Strict, origin: None })
+    }
+    /// Take the argument of `try`, returning whether it was evaluated without errors.
+    ///
+    /// Errors from the argument are reported as warnings instead. As evaluation stops at the first error, the rest of
+    /// the argument is skipped to the closing parenthesis.
+    fn parse_try(&mut self, parser: &mut Parser, name_span: Span) -> Option<Operand> {
+        let start = parser.offset;
+        if parser.peek() == Some(')') {
+            parser.expect(')');
+            self.argument_count("try", "1", 0, parser.span_from(name_span.offset));
+            return None;
+        }
+        let first = self.diagnostics.len();
+        let operand = self.parse_binary(parser, 0);
+        if operand.is_some() && parser.peek() != Some(')') {
+            self.diagnostics.push(Diagnostic {
+                span: Some(parser.span_char()),
+                message: Message::ExpectedExact(")"),
+                severity: Severity::Error,
+            });
+        }
+        // without a closing parenthesis, the expression after `try` cannot be found, so the errors stand
+        parser.offset = start + paren_end(&parser.data[start..])?;
+        parser.expect(')');
+        let mut success = operand.is_some();
+        for diagnostic in &mut self.diagnostics[first..] {
+            if matches!(diagnostic.severity, Severity::Error) {
+                diagnostic.severity = Severity::Warning;
+                success = false;
+            }
+        }
+        let span = parser.span_from(name_span.offset);
+        Some(Operand { data: Data::Bool(success), span, coerce: Coercion::Strict, origin: None })
     }
     /// Take an argument of `run`, which is an expression, or an environment variable as `name: expression`.
     ///
@@ -1180,6 +1284,18 @@ impl Project {
             self.argument_count("run", "at least 1", 0, span);
             return None;
         };
+        // as in `sh`, a program with a `/` is a path, here relative to the file, otherwise it is searched for in `PATH`
+        let program = &if program.contains('/') {
+            let mut path = normalize(&self.file(span.file).relative_path(program));
+            self.depend_on_path(&path);
+            // a path in the same directory must still have a `/`, so that it is not searched for in `PATH`
+            if path.is_relative() {
+                path = Path::new(".").join(path);
+            }
+            path.display().to_string()
+        } else {
+            program.clone()
+        };
         let output = std::process::Command::new(program)
             .args(args)
             .envs(env)
@@ -1206,6 +1322,43 @@ impl Project {
             severity: Severity::Error,
         });
         None
+    }
+    /// Search the directories in `PATH` for an executable file.
+    ///
+    /// The directories searched before it is found are dependencies, as the program could be added to one of them.
+    fn which(&mut self, name: &str) -> Result<PathBuf, Message> {
+        use std::os::unix::fs::PermissionsExt;
+        if name.is_empty() || name.contains('/') {
+            return Err(Message::InvalidProgramName(name.into()));
+        }
+        let search = std::env::var_os("PATH").unwrap_or_default();
+        for dir in std::env::split_paths(&search) {
+            // an empty entry means the working directory, which is not a reliable place to find a program
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            let path = dir.join(name);
+            self.depend(dir);
+            if path.metadata().is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0) {
+                return Ok(path);
+            }
+        }
+        Err(Message::ProgramNotFound(name.into()))
+    }
+    /// Add a path which the configuration depends on, if it exists.
+    ///
+    /// A missing dependency is always out of date, which would regenerate the configuration endlessly, so a path which
+    /// does not exist is not tracked.
+    fn depend_on_path(&mut self, path: &Path) {
+        if path.exists() {
+            self.depend(path.to_path_buf());
+        }
+    }
+    /// Add a file which the configuration depends on, so that it is regenerated when the file changes.
+    fn depend(&mut self, path: PathBuf) {
+        if !self.dependencies.contains(&path) {
+            self.dependencies.push(path);
+        }
     }
     /// Take a parenthesised list of arguments separated by `, `, after the opening parenthesis.
     fn parse_arguments<'a, T>(
@@ -1649,6 +1802,27 @@ fn expression_end(s: &str) -> Option<usize> {
     None
 }
 
+/// Returns the index of the `)` which closes a parenthesis, given the text after the `(`.
+///
+/// Parentheses in strings are not counted, and the parenthesis must be closed on the same line.
+fn paren_end(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => return None,
+            b'\'' => i += 1 + string_end(&s[i + 1..])?,
+            b'(' => depth += 1,
+            b')' if depth == 0 => return Some(i),
+            b')' => depth -= 1,
+            _ => (),
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Returns whether a character, at index `i`, cannot be part of an identifier.
 fn invalid_ident_char(&(i, c): &(usize, char)) -> bool {
     match c {
@@ -1809,6 +1983,8 @@ pub enum Message {
     },
     NoneSelected(Vec<String>),
     PositionalAfterEnv,
+    InvalidProgramName(String),
+    ProgramNotFound(String),
     RunSpawn {
         program: String,
         error: String,
@@ -1917,6 +2093,8 @@ impl core::fmt::Display for Message {
                 let verb = if *found == 1 { "was" } else { "were" };
                 write!(f, "function {function:?} takes {expected} argument{suffix}, but {found} {verb} given")
             },
+            Self::InvalidProgramName(name) => write!(f, "invalid program name {name:?}, which cannot contain \"/\""),
+            Self::ProgramNotFound(name) => write!(f, "program {name:?} not found in PATH"),
             Self::PositionalAfterEnv => write!(f, "program arguments must come before environment variables"),
             Self::RunSpawn { program, error } => write!(f, "failed to run {program:?}: {error}"),
             Self::RunFailed { program, status, .. } => write!(f, "{program:?} failed with {status}"),
@@ -1966,7 +2144,7 @@ impl core::fmt::Display for Message {
             Self::AvailableTargets(targets) => {
                 write!(f, "available targets are:")?;
                 for target in targets {
-                    write!(f, "\n    {target}")?;
+                    write!(f, "\n{target}")?;
                 }
                 Ok(())
             },

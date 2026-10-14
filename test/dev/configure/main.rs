@@ -261,8 +261,8 @@ crate b 'x.rs'
     output
         .stderr("error: unknown target \"riscv64gc-unknown-none\", did you mean \"riscv64gc-unknown-none-elf\"?\n --> Build:2:12")
         .stderr("error: unknown target \"nope\"\n --> Build:4:12")
-        .stderr("note: available targets are:\n    ")
-        .stderr("\n    riscv64gc-unknown-none-elf\n");
+        .stderr("note: available targets are:\n      aarch64-")
+        .stderr("\n      riscv64gc-unknown-none-elf\n");
     assert_eq!(output.stderr.matches("available targets are").count(), 1, "{}", output.stderr);
 }
 
@@ -869,7 +869,8 @@ set a run('sh', '-c', 'printf \"\\377\"')
 ")]);
     project.configure().failed()
         .stderr("error: \"sh\" failed with exit status: 3\n --> Build:2:7")
-        .stderr("note: stderr:\n    oops\n    second\n")
+        // shown like a location
+        .stderr("^\n --> stderr\n  |\n  | oops\n  | second\n  |\nerror")
         .stderr("error: failed to run \"bluemetal-no-such-program\": ")
         .stderr("error: program arguments must come before environment variables\n --> Build:4:27")
         .stderr("error: unsigned value used where str is required\n --> Build:5:19")
@@ -918,7 +919,7 @@ fn run_environment_names() {
     let project = Project::new("run-env-names", &[("Build", "\
 declare name
     default 'world'
-log note '{run('printenv', target, {target}: 'computed')}'
+log note '{run('sh', '-c', 'echo $NAME_world', {'NAME_{name}'}: 'computed')}'
 log note '{run('sh', '-c', 'echo $CC $X-Y', CC: 'clang', name: name)}'
 log note '{run('printenv', 'X-Y', X-Y: 'hyphen')}'
 log note '{run('printf', {5})}|{run('printf', '%s', {'{5}'})}'
@@ -933,4 +934,202 @@ set name run('printenv', {'a b'}: 'x')
         .stderr("note: 5|5\n")
         .stderr("error: invalid character ' ' in identifier \"a b\"\n --> Build:7:26")
         .stderr("configuration failed with 1 error");
+}
+
+#[test]
+fn read_function() {
+    let project = Project::new("read", &[
+        ("Build", "use 'sub'\n"),
+        ("sub/Build", "\
+log note 'version {read('data dir/VERSION')}|'
+log note '{read('plain')} {read('../sub/plain')}'
+"),
+        ("sub/data dir/VERSION", "1.2.3\n\n"),
+        ("sub/plain", "abc"),
+    ]);
+    // trailing newlines are removed
+    project.configure().ok().stderr("note: version 1.2.3|\n").stderr("note: abc abc\n");
+    // the configuration is regenerated when a file it read changes, with special characters escaped
+    let depfile = std::fs::read_to_string(project.dir.join("build.ninja.d")).unwrap();
+    assert_eq!(depfile, "build.ninja: Build sub/Build sub/data\\ dir/VERSION sub/plain\n");
+}
+
+#[test]
+fn read_errors() {
+    let project = Project::new("read-errors", &[
+        ("Build", "declare a\nset a read('missing')\nset a read('binary')\nset a read(5)\n"),
+        ("binary", "\u{0}\u{0}"),
+    ]);
+    std::fs::write(project.dir.join("binary"), b"\xff").unwrap();
+    project.configure().failed()
+        .stderr("error: failed to read \"missing\": ")
+        .stderr("\n --> Build:2:12")
+        .stderr("error: failed to read \"binary\": stream did not contain valid UTF-8\n --> Build:3:12")
+        .stderr("error: unsigned value used where str is required\n --> Build:4:12")
+        .stderr("configuration failed with 3 errors");
+}
+
+#[test]
+fn exists_function() {
+    let project = Project::new("exists", &[
+        ("Build", "use 'sub'\n"),
+        ("sub/Build", "\
+@if exists('present')
+log note 'present'
+@if !exists('absent')
+log note 'absent'
+@if exists('inner')
+log note 'directory'
+@if !exists('no/such/file')
+log note 'deep'
+@if exists('../sub/present')
+log note 'normalized'
+"),
+        ("sub/present", ""),
+        ("sub/inner/file", ""),
+    ]);
+    project.configure().ok()
+        .stderr("note: present\n")
+        .stderr("note: absent\n")
+        .stderr("note: directory\n")
+        .stderr("note: deep\n")
+        .stderr("note: normalized\n");
+    // only paths which exist are dependencies, as a missing dependency would always be out of date
+    let depfile = std::fs::read_to_string(project.dir.join("build.ninja.d")).unwrap();
+    assert_eq!(depfile, "build.ninja: Build sub/Build sub/present sub/inner\n");
+}
+
+#[test]
+fn run_relative_program() {
+    let project = Project::new("run-relative", &[
+        ("Build", "use 'sub'\n"),
+        ("sub/Build", "\
+log note '{run('../tool.sh', 'arg')}'
+log note '{run('./local.sh')}'
+log note '{run('sh', '-c', 'echo from path')}'
+"),
+        ("tool.sh", "#!/bin/sh\necho \"tool $1\"\n"),
+        ("sub/local.sh", "#!/bin/sh\necho local\n"),
+    ]);
+    use std::os::unix::fs::PermissionsExt;
+    for script in ["tool.sh", "sub/local.sh"] {
+        std::fs::set_permissions(project.dir.join(script), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // a program with a `/` is relative to the file, and the configuration depends on it
+    project.configure().ok().stderr("note: tool arg\n").stderr("note: local\n").stderr("note: from path\n");
+    // a program without a `/` is found in `PATH`, and is not a dependency
+    let depfile = std::fs::read_to_string(project.dir.join("build.ninja.d")).unwrap();
+    assert_eq!(depfile, "build.ninja: Build sub/Build tool.sh sub/local.sh\n");
+}
+
+#[test]
+fn which_function() {
+    let project = Project::new("which", &[("Build", "\
+log note 'sh is {which('sh')}'
+declare a
+set a which('bluemetal-no-such-program')
+set a which('a/b')
+set a which('')
+")]);
+    let output = project.configure().failed();
+    output
+        .stderr("error: program \"bluemetal-no-such-program\" not found in PATH\n --> Build:3:13")
+        .stderr("error: invalid program name \"a/b\", which cannot contain \"/\"\n --> Build:4:13")
+        .stderr("error: invalid program name \"\"")
+        .stderr("configuration failed with 3 errors");
+    // the first executable `sh` in `PATH`
+    let path = std::env::var_os("PATH").unwrap();
+    let sh = std::env::split_paths(&path).map(|dir| dir.join("sh")).find(|path| path.is_file()).unwrap();
+    output.stderr(&format!("note: sh is {}\n", sh.display()));
+}
+
+#[test]
+fn try_function() {
+    let project = Project::new("try", &[("Build", "\
+declare a
+    default 'x'
+@if try(env('BLUEMETAL_CONFIGURE_TEST_UNSET'))
+log note 'not taken'
+@if !try(env('BLUEMETAL_CONFIGURE_TEST_UNSET') == 'a')
+log note 'skipped the rest'
+log note '{try(env('PATH'))} {try(upper(a))} {try(upper(5))} {try(missing)} {try(1 + )} {try(a, a)}'
+log note 'nested {try(try(read('no file')))} paren {try(upper(')('))}'
+")]);
+    let output = project.configure().ok();
+    output
+        // errors are reported as warnings
+        .stderr("warning: environment variable \"BLUEMETAL_CONFIGURE_TEST_UNSET\" is not set\n --> Build:3:13")
+        // the rest of the argument is skipped after an error
+        .stderr("note: skipped the rest\n")
+        .stderr("warning: unsigned value used where str is required\n --> Build:7:57")
+        .stderr("warning: no value for property \"missing\"")
+        .stderr("warning: expected expression")
+        .stderr("warning: expected \")\"")
+        .stderr("note: true true false false false false\n")
+        // a `try` succeeds even if its argument is a `try` which failed
+        .stderr("note: nested true paren true\n")
+        .stderr("configuration raised 7 warnings");
+    assert!(!output.stderr.contains("not taken"), "{}", output.stderr);
+}
+
+#[test]
+fn try_errors() {
+    let project = Project::new("try-errors", &[("Build", "\
+declare a
+set a try()
+set a try(upper('unclosed'
+")]);
+    // errors which leave the end of the argument unknown are not suppressed
+    project.configure().failed()
+        .stderr("error: function \"try\" takes 1 argument, but 0 were given\n --> Build:2:7")
+        .stderr("error: expected \", \" or \")\"\n --> Build:3:27")
+        .stderr("configuration failed with 2 errors");
+}
+
+#[test]
+fn missing_paths_are_not_dependencies() {
+    let project = Project::new("missing-dependencies", &[("Build", "\
+@if try(run('./missing-program'))
+log note 'ran'
+@if try(read('missing-file'))
+log note 'read'
+")]);
+    project.configure().ok().stderr("warning: failed to run \"./missing-program\"");
+    let depfile = std::fs::read_to_string(project.dir.join("build.ninja.d")).unwrap();
+    assert_eq!(depfile, "build.ninja: Build\n");
+}
+
+#[test]
+fn log_expression() {
+    let project = Project::new("log-expression", &[("Build", "\
+declare level
+    default 2
+log note level * 3
+log note upper('loud')
+log warning level > 1
+log note (level)
+log note
+")]);
+    project.configure().failed()
+        .stderr("note: 6\n --> Build:3:10\n  |\n3 | log note level * 3\n  |          ^^^^^^^^^\n")
+        .stderr("note: LOUD\n")
+        .stderr("warning: true\n")
+        .stderr("note: 2\n")
+        .stderr("error: expected \" \"\n --> Build:7:9")
+        .stderr("configuration failed with 1 error, 1 warning");
+}
+
+#[test]
+fn multi_line_message() {
+    let project = Project::new("multi-line", &[("Build", "\
+log warning run('printf', '%s\\n%s\\n\\n%s', 'first', 'second', 'after blank')
+")]);
+    // continuation lines are aligned with the first, except for blank lines
+    project.configure().ok().stderr("\
+warning: first
+         second
+
+         after blank
+ --> Build:1:13
+");
 }

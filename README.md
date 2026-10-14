@@ -22,7 +22,9 @@ From now on just build with `ninja`.
 - `use <path>`: start processing the build configuration file at `<path>`, unless it has already been processed. A file which uses itself, directly or through other files, raises a warning
 - `declare <name>`: define a property that can be used for substitution
 - `set <name> <value>`: assign a value to a property
-- `crate <name>`: introduces a crate named `<name>`
+- `crate <name> [<path>]`: introduce a Rust library crate named `<name>`, with its root at `<path>`, or at
+  `<name>/lib.rs` relative to the file without one
+- `log <severity> <expression>`: report the value of an expression as an `error`, `warning` or `note`
 
 A `<name>` is an identifier: ASCII letters, digits, `-` and `_`, not starting with a digit. Crate names cannot
 contain `-`, as rustc does not accept it. A name can instead be computed with an expression in `{}`, whose value must
@@ -95,10 +97,26 @@ Functions are called with their arguments in `()`, separated by `, `:
 - `env(name)`: the value of an environment variable, which must be set. The build is not reconfigured when it changes
 - `path(str)`: a path relative to the directory of the file containing the expression, as a `str`. An absolute path
   is not made relative. `.` and `..` are resolved without following symbolic links
-- `run(program, argument, ..., NAME: value, ...)`: run a program and return its output, without trailing newlines. The
-  program inherits the environment, with any variables given as `NAME: value` after the arguments, where `NAME` is a
-  name like those of properties, so it can be computed with `{}`. The configuration fails if the program exits
-  unsuccessfully. The build is not reconfigured when its output would change
+- `read(path)`: the contents of a file, without trailing newlines, where the path is relative to the file containing
+  the expression. The build is reconfigured when the file changes
+- `exists(path)`: whether a file or directory exists, as a `bool`, where the path is relative to the file containing
+  the expression. The build is reconfigured when an existing path changes, but not when a missing one is created
+- `try(expression)`: whether the expression is evaluated without errors, as a `bool`. Its errors are reported as
+  warnings instead, and its value is discarded
+
+```
+@if try(env('CROSS_COMPILE'))
+set prefix env('CROSS_COMPILE')
+```
+
+- `which(name)`: the path of the first executable file with the given name in the directories of the `PATH` environment
+  variable. The build is reconfigured when one of the directories searched before it changes
+- `run(program, argument, ..., NAME: value, ...)`: run a program and return its output, without trailing newlines.
+  As in `sh`, a program containing a `/` is a path, relative to the file containing the expression, while any other
+  program is found in `PATH`. It inherits the environment, with any variables given as `NAME: value` after the
+  arguments, where `NAME` is a name like those of properties, so it can be computed with `{}`. The configuration fails
+  if the program exits unsuccessfully. The build is reconfigured when a program given as a path changes, but not when
+  its output would change otherwise
 
 ```
 set board select(board, default-board)
@@ -120,6 +138,27 @@ A `declare` statement may be followed by indented attributes:
 - `default <value>`: the initial value of the property
 - `info <string>`: a description of the property, included in diagnostics about it
 - `read-only`: the property can only be assigned once, by its default or by a single `set` before or after the declaration
+
+A `crate` statement may be followed by indented attributes:
+
+- `target <string>`: the target triple to compile the crate for, which must be one supported by rustc. Without it, the
+  `target` property at the point of the declaration is used. A crate can be declared once for each target
+- `use <name>`: a crate for the same target which the crate depends on, passed to rustc with `--extern`. It can be
+  repeated, and the crate can be declared later or in another file
+- `builtin`: pass the crate with `--extern` to every crate for the same target which is not builtin, like the standard
+  library. Builtin crates are not passed to each other, so a builtin crate must `use` the ones it depends on
+
+```
+crate core '{rust-src}/library/core/src/lib.rs'
+    builtin
+
+crate compiler_builtins
+    builtin
+    use core
+
+crate build_tool
+    target host-target
+```
 
 ### Builtin properties
 
