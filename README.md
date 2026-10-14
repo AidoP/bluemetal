@@ -16,6 +16,11 @@ ninja -f bootstrap.ninja
 
 From now on just build with `ninja`.
 
+Configuring also writes `.rust-project.json`, which describes the crates to rust-analyzer. Its flycheck runs
+`target/configure --check <label>`, which brings the crate's checks up to date with ninja, then prints their saved
+diagnostics, so an up to date crate keeps its warnings without being checked again. The configuration is not evaluated
+again for a flycheck, which reads what it needs from `target/flycheck.db`.
+
 
 ### Statements
 

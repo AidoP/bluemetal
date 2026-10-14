@@ -26,10 +26,7 @@ impl Project {
         Self { dir }
     }
     fn configure(&self) -> Output {
-        let configure = match std::env::var_os("CONFIGURE") {
-            Some(path) => PathBuf::from(path),
-            None => std::env::current_dir().unwrap().join("target/configure"),
-        };
+        let configure = configure_path();
         let output = Command::new(&configure)
             .arg("Build")
             .current_dir(&self.dir)
@@ -41,12 +38,37 @@ impl Project {
             ninja: std::fs::read_to_string(self.dir.join("build.ninja")).unwrap_or_default(),
         }
     }
+    /// Write a `bootstrap.ninja` which regenerates `build.ninja`, which `build.ninja` includes, so that ninja can be run.
+    fn bootstrap(&self) {
+        let bootstrap = format!(
+            "rule configure\n    command = {} $in $out\n    deps = gcc\n    depfile = $out.d\nbuild build.ninja: configure Build\n",
+            configure_path().display(),
+        );
+        std::fs::write(self.dir.join("bootstrap.ninja"), bootstrap).unwrap();
+    }
+    /// Run `configure --check` for a label, returning stdout and stderr.
+    #[track_caller]
+    fn check(&self, label: &str) -> (String, String) {
+        let output = Command::new(configure_path()).args(["--check", label]).current_dir(&self.dir).output().unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        // a failed check is still a successful flycheck
+        assert!(output.status.success(), "--check failed:\n{stdout}\n{stderr}");
+        (stdout, stderr)
+    }
     /// The host triple, as seen by `rustc` from the project directory.
     fn host(&self) -> String {
         let output = Command::new("rustc").arg("--print=host-tuple").current_dir(&self.dir).output().unwrap();
         String::from_utf8(output.stdout).unwrap().trim().into()
     }
 }
+fn configure_path() -> PathBuf {
+    match std::env::var_os("CONFIGURE") {
+        Some(path) => std::path::absolute(path).unwrap(),
+        None => std::env::current_dir().unwrap().join("target/configure"),
+    }
+}
+
 impl Drop for Project {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
@@ -87,9 +109,10 @@ impl Output {
         let rest = &self.ninja[start..];
         &rest[..rest.find("\n\n").unwrap_or(rest.len())]
     }
-    /// Returns the outputs of all `build` statements.
+    /// Returns the outputs of the crates' `build` statements, rather than their checks.
     fn outputs(&self) -> Vec<&str> {
-        self.ninja.lines().filter_map(|line| line.strip_prefix("build ")?.split(':').next()).collect()
+        let outputs = self.ninja.lines().filter_map(|line| line.strip_prefix("build ")?.split(':').next());
+        outputs.filter(|output| output.ends_with(".rlib")).collect()
     }
 }
 
@@ -1132,4 +1155,105 @@ warning: first
          after blank
  --> Build:1:13
 ");
+}
+
+#[test]
+fn rust_project() {
+    let project = Project::new("rust-project", &[("Build", "\
+crate core 'core.rs'
+    builtin
+crate util 'util.rs'
+crate app 'app\"s.rs'
+    use util
+")]);
+    let host = project.host();
+    project.configure().ok();
+    let json = std::fs::read_to_string(project.dir.join(".rust-project.json")).unwrap();
+    let dir = std::path::absolute(&project.dir).unwrap();
+    // crates are in the same order as their indices in `deps`, which match the `--extern` flags
+    assert_contains(&json, &format!("\
+        {{
+            \"display_name\": \"app\",
+            \"root_module\": \"{}/app\\\"s.rs\",
+            \"edition\": \"2024\",
+            \"target\": \"{host}\",
+            \"is_workspace_member\": true,
+            \"cfg\": [],
+            \"build\": {{ \"label\": \"app@{host}\", \"build_file\": \"{}/Build\", \"target_kind\": \"lib\" }},
+            \"deps\": [{{ \"crate\": 1, \"name\": \"core\" }}, {{ \"crate\": 2, \"name\": \"util\" }}]
+        }},", dir.display(), dir.display()));
+    assert_contains(&json, "\"display_name\": \"core\",");
+    assert_contains(&json, &format!("\"root_module\": \"{}/util.rs\"", dir.display()));
+    // the configure tool is checked as a test
+    assert_contains(&json, &format!("\
+            \"display_name\": \"configure\",
+            \"root_module\": \"{}/dev/configure/main.rs\",
+            \"edition\": \"2024\",
+            \"target\": \"{host}\",
+            \"is_workspace_member\": true,
+            \"cfg\": [\"test\"],
+            \"build\": {{ \"label\": \"configure\", \"build_file\": \"{}/bootstrap.ninja\", \"target_kind\": \"bin\" }},", dir.display(), dir.display()));
+    assert_contains(&json, "\"sysroot_src\": \"");
+    // the flycheck for a label replays its saved diagnostics
+    assert_contains(&json, &format!("\
+    \"runnables\": [
+        {{
+            \"kind\": \"flycheck\",
+            \"program\": \"{}\",
+            \"args\": [\"--check\", \"{{label}}\"],
+            \"cwd\": \"{}\"
+        }}
+    ],", configure_path().display(), dir.display()));
+}
+
+#[test]
+fn flycheck_replays_diagnostics() {
+    let project = Project::new("flycheck", &[
+        ("Build", "crate util 'util.rs'\ncrate app 'app.rs'\n    use util\n"),
+        ("util.rs", "pub fn f() -> u32 { let unused = 1; 2 }\n"),
+        ("app.rs", "pub fn g() -> u32 { util::f() }\n"),
+    ]);
+    project.bootstrap();
+    let host = project.host();
+    project.configure().ok();
+    let ninja = project.configure().ninja;
+    // checks are ordinary edges, which save their diagnostics
+    assert_contains(&ninja, &format!("build check/app@{host}: phony target/{host}/check/libapp.rmeta\n"));
+    assert_contains(&ninja, &format!("--extern util=target/{host}/check/libutil.rmeta"));
+
+    // the diagnostics of the crates it depends on are replayed too
+    let (first, _) = project.check(&format!("app@{host}"));
+    assert_contains(&first, "\"message\":\"unused variable: `unused`\"");
+    let util = project.dir.join(format!("target/{host}/check/util.json"));
+    let modified = std::fs::metadata(&util).unwrap().modified().unwrap();
+
+    // an up to date check is not run again, but its diagnostics are still replayed
+    let (second, stderr) = project.check(&format!("app@{host}"));
+    assert_eq!(second, first);
+    assert!(!stderr.contains("CHECK"), "{stderr}");
+    assert_eq!(std::fs::metadata(&util).unwrap().modified().unwrap(), modified);
+
+    // a failed check is reported, and runs again next time
+    std::fs::write(project.dir.join("app.rs"), "pub fn g() -> u32 { util::f() + \"x\" }\n").unwrap();
+    let (failed, _) = project.check(&format!("app@{host}"));
+    assert_contains(&failed, "\"message\":\"cannot add `&str` to `u32`\"");
+    assert_contains(&failed, "\"message\":\"unused variable: `unused`\"");
+    let (again, stderr) = project.check(&format!("app@{host}"));
+    assert_eq!(again, failed);
+    assert_contains(&stderr, "FAILED");
+}
+
+#[test]
+fn flycheck_problems() {
+    let project = Project::new("flycheck-problems", &[("Build", "crate app 'app.rs'\n"), ("app.rs", "")]);
+    // without a configuration
+    let (stdout, stderr) = project.check("app");
+    assert_eq!(stdout, "");
+    assert_contains(&stderr, "failed to read target/flycheck.db");
+    // with an unknown label
+    project.bootstrap();
+    project.configure().ok();
+    let (stdout, stderr) = project.check("nope");
+    assert_eq!(stdout, "");
+    assert_contains(&stderr, "no crate with the label \"nope\"");
 }

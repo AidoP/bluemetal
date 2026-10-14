@@ -1,7 +1,9 @@
-use std::{io::IsTerminal, path::PathBuf};
+use std::{io::IsTerminal, path::{Path, PathBuf}};
 
+mod flycheck;
 mod ninja;
 mod project;
+mod rust_analyzer;
 
 use ninja::NinjaFile;
 
@@ -21,6 +23,13 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
     let Some(input) = args.next() else {
         return Err(Error::MissingArg("input"));
     };
+    if input == "--check" {
+        let Some(label) = args.next() else {
+            return Err(Error::MissingArg("label"));
+        };
+        check(&label.to_string_lossy());
+        return Ok(());
+    }
     let input = PathBuf::from(input);
 
     let sysroot = rustc_print("sysroot")?;
@@ -36,7 +45,7 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
         (
             project::Property::new("sysroot".into(), project::Type::String)
                 .info("the sysroot of the Rust toolchain"),
-            sysroot,
+            sysroot.clone(),
         ),
         (
             project::Property::new("target".into(), project::Type::String)
@@ -47,7 +56,7 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
             project::Property::new("host-target".into(), project::Type::String)
                 .info("the target triple of the machine running the build")
                 .read_only(),
-            host,
+            host.clone(),
         ),
     ];
     for (property, value) in builtins {
@@ -108,37 +117,235 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
         ("depfile", "$out.d"),
     ])?;
 
+    build_ninja.rule("rustc-check", &[
+        ("command", "rustc --error-format=json --out-dir=$outdir --emit=metadata=$out --emit=dep-info=$out.d --crate-type=$crate-type --crate-name=$crate-name --edition=$edition $flags $in 2> $diagnostics"),
+        ("description", "CHECK $out"),
+        ("deps", "gcc"),
+        ("depfile", "$out.d"),
+    ])?;
+
     let mut crates: Vec<_> = project.crates.into_values().collect();
     crates.sort_unstable_by(|lhs, rhs| (&lhs.name, &lhs.target).cmp(&(&rhs.name, &rhs.target)));
     let rlib = |c: &project::rust::Crate| PathBuf::from(format!("target/{}/lib{}.rlib", c.target, c.name));
     for c in &crates {
         let output = rlib(c);
-        // the outputs for a target share a directory, so it is searched for the dependencies of `--extern` crates
-        let mut flags = format!("--target={} -L dependency=target/{}", c.target, c.target);
-        // builtin crates are passed to every other crate for the same target, but not to each other as that would be a
-        // cycle, so a builtin crate must `use` the others it depends on
-        let externs = crates.iter().filter(|d| {
-            d.target == c.target && ((d.builtin && !c.builtin) || c.uses.iter().any(|(name, _)| *name == d.name))
-        });
-        let externs: Vec<_> = externs.map(|d| {
-            let path = rlib(d);
-            flags.push_str(&format!(" --extern {}={}", d.name, path.display()));
-            path
-        }).collect();
-        let externs: Vec<_> = externs.iter().map(PathBuf::as_path).collect();
+        let deps: Vec<_> = externs(c, &crates).map(|(_, d)| (d.name.as_str(), rlib(d))).collect();
+        let flags = rustc_flags(&c.target, Path::new(&format!("target/{}", c.target)), &deps);
+        let deps: Vec<_> = deps.iter().map(|(_, path)| path.as_path()).collect();
         build_ninja.build(&ninja::Build {
             rule: "rustc",
             outputs: &[&output],
             inputs: &[&c.path],
-            implicit: &externs,
+            implicit: &deps,
             variables: &[("crate-name", &c.name), ("crate-type", "lib"), ("flags", &flags)],
+            ..Default::default()
+        })?;
+    }
+
+    let mut units: Vec<_> = crates.iter().map(|c| Unit {
+        label: format!("{}@{}", c.name, c.target),
+        name: c.name.clone(),
+        root: c.path.clone(),
+        target: c.target.clone(),
+        test: false,
+        deps: externs(c, &crates).map(|(index, _)| index).collect(),
+        // crates from the toolchain, such as `core`, are not edited
+        member: !rust_analyzer::absolute(&c.path).starts_with(&sysroot),
+        build_file: project.files[c.name_span.file].path.clone(),
+    }).collect();
+    // the configure tool is not declared by the configuration, but is checked like the crates which are
+    for (name, root) in [("configure", "dev/configure/main.rs"), ("test_dev_configure", "test/dev/configure/main.rs")] {
+        units.push(Unit {
+            label: name.into(),
+            name: name.into(),
+            root: root.into(),
+            target: host.clone(),
+            test: true,
+            deps: Vec::new(),
+            member: true,
+            build_file: "bootstrap.ninja".into(),
+        });
+    }
+
+    // each check is an ordinary edge which saves its diagnostics, so that a flycheck can replay them when it is up to
+    // date, as rust-analyzer only shows the diagnostics from the latest flycheck
+    for unit in &units {
+        let deps: Vec<_> = unit.deps.iter()
+            .map(|&index| (units[index].name.as_str(), units[index].check_rmeta()))
+            .collect();
+        let mut flags = rustc_flags(&unit.target, &unit.check_dir(), &deps);
+        if unit.test {
+            flags.push_str(" --test");
+        }
+        let deps: Vec<_> = deps.iter().map(|(_, path)| path.as_path()).collect();
+        let output = unit.check_rmeta();
+        let diagnostics = unit.diagnostics();
+        let outdir = unit.check_dir();
+        build_ninja.build(&ninja::Build {
+            rule: "rustc-check",
+            outputs: &[&output],
+            implicit_outputs: &[&diagnostics],
+            inputs: &[&unit.root],
+            implicit: &deps,
+            variables: &[
+                ("crate-name", &unit.name),
+                ("crate-type", if unit.test { "bin" } else { "lib" }),
+                ("flags", &flags),
+                ("outdir", &outdir.display().to_string()),
+                ("diagnostics", &diagnostics.display().to_string()),
+            ],
+            ..Default::default()
+        })?;
+        build_ninja.build(&ninja::Build {
+            rule: "phony",
+            outputs: &[&Path::new("check").join(&unit.label)],
+            inputs: &[&output],
             ..Default::default()
         })?;
     }
 
     build_ninja.sync_all()?;
 
+    let rust_project_path = Path::new(".rust-project.json");
+    let mut rust_project = Vec::new();
+    let configure = std::env::current_exe().unwrap_or_else(|_| "target/configure".into());
+    // writing to a buffer cannot fail
+    let _ = rust_analyzer::write(&mut rust_project, Path::new(&sysroot), &configure, &units);
+    if let Err(error) = std::fs::write(rust_project_path, rust_project) {
+        return Err(Error::Write(rust_project_path.into(), error));
+    }
+
+    let diagnostics: Vec<Vec<_>> = units.iter()
+        .map(|unit| replayed(unit, &units).iter().map(|path| path.display().to_string()).collect())
+        .collect();
+    let entries: Vec<_> = units.iter().zip(&diagnostics).map(|(unit, diagnostics)| flycheck::Entry {
+        label: &unit.label,
+        diagnostics: diagnostics.iter().map(String::as_str).collect(),
+    }).collect();
+    let mut database = Vec::new();
+    let _ = flycheck::write(&mut database, &entries);
+    let database_path = Path::new(flycheck::PATH);
+    let written = std::fs::create_dir_all(database_path.parent().unwrap())
+        .and_then(|()| std::fs::write(database_path, database));
+    if let Err(error) = written {
+        return Err(Error::Write(database_path.into(), error));
+    }
+
     Ok(())
+}
+
+/// A crate which can be checked by rust-analyzer's flycheck.
+pub struct Unit {
+    /// The label of the flycheck, which is unique.
+    pub label: String,
+    pub name: String,
+    pub root: PathBuf,
+    pub target: String,
+    /// Whether the crate is compiled as a test, as the configure tool is.
+    pub test: bool,
+    /// The indices of the crates passed with `--extern`.
+    pub deps: Vec<usize>,
+    /// Whether the crate is edited, rather than part of the toolchain.
+    pub member: bool,
+    /// The file which declares the crate.
+    pub build_file: PathBuf,
+}
+impl Unit {
+    fn check_dir(&self) -> PathBuf {
+        PathBuf::from(format!("target/{}/check", self.target))
+    }
+    fn check_rmeta(&self) -> PathBuf {
+        self.check_dir().join(format!("lib{}.rmeta", self.name))
+    }
+    /// The file of JSON diagnostics from checking the crate.
+    fn diagnostics(&self) -> PathBuf {
+        self.check_dir().join(format!("{}.json", self.name))
+    }
+}
+
+/// Returns the diagnostics to replay for a flycheck of a unit: its own, then those of the units it depends on, directly
+/// or not, which are edited.
+fn replayed(unit: &Unit, units: &[Unit]) -> Vec<PathBuf> {
+    let mut seen = vec![false; units.len()];
+    let mut stack: Vec<_> = unit.deps.iter().rev().copied().collect();
+    let mut paths = vec![unit.diagnostics()];
+    while let Some(index) = stack.pop() {
+        if std::mem::replace(&mut seen[index], true) {
+            continue;
+        }
+        if units[index].member {
+            paths.push(units[index].diagnostics());
+        }
+        stack.extend(units[index].deps.iter().rev());
+    }
+    paths
+}
+
+/// Run a flycheck for rust-analyzer, without evaluating the configuration.
+///
+/// The checks are brought up to date by ninja, then their saved diagnostics are copied to stdout, so that diagnostics
+/// are shown even when nothing needed checking. Problems are reported on stderr, which rust-analyzer ignores, as is the
+/// exit status.
+fn check(label: &str) {
+    // ninja's output is not JSON, so it is kept out of stdout
+    let status = std::process::Command::new("ninja")
+        .args(["--quiet", &format!("check/{label}")])
+        .stdout(std::io::stderr())
+        .status();
+    if let Err(error) = status {
+        eprintln!("failed to run ninja: {error}");
+    }
+    // read after ninja, which reconfigures if needed, so that it is current
+    let bytes = match std::fs::read(flycheck::PATH) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("failed to read {}: {error}", flycheck::PATH);
+            return;
+        },
+    };
+    // the entries borrow from the bytes
+    let entries = match flycheck::read(&bytes) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("failed to read {}: {error}", flycheck::PATH);
+            return;
+        },
+    };
+    let Some(entry) = entries.iter().find(|entry| entry.label == label) else {
+        eprintln!("no crate with the label {label:?}");
+        return;
+    };
+    let mut stdout = std::io::stdout().lock();
+    for path in &entry.diagnostics {
+        // a check which has not run, as a dependency failed, has no diagnostics
+        if let Ok(mut file) = std::fs::File::open(path) {
+            let _ = std::io::copy(&mut file, &mut stdout);
+        }
+    }
+}
+
+/// Returns the flags for compiling a crate for a target with dependencies, as names and paths.
+///
+/// The outputs for a target share a directory, `search`, for the dependencies of `--extern` crates.
+fn rustc_flags(target: &str, search: &Path, deps: &[(&str, PathBuf)]) -> String {
+    let mut flags = format!("--target={target} -L dependency={}", search.display());
+    for (name, path) in deps {
+        flags.push_str(&format!(" --extern {name}={}", path.display()));
+    }
+    flags
+}
+
+/// Returns the crates passed to a crate with `--extern`, with their indices in `crates`.
+///
+/// Builtin crates are passed to every other crate for the same target, but not to each other as that would be a cycle,
+/// so a builtin crate must `use` the others it depends on.
+fn externs<'a>(
+    c: &'a project::rust::Crate,
+    crates: &'a [project::rust::Crate],
+) -> impl Iterator<Item = (usize, &'a project::rust::Crate)> {
+    crates.iter().enumerate().filter(move |(_, d)| {
+        d.target == c.target && ((d.builtin && !c.builtin) || c.uses.iter().any(|(name, _)| *name == d.name))
+    })
 }
 
 fn write_depfile(w: &mut dyn std::io::Write, project: &project::Project) -> Result<(), std::io::Error> {
