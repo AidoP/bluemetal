@@ -1,6 +1,12 @@
 use std::{collections::{HashMap, hash_map::Entry}, path::{Path, PathBuf}};
 
 pub mod rust;
+mod syntax;
+
+pub use syntax::Span;
+use syntax::{
+    Operator, Parser, argument_end, expression_end, invalid_ident_char, is_attribute_access, is_crate_reference,
+};
 
 pub struct Project {
     root: PathBuf,
@@ -2905,99 +2911,9 @@ fn normalize(path: &Path) -> PathBuf {
     normal
 }
 
-/// Returns the index of the `'` which closes a string, given the text after the opening `'`.
-///
-/// A string is on a single line. An expression in `{}` within it may contain strings, so their quotes do not close it,
-/// while `{{` and `}}` are escaped braces. An unclosed `{` is ignored, so that it is reported as an invalid template.
-fn string_end(s: &str) -> Option<usize> {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\n' => return None,
-            b'\'' => return Some(i),
-            b'{' | b'}' if bytes.get(i + 1) == Some(&bytes[i]) => i += 1,
-            b'{' => {
-                if let Some(end) = expression_end(&s[i + 1..]) {
-                    i += 1 + end;
-                }
-            },
-            _ => (),
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Returns the index of the `}` which closes an expression in a string template, given the text after the `{`.
-///
-/// The expression may itself contain `{}` to coerce a value, and strings, whose braces are not counted.
-fn expression_end(s: &str) -> Option<usize> {
-    let bytes = s.as_bytes();
-    let mut depth = 0usize;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\n' => return None,
-            b'\'' => i += 1 + string_end(&s[i + 1..])?,
-            b'{' => depth += 1,
-            b'}' if depth == 0 => return Some(i),
-            b'}' => depth -= 1,
-            _ => (),
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Returns the index of the end of an argument, at the `,` or `)` after it, given the text from its start.
-///
-/// Brackets and strings within the argument are skipped, and the argument must end on the same line.
-fn argument_end(s: &str) -> Option<usize> {
-    let bytes = s.as_bytes();
-    let mut depth = 0usize;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\n' => return None,
-            b'\'' => i += 1 + string_end(&s[i + 1..])?,
-            b'(' | b'[' | b'{' => depth += 1,
-            b',' | b')' if depth == 0 => return Some(i),
-            b')' | b']' | b'}' if depth > 0 => depth -= 1,
-            b']' | b'}' => return None,
-            _ => (),
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Returns whether the parser is at the `/` of a reference to a crate, `<target>/<name>`, after its target, which
-/// division cannot be confused with, as an operator must have spaces around it.
-fn is_crate_reference(parser: &Parser) -> bool {
-    let mut chars = parser.as_str().chars();
-    chars.next() == Some('/') && chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
-}
-
 /// The name of the test of a crate, which is the name of the crate, with its target if that is not the host target.
 fn crate_test_name(c: &rust::Crate, host: &str) -> String {
     if c.target == host { c.name.clone() } else { format!("{}@{}", c.name, c.target) }
-}
-
-/// Returns whether the parser is at the `.` of an attribute of what is before it.
-fn is_attribute_access(parser: &Parser) -> bool {
-    let mut chars = parser.as_str().chars();
-    chars.next() == Some('.') && chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
-}
-
-/// Returns whether a character, at index `i`, cannot be part of an identifier.
-fn invalid_ident_char(&(i, c): &(usize, char)) -> bool {
-    match c {
-        'a'..='z' | 'A'..='Z' | '-' | '_' => false,
-        // a leading digit would be an integer
-        '0'..='9' => i == 0,
-        _ => true,
-    }
 }
 
 /// What remains of a statement after its meta-statements.
@@ -3035,44 +2951,6 @@ enum Coercion {
     Sign,
     /// An expression in `{}`, which may be converted to any type.
     Any,
-}
-
-#[derive(Clone, Copy)]
-enum Operator {
-    Or,
-    And,
-    Equal,
-    NotEqual,
-    Less,
-    LessEqual,
-    Greater,
-    GreaterEqual,
-    Add,
-    Subtract,
-    Multiply,
-    Divide,
-    Remainder,
-    BitOr,
-    BitXor,
-    BitAnd,
-    ShiftLeft,
-    ShiftRight,
-}
-impl Operator {
-    /// The precedence of the operator, which is the same as in Rust.
-    const fn precedence(self) -> u8 {
-        match self {
-            Self::Or => 0,
-            Self::And => 1,
-            Self::Equal | Self::NotEqual | Self::Less | Self::LessEqual | Self::Greater | Self::GreaterEqual => 2,
-            Self::BitOr => 3,
-            Self::BitXor => 4,
-            Self::BitAnd => 5,
-            Self::ShiftLeft | Self::ShiftRight => 6,
-            Self::Add | Self::Subtract => 7,
-            Self::Multiply | Self::Divide | Self::Remainder => 8,
-        }
-    }
 }
 
 struct Attribute<'a> {
@@ -3114,13 +2992,6 @@ impl File {
         let col = offset - before.rfind('\n').map_or(0, |i| i + 1) + 1;
         (line, col)
     }
-}
-
-#[derive(Clone, Copy)]
-pub struct Span {
-    pub file: usize,
-    pub offset: usize,
-    pub len: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -3749,223 +3620,6 @@ impl Data {
         match self {
             Self::List(items) => items.iter().flat_map(Self::spread).collect(),
             data => vec![data.coerce_string()],
-        }
-    }
-}
-
-
-struct Parser<'a> {
-    file: usize,
-    data: &'a str,
-    offset: usize,
-}
-
-impl <'a> Parser<'a> {
-    pub fn new(file: usize, data: &'a str) -> Self {
-        Self {
-            file,
-            data,
-            offset: 0,
-        }
-    }
-    pub fn as_str(&self) -> &'a str {
-        &self.data[self.offset..]
-    }
-    pub fn as_bytes(&self) -> &'a [u8] {
-        self.data[self.offset..].as_bytes()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.offset >= self.data.len()
-    }
-    pub fn peek(&mut self) -> Option<char> {
-        self.as_str().chars().next()
-    }
-    pub fn expect(&mut self, c: char) -> bool {
-        match self.as_str().chars().next() {
-            None => false,
-            Some(other) if other != c => false,
-            Some(other) => {
-                self.offset += other.len_utf8();
-                true
-            },
-        }
-    }
-    pub fn skip_empty(&mut self) {
-        while let Some(b) = self.as_bytes().get(0) {
-            match b {
-                b'#' => {
-                    self.skip_statement();
-                },
-                b'\n' => self.offset += 1,
-                _ => return,
-            }
-        }
-    }
-    pub fn skip_line(&mut self) -> Span {
-        let start = self.offset;
-        match self.as_str().find('\n') {
-            Some(end) => self.offset += end + 1,
-            None => self.offset = self.data.len(),
-        }
-        Span {
-            file: self.file,
-            offset: start,
-            len: self.offset - start,
-        }
-    }
-    pub fn skip_statement(&mut self) -> Span {
-        let offset = self.offset;
-        while self.offset < self.data.len() {
-            // continue from the next non-indented line
-            if let Some(end) = self.as_str().find('\n') {
-                self.offset += end + 1;
-            } else {
-                self.offset = self.data.len();
-            }
-            match self.as_bytes().get(0) {
-                Some(b' ') => (),
-                _ => break,
-            }
-        }
-        Span {
-            file: self.file,
-            offset,
-            len: self.offset - offset,
-        }
-    }
-    /// Take the indentation of an attribute, skipping comments at that indentation, which comment out an attribute.
-    pub fn indent(&mut self) -> Option<Span> {
-        while self.as_str().starts_with("    #") {
-            self.skip_line();
-        }
-        if self.as_str().starts_with("    ") {
-            let offset = self.offset;
-            self.offset += 4;
-            Some(Span {
-                file: self.file,
-                offset,
-                len: 4,
-            })
-        } else {
-            None
-        }
-    }
-    pub fn ident(&mut self) -> Option<(&'a str, Span)> {
-        let data = self.data.as_bytes();
-        let start = self.offset;
-        let mut i = self.offset;
-        while i < data.len() {
-            match data[i] {
-                b'a'..=b'z' | b'A'..=b'Z' | b'-' | b'_' => i += 1,
-                // a leading digit would be an integer
-                b'0'..=b'9' if i > start => i += 1,
-                _ => break,
-            }
-        }
-        if i == self.offset {
-            return None;
-        }
-        let ident = &self.data[self.offset..i];
-        self.offset = i;
-        Some((ident, Span { file: self.file, offset: start, len: ident.len() }))
-    }
-    /// An operator with a single space on either side.
-    ///
-    /// The operator is only taken if its precedence is at least `min_precedence`.
-    pub fn operator(&mut self, min_precedence: u8) -> Option<Operator> {
-        let rest = self.as_str().strip_prefix(' ')?;
-        let end = rest.find(' ')?;
-        let operator = match &rest[..end] {
-            "||" => Operator::Or,
-            "&&" => Operator::And,
-            "==" => Operator::Equal,
-            "!=" => Operator::NotEqual,
-            "<" => Operator::Less,
-            "<=" => Operator::LessEqual,
-            ">" => Operator::Greater,
-            ">=" => Operator::GreaterEqual,
-            "+" => Operator::Add,
-            "-" => Operator::Subtract,
-            "*" => Operator::Multiply,
-            "/" => Operator::Divide,
-            "%" => Operator::Remainder,
-            "|" => Operator::BitOr,
-            "^" => Operator::BitXor,
-            "&" => Operator::BitAnd,
-            "<<" => Operator::ShiftLeft,
-            ">>" => Operator::ShiftRight,
-            _ => return None,
-        };
-        if operator.precedence() < min_precedence {
-            return None;
-        }
-        self.offset += end + 2;
-        Some(operator)
-    }
-    /// An integer with an optional `-` or `+` sign.
-    ///
-    /// The prefixes `0x`, `0o` and `0b` select hexadecimal, octal and binary, otherwise it is decimal.
-    /// Digits may be separated with `_`, but the first character must be a digit.
-    /// Returns [`Data::Signed`] if the sign is `-` and [`Data::Unsigned`] otherwise.
-    pub fn integer(&mut self) -> Option<(Data, Span)> {
-        let s = self.as_str();
-        let (negative, unsigned) = match s.strip_prefix('-') {
-            Some(rest) => (true, rest),
-            None => (false, s.strip_prefix('+').unwrap_or(s)),
-        };
-        let (radix, digits) = if let Some(rest) = unsigned.strip_prefix("0x") {
-            (16, rest)
-        } else if let Some(rest) = unsigned.strip_prefix("0o") {
-            (8, rest)
-        } else if let Some(rest) = unsigned.strip_prefix("0b") {
-            (2, rest)
-        } else {
-            (10, unsigned)
-        };
-        let end = digits.find(|c: char| !c.is_ascii_alphanumeric() && c != '_').unwrap_or(digits.len());
-        if digits.starts_with('_') {
-            return None;
-        }
-        let magnitude = u64::from_str_radix(&digits[..end].replace('_', ""), radix).ok()?;
-        let data = if negative {
-            Data::Signed(0i64.checked_sub_unsigned(magnitude)?)
-        } else {
-            Data::Unsigned(magnitude)
-        };
-        let start = self.offset;
-        self.offset += s.len() - digits.len() + end;
-        Some((data, self.span_from(start)))
-    }
-    /// A `'` quoted string on a single line.
-    pub fn string(&mut self) -> Option<(&'a str, Span)> {
-        let data = self.as_str();
-        let rest = data.strip_prefix('\'')?;
-        let end = string_end(rest)?;
-        let start = self.offset;
-        self.offset += end + 2;
-        Some((&rest[..end], self.span_from(start)))
-    }
-    pub fn span_char(&self) -> Span {
-        Span {
-            file: self.file,
-            offset: self.offset,
-            len: self.as_str().chars().next().map_or_default(|c| c.len_utf8()),
-        }
-    }
-    /// Returns the span from `start` to the current offset.
-    pub fn span_from(&self, start: usize) -> Span {
-        Span {
-            file: self.file,
-            offset: start,
-            len: self.offset - start,
-        }
-    }
-    pub fn span_until(&self, pat: impl Fn(char) -> bool) -> Span {
-        let len = self.as_str().find(pat).unwrap_or(self.data.len() - self.offset);
-        Span {
-            file: self.file,
-            offset: self.offset,
-            len,
         }
     }
 }
