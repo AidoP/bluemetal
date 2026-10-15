@@ -88,7 +88,7 @@ impl Project {
                 "use" => {
                     let span = attribute.data_span;
                     if let Some(name) = self.str_operand(attribute.operand()) {
-                        uses.push((name, span));
+                        uses.push(rust::Use { name, span });
                     }
                 },
                 name => self.diagnostics.push(Diagnostic {

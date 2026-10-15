@@ -6,24 +6,66 @@ use super::syntax::{Parser, Span};
 use super::value::Data;
 use super::Project;
 
-/// The attributes of a `target` statement which replace a field of its specification, with the field and the type of
-/// its value, where `features` is a `str` of features separated by `,`, or a list of them.
-pub(super) const TARGET_OPTIONS: &[(&str, &str, &str)] = &[
-    ("env", "env", "str"),
-    ("os", "os", "str"),
-    ("arch", "arch", "str"),
-    ("linker", "linker", "str"),
+/// An attribute of a `target` statement which replaces a field of its specification.
+pub(super) struct TargetOption {
+    pub(super) attribute: &'static str,
+    /// The field of the specification.
+    pub(super) field: &'static str,
+    pub(super) ty: OptionType,
+}
+
+/// The type of the value of a [`TargetOption`].
+#[derive(Clone, Copy)]
+pub(super) enum OptionType {
+    Str,
+    /// A flag, which is set by the attribute without a value.
+    Bool,
+    /// Features, as a `str` of features separated by `,`, or a list of them.
+    Features,
+}
+impl OptionType {
+    /// The type of value expected, as in a diagnostic.
+    fn expected(self) -> &'static str {
+        match self {
+            Self::Bool => "bool",
+            Self::Str | Self::Features => "str",
+        }
+    }
+}
+
+/// The attributes of a `target` statement which replace a field of its specification.
+const TARGET_OPTIONS: &[TargetOption] = &[
+    TargetOption { attribute: "env", field: "env", ty: OptionType::Str },
+    TargetOption { attribute: "os", field: "os", ty: OptionType::Str },
+    TargetOption { attribute: "arch", field: "arch", ty: OptionType::Str },
+    TargetOption { attribute: "linker", field: "linker", ty: OptionType::Str },
     // stable codegen options
-    ("code-model", "code-model", "str"),
-    ("relocation-model", "relocation-model", "str"),
-    ("target-cpu", "cpu", "str"),
-    ("target-feature", "features", "features"),
-    ("linker-flavor", "linker-flavor", "str"),
-    ("panic", "panic-strategy", "str"),
-    ("no-redzone", "disable-redzone", "bool"),
+    TargetOption { attribute: "code-model", field: "code-model", ty: OptionType::Str },
+    TargetOption { attribute: "relocation-model", field: "relocation-model", ty: OptionType::Str },
+    TargetOption { attribute: "target-cpu", field: "cpu", ty: OptionType::Str },
+    TargetOption { attribute: "target-feature", field: "features", ty: OptionType::Features },
+    TargetOption { attribute: "linker-flavor", field: "linker-flavor", ty: OptionType::Str },
+    TargetOption { attribute: "panic", field: "panic-strategy", ty: OptionType::Str },
+    TargetOption { attribute: "no-redzone", field: "disable-redzone", ty: OptionType::Bool },
     // the linker script, rather than its path
-    ("link-script", "link-script", "str"),
+    TargetOption { attribute: "link-script", field: "link-script", ty: OptionType::Str },
 ];
+
+/// Returns the option set by an attribute of a `target` statement, if it sets one.
+pub(super) fn target_option(attribute: &str) -> Option<&'static TargetOption> {
+    for option in TARGET_OPTIONS {
+        if option.attribute == attribute {
+            return Some(option);
+        }
+    }
+    None
+}
+
+/// A field of a target specification.
+pub struct Field {
+    pub name: String,
+    pub value: Data,
+}
 
 /// A target declared by a `target` statement.
 pub struct CustomTarget {
@@ -35,7 +77,7 @@ pub struct CustomTarget {
     /// The builtin target whose specification is extended.
     pub inherit: Option<String>,
     /// Fields of the target specification, in order, which replace those inherited.
-    pub fields: Vec<(String, Data)>,
+    pub fields: Vec<Field>,
     /// Whether crates for the target can be tested.
     pub test: bool,
     /// The index of the runner of a test harness for the target, which is its last argument, or none to run it
@@ -62,15 +104,20 @@ impl Project {
             parser.skip_statement();
         }
         let mut inherit = None;
-        let mut fields: Vec<(String, Data)> = Vec::new();
+        let mut fields: Vec<Field> = Vec::new();
         let mut test = false;
         let mut runner = None;
         let mut overrides = false;
-        // the attributes which describe the specification, which a builtin target has already
-        let mut spec_attributes = Vec::new();
+        // the attributes which describe the specification, which a builtin target has already, are reported if it turns
+        // out to be overridden
+        let mut override_errors = Vec::new();
         while let Some(attribute) = self.next_attribute(parser, &[]) {
             if !matches!(attribute.name, "override" | "test" | "runner") {
-                spec_attributes.push((attribute.name, attribute.name_span));
+                override_errors.push(Diagnostic {
+                    span: Some(attribute.name_span),
+                    message: Message::OverrideAttribute(attribute.name.into()),
+                    severity: Severity::Error,
+                });
             }
             match (attribute.name, attribute.data) {
                 ("override", Data::None) => overrides = true,
@@ -104,46 +151,42 @@ impl Project {
                     };
                     self.invalid_operand(&Attribute { data, ..attribute }.operand(), expected, false);
                 },
-                (option, data) => {
-                    let Some(&(_, field, ty)) = TARGET_OPTIONS.iter().find(|(name, ..)| *name == option) else {
+                (name, data) => {
+                    let Some(option) = target_option(name) else {
                         self.diagnostics.push(Diagnostic {
                             span: Some(attribute.name_span),
-                            message: Message::UnknownAttribute { statement: "target", name: option.into() },
+                            message: Message::UnknownAttribute { statement: "target", name: name.into() },
                             severity: Severity::Error,
                         });
                         continue;
                     };
-                    let data = match (ty, data) {
+                    let value = match (option.ty, data) {
                         // a flag without a value is set
-                        ("bool", Data::None) => Data::Bool(true),
+                        (OptionType::Bool, Data::None) => Data::Bool(true),
                         // features may be given separately
-                        ("features", Data::List(items)) if items.iter().all(|item| matches!(item, Data::Str(_))) => {
+                        (OptionType::Features, Data::List(items))
+                            if items.iter().all(|item| matches!(item, Data::Str(_))) =>
+                        {
                             let features: Vec<_> = items.iter().map(Data::coerce_string).collect();
                             Data::Str(features.join(","))
                         },
-                        ("str" | "features", data @ Data::Str(_)) | ("bool", data @ Data::Bool(_)) => data,
+                        (OptionType::Str | OptionType::Features, data @ Data::Str(_))
+                        | (OptionType::Bool, data @ Data::Bool(_)) => data,
                         (ty, data) => {
-                            let expected = if ty == "bool" { "bool" } else { "str" };
-                            self.invalid_operand(&Attribute { data, ..attribute }.operand(), expected, false);
+                            self.invalid_operand(&Attribute { data, ..attribute }.operand(), ty.expected(), false);
                             continue;
                         },
                     };
-                    match fields.iter_mut().find(|(name, _)| name == field) {
-                        Some((_, value)) => *value = data,
-                        None => fields.push((field.into(), data)),
+                    match fields.iter_mut().find(|field| field.name == option.field) {
+                        Some(field) => field.value = value,
+                        None => fields.push(Field { name: option.field.into(), value }),
                     }
                 },
             }
         }
         if overrides {
             // a builtin target is only given the attributes which do not describe its specification
-            for (attribute, attribute_span) in spec_attributes {
-                self.diagnostics.push(Diagnostic {
-                    span: Some(attribute_span),
-                    message: Message::OverrideAttribute(attribute.into()),
-                    severity: Severity::Error,
-                });
-            }
+            self.diagnostics.extend(override_errors);
             if !self.targets.contains(&name) {
                 self.diagnostics.push(Diagnostic {
                     span: Some(span),

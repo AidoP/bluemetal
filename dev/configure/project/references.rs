@@ -6,7 +6,7 @@ use super::diagnostic::{Diagnostic, Message, Severity};
 use super::syntax::{Parser, Span, is_attribute_access};
 use super::value::{Coercion, Data, Operand};
 use super::customs::CustomKind;
-use super::targets::TARGET_OPTIONS;
+use super::targets::target_option;
 use super::Project;
 
 impl Project {
@@ -38,7 +38,7 @@ impl Project {
             "builtin" => Some(Data::Bool(c.builtin)),
             "default" => Some(Data::Bool(c.default)),
             "test" => Some(Data::Bool(c.test)),
-            "use" => Some(Data::List(c.uses.iter().map(|(name, _)| Data::Str(name.clone())).collect())),
+            "use" => Some(Data::List(c.uses.iter().map(|used| Data::Str(used.name.clone())).collect())),
             _ => None,
         };
         self.attribute_value("crate", name, attribute, attribute_span, data.map(Some), start, parser)
@@ -126,8 +126,8 @@ impl Project {
             "override" => Some(Some(Data::Bool(target.overrides))),
             "runner" => Some(target.runner.map(|runner| strings(&self.runners[runner].command))),
             // a field of the specification, which is named after its option
-            option => TARGET_OPTIONS.iter().find(|(name, ..)| *name == option).map(|&(_, field, _)| {
-                target.fields.iter().find(|(name, _)| name == field).map(|(_, data)| data.clone())
+            option => target_option(option).map(|option| {
+                target.fields.iter().find(|field| field.name == option.field).map(|field| field.value.clone())
             }),
         };
         self.attribute_value("target", name, attribute, attribute_span, data, start, parser)

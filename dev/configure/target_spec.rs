@@ -16,11 +16,11 @@ pub fn spec(target: &CustomTarget, inherited: Option<&str>) -> Result<String, &'
         Some(json) => object_fields(json).ok_or("invalid target specification from rustc")?,
         None => Vec::new(),
     };
-    for (name, data) in &target.fields {
-        let value = json(data);
-        match fields.iter_mut().find(|(field, _)| field == name) {
+    for field in &target.fields {
+        let value = json(&field.value);
+        match fields.iter_mut().find(|(name, _)| *name == field.name) {
             Some((_, inherited)) => *inherited = value,
-            None => fields.push((name.clone(), value)),
+            None => fields.push((field.name.clone(), value)),
         }
     }
     let fields: Vec<_> = fields.iter().map(|(name, value)| format!("  {}: {value}", crate::rust_analyzer::string(name))).collect();

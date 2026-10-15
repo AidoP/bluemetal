@@ -19,8 +19,16 @@ pub struct Crate {
     pub default: bool,
     /// Whether the crate's tests are built as a test harness, and registered as a test named after the crate.
     pub test: bool,
-    /// The names of crates for the same target which are passed to this crate with `--extern`.
-    pub uses: Vec<(String, Span)>,
+    /// The crates for the same target which are passed to this crate with `--extern`.
+    pub uses: Vec<Use>,
+}
+
+/// A crate used by another, from a `use` attribute.
+#[derive(Clone)]
+pub struct Use {
+    /// The name of the crate, which is for the same target as the crate using it.
+    pub name: String,
+    pub span: Span,
 }
 
 #[derive(Clone, Copy, PartialEq)]

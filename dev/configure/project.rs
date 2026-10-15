@@ -167,16 +167,23 @@ impl Project {
         }
         let host = self.values_idx.get("host-target").map_or_default(|&value| self.values[value].data.coerce_string());
         for c in self.crates.values() {
-            for (name, span) in &c.uses {
+            for used in &c.uses {
+                let mut d = self.crates.get(&(used.name.clone(), c.target.clone()));
                 // a procedural macro is for the host target, but can be used by a crate for any target
-                let used = self.crates.get(&(name.clone(), c.target.clone()))
-                    .or_else(|| self.crates.get(&(name.clone(), host.clone())).filter(|d| d.kind == rust::Kind::ProcMacro));
-                let message = match used {
-                    None => Message::UnknownCrate { name: name.clone(), target: c.target.clone() },
-                    Some(d) if d.kind == rust::Kind::Bin => Message::UseBinary { name: name.clone(), declared: d.name_span },
+                if d.is_none()
+                    && let Some(host_crate) = self.crates.get(&(used.name.clone(), host.clone()))
+                    && host_crate.kind == rust::Kind::ProcMacro
+                {
+                    d = Some(host_crate);
+                }
+                let message = match d {
+                    None => Message::UnknownCrate { name: used.name.clone(), target: c.target.clone() },
+                    Some(d) if d.kind == rust::Kind::Bin => {
+                        Message::UseBinary { name: used.name.clone(), declared: d.name_span }
+                    },
                     Some(_) => continue,
                 };
-                self.diagnostics.push(Diagnostic { span: Some(*span), message, severity: Severity::Error });
+                self.diagnostics.push(Diagnostic { span: Some(used.span), message, severity: Severity::Error });
             }
         }
     }

@@ -431,7 +431,7 @@ fn externs(c: &Crate, crates: &[Crate]) -> Vec<usize> {
         let builtin = d.target == c.target && d.builtin && !c.builtin && !c.implicit;
         // a procedural macro is for the host target, but can be used by a crate for any target
         let target = d.target == c.target || d.kind == Kind::ProcMacro;
-        if builtin || target && d.kind != Kind::Bin && c.uses.iter().any(|(name, _)| *name == d.name) {
+        if builtin || target && d.kind != Kind::Bin && c.uses.iter().any(|used| used.name == d.name) {
             externs.push(index);
         }
     }
