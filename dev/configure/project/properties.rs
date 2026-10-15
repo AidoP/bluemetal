@@ -67,18 +67,10 @@ impl Project {
                     }
                 },
                 "read-only" => read_only = true,
-                "info" => match attribute.data {
-                    Data::Str(string) => info = Some(string),
-                    data => self.diagnostics.push(Diagnostic {
-                        span: Some(attribute.data_span),
-                        message: Message::InvalidOperand {
-                            ty: data.type_name(),
-                            expected: "str",
-                            coerce: false,
-                            origin: attribute.origin,
-                        },
-                        severity: Severity::Error,
-                    }),
+                "info" => {
+                    if let Some(string) = self.str_operand(attribute.operand()) {
+                        info = Some(string);
+                    }
                 },
                 "default" => {
                     default = Some(attribute.name_span);

@@ -246,16 +246,7 @@ impl Project {
             _ => None,
         };
         if value.is_none() {
-            self.diagnostics.push(Diagnostic {
-                span: Some(operand.span),
-                message: Message::InvalidOperand {
-                    ty: operand.data.type_name(),
-                    expected: "bool",
-                    coerce: operand.coerce == Coercion::Any,
-                    origin: operand.origin,
-                },
-                severity: Severity::Error,
-            });
+            self.invalid_operand(&operand, "bool", operand.coerce == Coercion::Any);
         }
         value
     }
@@ -267,16 +258,7 @@ impl Project {
             _ => None,
         };
         let Some(data) = data else {
-            self.diagnostics.push(Diagnostic {
-                span: Some(operand.span),
-                message: Message::InvalidOperand {
-                    ty: operand.data.type_name(),
-                    expected: "integer",
-                    coerce: operand.coerce == Coercion::Any,
-                    origin: operand.origin,
-                },
-                severity: Severity::Error,
-            });
+            self.invalid_operand(&operand, "integer", operand.coerce == Coercion::Any);
             return None;
         };
         Some(Operand { data, ..operand })
@@ -336,58 +318,39 @@ impl Project {
             return None;
         };
         let Some(data) = from.data.coerce_like(&to.data) else {
-            self.diagnostics.push(Diagnostic {
-                span: Some(from.span),
-                message: Message::InvalidOperand {
-                    ty: from.data.type_name(),
-                    expected: to.data.type_name(),
-                    coerce: true,
-                    origin: from.origin,
-                },
-                severity: Severity::Error,
-            });
+            self.invalid_operand(&from, to.data.type_name(), true);
             return None;
         };
         Some(if swap { (data, to.data) } else { (to.data, data) })
     }
     /// Ensure an operand is a list.
     pub(super) fn list_operand(&mut self, operand: Operand) -> Option<Vec<Data>> {
-        match operand.data {
-            Data::List(items) => Some(items),
-            data => {
-                self.diagnostics.push(Diagnostic {
-                    span: Some(operand.span),
-                    message: Message::InvalidOperand {
-                        ty: data.type_name(),
-                        expected: "list",
-                        coerce: false,
-                        origin: operand.origin,
-                    },
-                    severity: Severity::Error,
-                });
-                None
-            },
+        if let Data::List(items) = operand.data {
+            return Some(items);
         }
+        self.invalid_operand(&operand, "list", false);
+        None
     }
     /// Ensure an operand is a string, converting it if it permits coercion.
     pub(super) fn str_operand(&mut self, operand: Operand) -> Option<String> {
-        match operand.data {
-            Data::Str(string) => Some(string),
-            data if operand.coerce == Coercion::Any && data != Data::None => Some(data.coerce_string()),
-            data => {
-                self.diagnostics.push(Diagnostic {
-                    span: Some(operand.span),
-                    message: Message::InvalidOperand {
-                        ty: data.type_name(),
-                        expected: "str",
-                        coerce: operand.coerce == Coercion::Any,
-                        origin: operand.origin,
-                    },
-                    severity: Severity::Error,
-                });
-                None
-            },
+        let coerce = operand.coerce == Coercion::Any;
+        if let Data::Str(string) = operand.data {
+            return Some(string);
         }
+        if coerce && operand.data != Data::None {
+            return Some(operand.data.coerce_string());
+        }
+        self.invalid_operand(&operand, "str", coerce);
+        None
+    }
+    /// Report an operand which does not have the type that is `expected`, or which cannot be converted to it if
+    /// `coerce`.
+    pub(super) fn invalid_operand(&mut self, operand: &Operand, expected: &'static str, coerce: bool) {
+        self.diagnostics.push(Diagnostic {
+            span: Some(operand.span),
+            message: Message::InvalidOperand { ty: operand.data.type_name(), expected, coerce, origin: operand.origin },
+            severity: Severity::Error,
+        });
     }
     /// Take the next string from the parser.
     fn parse_string(&mut self, parser: &mut Parser) -> Option<(String, Span)> {

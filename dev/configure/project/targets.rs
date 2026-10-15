@@ -1,6 +1,7 @@
 //! Targets declared by `target` statements.
 
 use super::diagnostic::{Diagnostic, Message, Severity, suggest};
+use super::statements::Attribute;
 use super::syntax::{Parser, Span};
 use super::value::Data;
 use super::Project;
@@ -98,21 +99,15 @@ impl Project {
                 ("runner", Data::List(items)) if !items.is_empty() && items.iter().all(|item| matches!(item, Data::Str(_))) => {
                     runner = Some(self.add_runner(items.iter().map(Data::coerce_string).collect(), parser.file));
                 },
-                (name @ ("inherit" | "test" | "runner" | "override"), data) => self.diagnostics.push(Diagnostic {
-                    span: Some(attribute.data_span),
-                    message: Message::InvalidOperand {
-                        ty: data.type_name(),
-                        expected: match name {
-                            "test" => "bool",
-                            "runner" => "str or a list of str",
-                            "override" => "none",
-                            _ => "str",
-                        },
-                        coerce: false,
-                        origin: attribute.origin,
-                    },
-                    severity: Severity::Error,
-                }),
+                (name @ ("inherit" | "test" | "runner" | "override"), data) => {
+                    let expected = match name {
+                        "test" => "bool",
+                        "runner" => "str or a list of str",
+                        "override" => "none",
+                        _ => "str",
+                    };
+                    self.invalid_operand(&Attribute { data, ..attribute }.operand(), expected, false);
+                },
                 (option, data) => {
                     let Some(&(_, field, ty)) = TARGET_OPTIONS.iter().find(|(name, ..)| *name == option) else {
                         self.diagnostics.push(Diagnostic {
@@ -132,16 +127,8 @@ impl Project {
                         },
                         ("str" | "features", data @ Data::Str(_)) | ("bool", data @ Data::Bool(_)) => data,
                         (ty, data) => {
-                            self.diagnostics.push(Diagnostic {
-                                span: Some(attribute.data_span),
-                                message: Message::InvalidOperand {
-                                    ty: data.type_name(),
-                                    expected: if ty == "bool" { "bool" } else { "str" },
-                                    coerce: false,
-                                    origin: attribute.origin,
-                                },
-                                severity: Severity::Error,
-                            });
+                            let expected = if ty == "bool" { "bool" } else { "str" };
+                            self.invalid_operand(&Attribute { data, ..attribute }.operand(), expected, false);
                             continue;
                         },
                     };

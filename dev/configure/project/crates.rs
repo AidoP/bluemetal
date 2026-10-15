@@ -63,50 +63,36 @@ impl Project {
                 "builtin" => builtin = true,
                 "default" => default = true,
                 "test" => test = true,
-                "crate-type" => match attribute.data {
-                    Data::Str(crate_type) => match crate_type.as_str() {
+                "crate-type" => {
+                    let span = attribute.data_span;
+                    let Some(crate_type) = self.str_operand(attribute.operand()) else {
+                        continue;
+                    };
+                    match crate_type.as_str() {
                         "lib" => kind = rust::Kind::Lib,
                         "bin" => kind = rust::Kind::Bin,
                         "proc-macro" => kind = rust::Kind::ProcMacro,
                         _ => self.diagnostics.push(Diagnostic {
-                            span: Some(attribute.data_span),
+                            span: Some(span),
                             message: Message::InvalidCrateType(crate_type),
                             severity: Severity::Error,
                         }),
-                    },
-                    data => self.diagnostics.push(Diagnostic {
-                        span: Some(attribute.data_span),
-                        message: Message::InvalidOperand {
-                            ty: data.type_name(),
-                            expected: "str",
-                            coerce: false,
-                            origin: attribute.origin,
-                        },
-                        severity: Severity::Error,
-                    }),
+                    }
                 },
-                "target" | "use" => match attribute.data {
-                    Data::Str(string) if attribute.name == "target" => {
-                        target = Some((vec![string], attribute.data_span));
-                    },
+                "target" => match attribute.data {
+                    Data::Str(string) => target = Some((vec![string], attribute.data_span)),
                     // a crate is declared for each of a list of targets
-                    Data::List(items)
-                        if attribute.name == "target" && items.iter().all(|item| matches!(item, Data::Str(_))) =>
-                    {
+                    Data::List(items) if items.iter().all(|item| matches!(item, Data::Str(_))) => {
                         let targets = items.iter().map(Data::coerce_string).collect();
                         target = Some((targets, attribute.data_span));
                     },
-                    Data::Str(string) => uses.push((string, attribute.data_span)),
-                    data => self.diagnostics.push(Diagnostic {
-                        span: Some(attribute.data_span),
-                        message: Message::InvalidOperand {
-                            ty: data.type_name(),
-                            expected: "str",
-                            coerce: false,
-                            origin: attribute.origin,
-                        },
-                        severity: Severity::Error,
-                    }),
+                    _ => self.invalid_operand(&attribute.operand(), "str", false),
+                },
+                "use" => {
+                    let span = attribute.data_span;
+                    if let Some(name) = self.str_operand(attribute.operand()) {
+                        uses.push((name, span));
+                    }
                 },
                 name => self.diagnostics.push(Diagnostic {
                     span: Some(attribute.name_span),

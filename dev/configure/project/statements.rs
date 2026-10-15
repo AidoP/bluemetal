@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use super::syntax::{Parser, Span, invalid_ident_char, is_crate_reference};
 use super::meta::Meta;
+use super::value::{Coercion, Operand};
 use super::{Data, Diagnostic, File, Message, Project, Severity, Value};
 
 pub(super) struct Attribute<'a> {
@@ -13,6 +14,12 @@ pub(super) struct Attribute<'a> {
     pub(super) data_span: Span,
     /// Where the value was set, if the data is the value of a property.
     pub(super) origin: Option<Span>,
+}
+impl Attribute<'_> {
+    /// The value of the attribute as an operand, which is not converted to another type.
+    pub(super) fn operand(self) -> Operand {
+        Operand { data: self.data, span: self.data_span, coerce: Coercion::Strict, origin: self.origin }
+    }
 }
 
 impl Project {

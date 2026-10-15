@@ -158,17 +158,8 @@ impl Project {
                 match &operand.data {
                     Data::Str(string) => Data::Unsigned(string.len() as u64),
                     Data::List(items) => Data::Unsigned(items.len() as u64),
-                    data => {
-                        self.diagnostics.push(Diagnostic {
-                            span: Some(operand.span),
-                            message: Message::InvalidOperand {
-                                ty: data.type_name(),
-                                expected: "list or str",
-                                coerce: false,
-                                origin: operand.origin,
-                            },
-                            severity: Severity::Error,
-                        });
+                    _ => {
+                        self.invalid_operand(&operand, "list or str", false);
                         return None;
                     },
                 }
