@@ -34,6 +34,39 @@ impl core::fmt::Display for Severity {
     }
 }
 
+/// Something declared by a statement, as it is named in messages.
+#[derive(Clone, Copy)]
+pub enum Item {
+    Crate,
+    CustomCommand,
+    Test,
+    Target,
+    Property,
+}
+impl Item {
+    /// The keyword of the statement which declares the item.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Crate => "crate",
+            Self::CustomCommand => "custom",
+            Self::Test => "test",
+            Self::Target => "target",
+            Self::Property => "declare",
+        }
+    }
+}
+impl core::fmt::Display for Item {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Crate => "crate",
+            Self::CustomCommand => "custom command",
+            Self::Test => "test",
+            Self::Target => "target",
+            Self::Property => "property",
+        })
+    }
+}
+
 pub struct Diagnostic {
     pub span: Option<Span>,
     pub message: Message,
@@ -138,13 +171,13 @@ pub enum Message {
         name: String,
     },
     UnknownAttribute {
-        statement: &'static str,
+        item: Item,
         name: String,
     },
     RepeatedAttribute(String),
     MissingAttribute(&'static str),
     RedeclareCustom {
-        statement: &'static str,
+        item: Item,
         name: String,
         previous: Span,
     },
@@ -170,12 +203,12 @@ pub enum Message {
     },
     UnknownReference(String),
     UnknownAttributeOf {
-        kind: &'static str,
+        item: Item,
         name: String,
         attribute: String,
     },
     AttributeNotSet {
-        kind: &'static str,
+        item: Item,
         name: String,
         attribute: String,
     },
@@ -278,12 +311,10 @@ impl core::fmt::Display for Message {
             Self::ReadOnlyProperty { name, builtin: true, .. } => write!(f, "cannot set read-only builtin property {name:?}"),
             Self::UnknownDeclarationAttribute { name, .. } => write!(f, "unknown declare attribute {name:?}"),
             Self::UnknownCrateAttribute { name, .. } => write!(f, "unknown crate attribute {name:?}"),
-            Self::UnknownAttribute { statement, name } => write!(f, "unknown {statement} attribute {name:?}"),
+            Self::UnknownAttribute { item, name } => write!(f, "unknown {} attribute {name:?}", item.keyword()),
             Self::RepeatedAttribute(name) => write!(f, "attribute {name:?} cannot be repeated"),
             Self::MissingAttribute(name) => write!(f, "missing required attribute {name:?}"),
-            Self::RedeclareCustom { statement: "test", name, .. } => write!(f, "redeclaration of test {name:?}"),
-            Self::RedeclareCustom { statement: "target", name, .. } => write!(f, "redeclaration of target {name:?}"),
-            Self::RedeclareCustom { name, .. } => write!(f, "redeclaration of custom command {name:?}"),
+            Self::RedeclareCustom { item, name, .. } => write!(f, "redeclaration of {item} {name:?}"),
             Self::NewlineInArgument => write!(f, "command arguments cannot contain a newline"),
             Self::EmptySeparator => write!(f, "the separator cannot be empty"),
             Self::NoValues => write!(f, "there are no values to compare"),
@@ -298,11 +329,11 @@ impl core::fmt::Display for Message {
             Self::UseWithTarget { .. } => write!(f, "cannot use a crate of a different target"),
             Self::Replacement { description, .. } => f.write_str(description),
             Self::UnknownReference(name) => write!(f, "no property, custom command, target or test named {name:?}"),
-            Self::UnknownAttributeOf { kind, name, attribute } => {
-                write!(f, "unknown attribute {attribute:?} of {kind} {name:?}")
+            Self::UnknownAttributeOf { item, name, attribute } => {
+                write!(f, "unknown attribute {attribute:?} of {item} {name:?}")
             },
-            Self::AttributeNotSet { kind, name, attribute } => {
-                write!(f, "attribute {attribute:?} of {kind} {name:?} is not set")
+            Self::AttributeNotSet { item, name, attribute } => {
+                write!(f, "attribute {attribute:?} of {item} {name:?} is not set")
             },
             Self::UseBinary { name, .. } => write!(f, "crate {name:?} is a binary, which cannot be used by another crate"),
             Self::BuiltinTargetName(name) => {

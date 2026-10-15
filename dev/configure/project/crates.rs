@@ -3,7 +3,7 @@
 use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
 
-use super::diagnostic::{Diagnostic, Message, Severity};
+use super::diagnostic::{Diagnostic, Item, Message, Severity};
 use super::statements::Name;
 use super::syntax::{Parser, Span};
 use super::value::Data;
@@ -183,7 +183,7 @@ impl Project {
             };
             // a crate is referred to as `<target>/<name>`, as it may be declared for several targets
             let property = format!("{}/{}", c.target, c.name);
-            self.declare_outputs(property, span, "crate", vec![output]);
+            self.declare_outputs(property, span, Item::Crate, vec![output]);
         }
     }
     /// Register the test harness of a crate, like a `test` statement which runs it, which also needs `inputs`.

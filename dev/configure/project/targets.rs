@@ -1,6 +1,6 @@
 //! Targets declared by `target` statements.
 
-use super::diagnostic::{Diagnostic, Message, Severity, suggest};
+use super::diagnostic::{Diagnostic, Item, Message, Severity, suggest};
 use super::statements::Attribute;
 use super::statements::Name;
 use super::syntax::{Parser, Span};
@@ -168,7 +168,7 @@ impl Project {
                     let Some(option) = target_option(name) else {
                         self.diagnostics.push(Diagnostic {
                             span: Some(attribute.name_span),
-                            message: Message::UnknownAttribute { statement: "target", name: name.into() },
+                            message: Message::UnknownAttribute { item: Item::Target, name: name.into() },
                             severity: Severity::Error,
                         });
                         continue;
@@ -220,7 +220,7 @@ impl Project {
             let previous = previous.name_span;
             self.diagnostics.push(Diagnostic {
                 span: Some(span),
-                message: Message::RedeclareCustom { statement: "target", name, previous },
+                message: Message::RedeclareCustom { item: Item::Target, name, previous },
                 severity: Severity::Error,
             });
             return;

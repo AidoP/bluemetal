@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use super::diagnostic::{Diagnostic, Message, Severity};
+use super::diagnostic::{Diagnostic, Item, Message, Severity};
 use super::syntax::{Parser, Span, is_attribute_access};
 use super::value::{Coercion, Data, Operand};
 use super::customs::CustomKind;
@@ -47,7 +47,7 @@ impl Project {
             },
             _ => AttributeValue::Unknown,
         };
-        self.attribute_value("crate", name, attribute, attribute_span, value, start, parser)
+        self.attribute_value(Item::Crate, name, attribute, attribute_span, value, start, parser)
     }
     /// Take the name of an attribute after a `.`, which is at the parser.
     fn parse_attribute_access<'a>(&mut self, parser: &mut Parser<'a>) -> Option<(&'a str, Span)> {
@@ -57,7 +57,7 @@ impl Project {
     /// Returns the value of an attribute as an operand, or reports an attribute which is unknown or not set.
     fn attribute_value(
         &mut self,
-        kind: &'static str,
+        item: Item,
         name: &str,
         attribute: &str,
         attribute_span: Span,
@@ -69,9 +69,9 @@ impl Project {
             AttributeValue::Set(data) => {
                 return Some(Operand { data, span: parser.span_from(start), coerce: Coercion::Strict, origin: None });
             },
-            AttributeValue::Unset => Message::AttributeNotSet { kind, name: name.into(), attribute: attribute.into() },
+            AttributeValue::Unset => Message::AttributeNotSet { item, name: name.into(), attribute: attribute.into() },
             AttributeValue::Unknown => {
-                Message::UnknownAttributeOf { kind, name: name.into(), attribute: attribute.into() }
+                Message::UnknownAttributeOf { item, name: name.into(), attribute: attribute.into() }
             },
         };
         self.diagnostics.push(Diagnostic { span: Some(attribute_span), message, severity: Severity::Error });
@@ -92,7 +92,7 @@ impl Project {
                 "default" => AttributeValue::Set(Data::Bool(*default)),
                 _ => AttributeValue::Unknown,
             };
-            return self.attribute_value("custom command", name, attribute, attribute_span, value, start, parser);
+            return self.attribute_value(Item::CustomCommand, name, attribute, attribute_span, value, start, parser);
         }
         if let Some(&id) = self.properties_idx.get(name) && let Some(property) = &self.properties[id] {
             let value = match attribute {
@@ -102,7 +102,7 @@ impl Project {
                 "info" => AttributeValue::optional(property.info.clone().map(Data::Str)),
                 _ => AttributeValue::Unknown,
             };
-            return self.attribute_value("property", name, attribute, attribute_span, value, start, parser);
+            return self.attribute_value(Item::Property, name, attribute, attribute_span, value, start, parser);
         }
         if let Some(target) = self.custom_targets.iter().find(|target| target.name == name) {
             let value = match attribute {
@@ -119,7 +119,7 @@ impl Project {
                     None => AttributeValue::Unknown,
                 },
             };
-            return self.attribute_value("target", name, attribute, attribute_span, value, start, parser);
+            return self.attribute_value(Item::Target, name, attribute, attribute_span, value, start, parser);
         }
         // a test has its own name, which is looked for last
         if let Some(test) = self.customs.iter().find(|test| test.is_test() && test.name == name) {
@@ -128,7 +128,7 @@ impl Project {
                 "command" => AttributeValue::Set(strings(&test.command(&self.runners))),
                 _ => AttributeValue::Unknown,
             };
-            return self.attribute_value("test", name, attribute, attribute_span, value, start, parser);
+            return self.attribute_value(Item::Test, name, attribute, attribute_span, value, start, parser);
         }
         self.diagnostics.push(Diagnostic {
             span: Some(span),

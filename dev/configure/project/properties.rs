@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use super::diagnostic::{Diagnostic, Message, Severity};
+use super::diagnostic::{Diagnostic, Item, Message, Severity};
 use super::statements::Name;
 use super::syntax::{Parser, Span};
 use super::value::{Coercion, Data, Operand, Property, Type, Value};
@@ -240,7 +240,7 @@ impl Project {
     }
     /// Declare a read-only property whose value is the path of an output, or a list of them, which is how crates and
     /// custom commands are referred to.
-    pub(super) fn declare_outputs(&mut self, name: String, span: Span, statement: &'static str, outputs: Vec<PathBuf>) {
+    pub(super) fn declare_outputs(&mut self, name: String, span: Span, item: Item, outputs: Vec<PathBuf>) {
         if outputs.is_empty() {
             return;
         }
@@ -250,7 +250,7 @@ impl Project {
             name: name.clone(),
             ty: Type::Any,
             read_only: true,
-            info: Some(format!("the output of the {statement}")),
+            info: Some(format!("the output of the {item}")),
             default: None,
         };
         let reported = self.diagnostics.len();

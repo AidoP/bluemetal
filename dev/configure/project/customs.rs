@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::diagnostic::{Diagnostic, Message, Severity};
+use super::diagnostic::{Diagnostic, Item, Message, Severity};
 use super::statements::Name;
 use super::syntax::{Parser, Span};
 use super::value::Data;
@@ -79,7 +79,7 @@ impl Project {
     /// While its attributes are evaluated, the paths of the inputs and outputs before them are the values of the
     /// `input` and `output` properties, as lists.
     pub(super) fn parse_custom(&mut self, parser: &mut Parser, test: bool) {
-        let statement = if test { "test" } else { "custom" };
+        let item = if test { Item::Test } else { Item::CustomCommand };
         if !self.parse_space(parser) {
             parser.skip_statement();
             return;
@@ -133,7 +133,7 @@ impl Project {
                     parser.skip_line();
                     self.diagnostics.push(Diagnostic {
                         span: Some(attribute_span),
-                        message: Message::UnknownAttribute { statement, name: name.into() },
+                        message: Message::UnknownAttribute { item, name: name.into() },
                         severity: Severity::Error,
                     });
                     continue;
@@ -171,7 +171,7 @@ impl Project {
         let kind = if test { CustomKind::Test { runner: None } } else { CustomKind::Command { outputs, default } };
         let custom = Custom { name, name_span: span, inputs, command: runner.command, program: runner.program, kind };
         if self.add_custom(custom) {
-            self.declare_outputs(declared, span, "custom command", declared_outputs);
+            self.declare_outputs(declared, span, Item::CustomCommand, declared_outputs);
         }
     }
     /// Returns a command whose program, as in `run`, is a path relative to a file if it has a `/`, and which it then
@@ -196,7 +196,7 @@ impl Project {
             self.diagnostics.push(Diagnostic {
                 span: Some(custom.name_span),
                 message: Message::RedeclareCustom {
-                    statement: if custom.is_test() { "test" } else { "custom" },
+                    item: if custom.is_test() { Item::Test } else { Item::CustomCommand },
                     name: custom.name,
                     previous,
                 },
