@@ -270,6 +270,45 @@ crate bad 'b.rs'
 }
 
 #[test]
+fn check_errors_in_declaration_order() {
+    let project = Project::new("check-order", &[("Build", "\
+crate a 'a.rs'
+    use x1
+    use x2
+crate b 'b.rs'
+    use x3
+crate c 'c.rs'
+    use x4
+crate d 'd.rs'
+    target ['nope-c', 'nope-a', 'nope-b']
+set undeclared-a 1
+set undeclared-b 2
+set undeclared-c 3
+")]);
+    let output = project.configure().failed();
+    // the crates and properties are kept in hash maps, so the errors are sorted
+    let expected = [
+        "unknown target \"nope-a\"",
+        "unknown target \"nope-b\"",
+        "unknown target \"nope-c\"",
+        "property \"undeclared-a\" is undeclared",
+        "property \"undeclared-b\" is undeclared",
+        "property \"undeclared-c\" is undeclared",
+        "no crate \"x1\"",
+        "no crate \"x2\"",
+        "no crate \"x3\"",
+        "no crate \"x4\"",
+    ];
+    let mut position = 0;
+    for message in expected {
+        let Some(found) = output.stderr[position..].find(message) else {
+            panic!("{message:?} not found in order in:\n{}", output.stderr);
+        };
+        position += found + message.len();
+    }
+}
+
+#[test]
 fn unknown_target() {
     let project = Project::new("target-unknown", &[("Build", "\
 crate a 'x.rs'

@@ -151,30 +151,51 @@ impl Project {
         };
         self.values[value].data.coerce_string()
     }
+    /// Returns the keys of the crates in the order they were declared, as the crates are not kept in order.
+    ///
+    /// The crates declared by one statement, for several targets or with `@for`, are ordered by name and target.
+    pub(super) fn crate_keys(&self) -> Vec<(String, String)> {
+        let mut keys = Vec::new();
+        for key in self.crates.keys() {
+            keys.push(key.clone());
+        }
+        keys.sort_by(|lhs, rhs| {
+            let (lhs_span, rhs_span) = (self.crates[lhs].name_span, self.crates[rhs].name_span);
+            (lhs_span.file, lhs_span.offset, lhs).cmp(&(rhs_span.file, rhs_span.offset, rhs))
+        });
+        keys
+    }
     /// Check for various conditions that cannot be evaluated as errors until reading has completed.
     /// - Unknown targets for crates, as a `target` statement may come later.
     /// - Missing declarations for `set` statements.
     /// - Missing crates for `use` attributes.
     pub fn check(&mut self) {
-        // in the order they were declared, as the crates are not
-        let mut targets: Vec<_> = self.crates.values().map(|c| (c.target.clone(), c.target_span)).collect();
-        targets.sort_by_key(|(_, span)| (span.file, span.offset));
-        for (target, span) in targets {
+        let keys = self.crate_keys();
+        for key in &keys {
+            let c = &self.crates[key];
+            let target = c.target.clone();
+            let span = c.target_span;
             self.check_target(&target, span);
         }
         self.add_crate_tests();
+        // in the order the values were set, as the properties are not kept in order
+        let mut undeclared = Vec::new();
         for (name, &idx) in &self.values_idx {
-            let value = &self.values[idx];
-            if self.properties[value.property].is_none() {
-                self.diagnostics.push(Diagnostic {
-                    span: value.span,
-                    message: Message::UndeclaredProperty(name.clone()),
-                    severity: Severity::Error,
-                });
+            if self.properties[self.values[idx].property].is_none() {
+                undeclared.push(name.clone());
             }
         }
+        undeclared.sort_by_key(|name| self.values_idx[name]);
+        for name in undeclared {
+            self.diagnostics.push(Diagnostic {
+                span: self.values[self.values_idx[&name]].span,
+                message: Message::UndeclaredProperty(name),
+                severity: Severity::Error,
+            });
+        }
         let host = self.host();
-        for c in self.crates.values() {
+        for key in &keys {
+            let c = &self.crates[key];
             for used in &c.uses {
                 let mut d = self.crates.get(&(used.name.clone(), c.target.clone()));
                 // a procedural macro is for the host target, but can be used by a crate for any target

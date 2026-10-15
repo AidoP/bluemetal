@@ -205,19 +205,11 @@ impl Project {
     /// target. Tests run on the host target, or a custom target which allows tests, and the others are removed.
     pub(super) fn add_crate_tests(&mut self) {
         let host = self.host();
-        // in the order they were declared, as the crates are not
-        let mut keys = Vec::new();
-        for (key, c) in &self.crates {
-            if c.test && !c.implicit {
-                keys.push(key.clone());
-            }
-        }
-        keys.sort_by(|lhs, rhs| {
-            let (lhs_span, rhs_span) = (self.crates[lhs].name_span, self.crates[rhs].name_span);
-            (lhs_span.file, lhs_span.offset, lhs).cmp(&(rhs_span.file, rhs_span.offset, rhs))
-        });
-        for key in keys {
+        for key in self.crate_keys() {
             let c = &self.crates[&key];
+            if !c.test || c.implicit {
+                continue;
+            }
             let name = crate_test_name(c, &host);
             let span = c.name_span;
             let target_span = c.target_span;
