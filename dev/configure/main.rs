@@ -1,10 +1,12 @@
 use std::{io::IsTerminal, path::{Path, PathBuf}};
 
+mod check;
 mod database;
 mod ninja;
 mod project;
 mod rust_analyzer;
 mod target_spec;
+mod test_runner;
 
 use ninja::NinjaFile;
 
@@ -28,12 +30,12 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
         let Some(label) = args.next() else {
             return Err(Error::MissingArg("label"));
         };
-        check(&label.to_string_lossy());
+        check::check(&label.to_string_lossy());
         return Ok(());
     }
     if input == "--test" {
         let names: Vec<_> = args.map(|name| name.to_string_lossy().into_owned()).collect();
-        return test(&names);
+        return test_runner::test(&names);
     }
     let input = PathBuf::from(input);
 
@@ -373,7 +375,7 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
     }
 
     let diagnostics: Vec<Vec<_>> = units.iter()
-        .map(|unit| replayed(unit, &units).iter().map(|path| path.display().to_string()).collect())
+        .map(|unit| check::replayed(unit, &units).iter().map(|path| path.display().to_string()).collect())
         .collect();
     let flychecks = units.iter().zip(&diagnostics).map(|(unit, diagnostics)| database::Flycheck {
         label: &unit.label,
@@ -431,136 +433,6 @@ impl Unit {
     fn diagnostics(&self) -> PathBuf {
         self.check_dir().join(format!("{}.json", self.name))
     }
-}
-
-/// Returns the diagnostics to replay for a flycheck of a unit: its own, then those of the units it depends on, directly
-/// or not, which are edited.
-fn replayed(unit: &Unit, units: &[Unit]) -> Vec<PathBuf> {
-    let mut seen = vec![false; units.len()];
-    let mut stack: Vec<_> = unit.deps.iter().rev().copied().collect();
-    let mut paths = vec![unit.diagnostics()];
-    while let Some(index) = stack.pop() {
-        if std::mem::replace(&mut seen[index], true) {
-            continue;
-        }
-        if units[index].member {
-            paths.push(units[index].diagnostics());
-        }
-        stack.extend(units[index].deps.iter().rev());
-    }
-    paths
-}
-
-/// Run a flycheck for rust-analyzer, without evaluating the configuration.
-///
-/// The checks are brought up to date by ninja, then their saved diagnostics are copied to stdout, so that diagnostics
-/// are shown even when nothing needed checking. Problems are reported on stderr, which rust-analyzer ignores, as is the
-/// exit status.
-fn check(label: &str) {
-    // ninja's output is not JSON, so it is kept out of stdout
-    let status = std::process::Command::new("ninja")
-        .args(["--quiet", &format!("check/{label}")])
-        .stdout(std::io::stderr())
-        .status();
-    if let Err(error) = status {
-        eprintln!("failed to run ninja: {error}");
-    }
-    // read after ninja, which reconfigures if needed, so that it is current
-    let bytes = match std::fs::read(database::PATH) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            eprintln!("failed to read {}: {error}", database::PATH);
-            return;
-        },
-    };
-    // the entries borrow from the bytes
-    let database = match database::read(&bytes) {
-        Ok(database) => database,
-        Err(error) => {
-            eprintln!("failed to read {}: {error}", database::PATH);
-            return;
-        },
-    };
-    let Some(entry) = database.flychecks.iter().find(|entry| entry.label == label) else {
-        eprintln!("no crate with the label {label:?}");
-        return;
-    };
-    let mut stdout = std::io::stdout().lock();
-    for path in &entry.diagnostics {
-        // a check which has not run, as a dependency failed, has no diagnostics
-        if let Ok(mut file) = std::fs::File::open(path) {
-            let _ = std::io::copy(&mut file, &mut stdout);
-        }
-    }
-}
-
-/// Run tests, or all of them if no names are given, without evaluating the configuration.
-///
-/// What the tests need is built by ninja first, then each is run in turn from the project root with its output captured,
-/// which is shown if it fails.
-fn test(names: &[String]) -> Result<(), Error> {
-    let targets: Vec<_> = if names.is_empty() {
-        vec!["test".to_string()]
-    } else {
-        names.iter().map(|name| format!("test/{name}")).collect()
-    };
-    let mut ninja = std::process::Command::new("ninja");
-    ninja.args(&targets);
-    let built = match ninja.status() {
-        Ok(status) => status.success(),
-        Err(error) => return Err(Error::Exec(ninja, error)),
-    };
-    // read after ninja, which reconfigures if needed, so that it is current
-    let bytes = match std::fs::read(database::PATH) {
-        Ok(bytes) => bytes,
-        Err(error) => return Err(Error::Read(database::PATH.into(), error)),
-    };
-    let database = match database::read(&bytes) {
-        Ok(database) => database,
-        Err(error) => return Err(Error::Read(database::PATH.into(), error)),
-    };
-    // an unknown test also fails the build, as it has no target, but is the more useful error
-    let mut tests = Vec::new();
-    for name in names {
-        match database.tests.iter().find(|test| test.name == name) {
-            Some(test) => tests.push(test),
-            None => return Err(Error::UnknownTest(name.clone())),
-        }
-    }
-    if !built {
-        return Err(Error::TestBuild);
-    }
-    if names.is_empty() {
-        tests = database.tests.iter().collect();
-    }
-
-    let mut failures = Vec::new();
-    for test in &tests {
-        let output = std::process::Command::new(test.command[0])
-            .args(&test.command[1..])
-            .stdin(std::process::Stdio::null())
-            .output();
-        let failure = match output {
-            Ok(output) if output.status.success() => None,
-            Ok(output) => {
-                let mut report = format!("{}\n", output.status);
-                report.push_str(&String::from_utf8_lossy(&output.stdout));
-                report.push_str(&String::from_utf8_lossy(&output.stderr));
-                Some(report)
-            },
-            Err(error) => Some(format!("failed to run {:?}: {error}\n", test.command[0])),
-        };
-        println!("test {} ... {}", test.name, if failure.is_some() { "FAILED" } else { "ok" });
-        if let Some(report) = failure {
-            failures.push((test.name, report));
-        }
-    }
-    for (name, report) in &failures {
-        println!("\n---- {name} ----\n{}", report.trim_end());
-    }
-    let result = if failures.is_empty() { "ok" } else { "FAILED" };
-    println!("\ntest result: {result}. {} passed; {} failed", tests.len() - failures.len(), failures.len());
-    if failures.is_empty() { Ok(()) } else { Err(Error::TestsFailed(failures.len())) }
 }
 
 /// Returns the flags for compiling a crate of a kind with the flag for its target and its dependencies, as names and
