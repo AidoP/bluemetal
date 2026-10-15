@@ -1,6 +1,6 @@
 //! The lexer of the configuration language, which only reads text and knows nothing of a project.
 
-use super::Data;
+use super::value::Data;
 
 #[derive(Clone, Copy)]
 pub struct Span {

@@ -2,7 +2,8 @@
 
 use super::diagnostic::{Diagnostic, Message, Severity};
 use super::syntax::{Parser, Span};
-use super::{Data, Project};
+use super::value::Data;
+use super::Project;
 
 /// What remains of a statement after its meta-statements.
 pub(super) enum Meta {

@@ -1,6 +1,6 @@
 //! The values of properties and expressions, and their types.
 
-use super::{Parser, Span};
+use super::syntax::{Parser, Span};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Data {

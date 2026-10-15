@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use super::Span;
+use super::syntax::Span;
 
 pub struct Crate {
     pub name: String,

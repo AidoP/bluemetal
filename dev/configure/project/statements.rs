@@ -2,10 +2,11 @@
 
 use std::path::PathBuf;
 
-use super::syntax::{Parser, Span, invalid_ident_char, is_crate_reference};
+use super::diagnostic::{Diagnostic, Message, Severity};
 use super::meta::Meta;
-use super::value::{Coercion, Operand};
-use super::{Data, Diagnostic, File, Message, Project, Severity, Value};
+use super::syntax::{Parser, Span, invalid_ident_char, is_crate_reference};
+use super::value::{Coercion, Data, Operand, Value};
+use super::{File, Project};
 
 pub(super) struct Attribute<'a> {
     pub(super) name: &'a str,

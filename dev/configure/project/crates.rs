@@ -3,11 +3,11 @@
 use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
 
+use super::customs::{Custom, CustomKind};
 use super::diagnostic::{Diagnostic, Item, Message, Severity};
 use super::statements::Name;
 use super::syntax::{Parser, Span};
 use super::value::Data;
-use super::customs::{Custom, CustomKind};
 use super::{Project, rust};
 
 /// The targets a crate is declared for, from its `target` attribute or the property in effect.

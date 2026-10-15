@@ -1,8 +1,7 @@
 //! Targets declared by `target` statements.
 
 use super::diagnostic::{Diagnostic, Item, Message, Severity, suggest};
-use super::statements::Attribute;
-use super::statements::Name;
+use super::statements::{Attribute, Name};
 use super::syntax::{Parser, Span};
 use super::value::Data;
 use super::Project;

@@ -3,7 +3,9 @@
 use std::path::PathBuf;
 
 use super::functions::Arguments;
-use super::{File, Project, Property, Span};
+use super::syntax::Span;
+use super::value::Property;
+use super::{File, Project};
 
 #[derive(Clone, Copy)]
 pub enum Severity {

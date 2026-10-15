@@ -2,11 +2,11 @@
 
 use std::path::PathBuf;
 
+use super::customs::CustomKind;
 use super::diagnostic::{Diagnostic, Item, Message, Severity};
 use super::syntax::{Parser, Span, is_attribute_access};
-use super::value::{Coercion, Data, Operand};
-use super::customs::CustomKind;
 use super::targets::target_option;
+use super::value::{Coercion, Data, Operand};
 use super::Project;
 
 impl Project {

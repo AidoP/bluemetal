@@ -5,21 +5,22 @@ mod customs;
 mod diagnostic;
 mod expressions;
 mod functions;
-pub mod rust;
 mod meta;
 mod properties;
 mod references;
+pub mod rust;
 mod statements;
 mod syntax;
 mod targets;
 mod value;
 
-pub use customs::{Custom, CustomKind, Runner};
+pub use customs::CustomKind;
 pub use diagnostic::{Diagnostic, Message, Severity};
 pub use syntax::Span;
 pub use targets::CustomTarget;
 pub use value::{Data, Property, Type, Value};
-use syntax::Parser;
+
+use customs::{Custom, Runner};
 
 pub struct Project {
     root: PathBuf,
