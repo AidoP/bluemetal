@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use super::diagnostic::{Diagnostic, Message, Severity};
 use super::syntax::{Parser, Span, is_attribute_access};
 use super::value::{Coercion, Data, Operand};
-use super::{Project, TARGET_OPTIONS};
+use super::targets::TARGET_OPTIONS;
+use super::Project;
 
 impl Project {
     /// Take the rest of a reference to a crate, `<target>/<name>`, after its target, returning the path of its output.
