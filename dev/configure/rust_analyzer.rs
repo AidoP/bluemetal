@@ -33,7 +33,11 @@ fn entry(unit: &Unit, units: &[Unit]) -> String {
         .map(|&index| format!("{{ \"crate\": {index}, \"name\": {} }}", string(&units[index].name)))
         .collect();
     let cfg = if unit.test { "\"test\"" } else { "" };
-    let kind = if unit.test { "bin" } else { "lib" };
+    let kind = match unit.kind {
+        crate::project::rust::Kind::Bin => "bin",
+        crate::project::rust::Kind::Test => "test",
+        crate::project::rust::Kind::Lib | crate::project::rust::Kind::ProcMacro => "lib",
+    };
     let mut entry = String::from("        {\n");
     entry.push_str(&format!("            \"display_name\": {},\n", string(&unit.name)));
     entry.push_str(&format!("            \"root_module\": {},\n", path(&unit.root)));
@@ -45,6 +49,11 @@ fn entry(unit: &Unit, units: &[Unit]) -> String {
     };
     entry.push_str(&format!("            \"target\": {target},\n"));
     entry.push_str(&format!("            \"is_workspace_member\": {},\n", unit.member));
+    // rust-analyzer loads procedural macros itself to expand them
+    if unit.kind == crate::project::rust::Kind::ProcMacro && let Some(output) = &unit.output {
+        entry.push_str("            \"is_proc_macro\": true,\n");
+        entry.push_str(&format!("            \"proc_macro_dylib_path\": {},\n", path(output)));
+    }
     entry.push_str(&format!("            \"cfg\": [{cfg}],\n"));
     entry.push_str(&format!(
         "            \"build\": {{ \"label\": {}, \"build_file\": {}, \"target_kind\": \"{kind}\" }},\n",

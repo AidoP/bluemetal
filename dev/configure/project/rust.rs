@@ -28,17 +28,27 @@ pub struct Crate {
 pub enum Kind {
     Lib,
     Bin,
+    /// A procedural macro, which is a library for the host target, which rustc loads.
+    ProcMacro,
     /// Only a test harness.
     Test,
+}
+
+impl Kind {
+    /// The `--crate-type` of a crate of the kind.
+    pub fn crate_type(self) -> &'static str {
+        match self {
+            Kind::Lib | Kind::Test => "lib",
+            Kind::Bin => "bin",
+            Kind::ProcMacro => "proc-macro",
+        }
+    }
 }
 
 impl Crate {
     /// The `--crate-type` of the crate.
     pub fn crate_type(&self) -> &'static str {
-        match self.kind {
-            Kind::Lib | Kind::Test => "lib",
-            Kind::Bin => "bin",
-        }
+        self.kind.crate_type()
     }
     /// The library or binary built from the crate, which a crate which is only a test harness does not have.
     pub fn output(&self) -> Option<PathBuf> {
@@ -46,6 +56,14 @@ impl Crate {
             _ if self.output.is_some() => self.output.clone(),
             Kind::Lib => Some(PathBuf::from(format!("target/{}/lib{}.rlib", self.target, self.name))),
             Kind::Bin => Some(PathBuf::from(format!("target/{}/{}", self.target, self.name))),
+            // a dynamic library for the host, which configure runs on
+            Kind::ProcMacro => Some(PathBuf::from(format!(
+                "target/{}/{}{}{}",
+                self.target,
+                std::env::consts::DLL_PREFIX,
+                self.name,
+                std::env::consts::DLL_SUFFIX,
+            ))),
             Kind::Test => None,
         }
     }

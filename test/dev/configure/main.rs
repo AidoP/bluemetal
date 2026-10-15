@@ -2041,3 +2041,196 @@ log note 'e'
         .stderr("configuration failed with 4 errors");
     assert!(!output.stderr.contains("note: a\n") && !output.stderr.contains("note: c\n"), "{}", output.stderr);
 }
+
+#[test]
+fn crate_types() {
+    let project = Project::new("crate-types", &[
+        ("Build", "\
+crate answer 'answer.rs'
+    crate-type 'proc-macro'
+crate app 'app.rs'
+    crate-type 'bin'
+    use answer
+    use util
+crate util 'util.rs'
+    use answer
+set target 'riscv64gc-unknown-none-elf'
+crate kernel 'kernel.rs'
+    use answer
+"),
+        ("answer.rs", "\
+use proc_macro::TokenStream;
+#[proc_macro]
+pub fn answer(_: TokenStream) -> TokenStream { \"42\".parse().unwrap() }
+"),
+        ("app.rs", "fn main() { println!(\"{} {}\", answer::answer!(), util::twice()); }\n"),
+        ("util.rs", "pub fn twice() -> u32 { answer::answer!() * 2 }\n"),
+        ("kernel.rs", "#![no_std]\npub fn k() -> u32 { answer::answer!() }\n"),
+    ]);
+    let host = project.host();
+    let output = project.configure().ok();
+    let answer = format!("target/{host}/{}answer{}", std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX);
+    // a procedural macro is for the host target, even when another is the default, and is used by any target
+    assert_contains(output.build(&answer), &format!("\
+    crate-type = proc-macro
+    flags = --target={host} -L dependency=target/{host} --extern proc_macro"));
+    assert_contains(output.build("target/riscv64gc-unknown-none-elf/libkernel.rlib"), &format!(
+        "--extern answer={answer}",
+    ));
+    assert_contains(output.build(&format!("target/{host}/app")), "crate-type = bin");
+    // the binary is built and runs, using the procedural macro directly and through a library
+    let ninja = Command::new("ninja").arg(format!("target/{host}/app")).current_dir(&project.dir).output().unwrap();
+    assert!(ninja.status.success(), "{}", String::from_utf8_lossy(&ninja.stdout));
+    let app = Command::new(project.dir.join(format!("target/{host}/app"))).output().unwrap();
+    assert_eq!(String::from_utf8(app.stdout).unwrap(), "42 84\n");
+    // checking uses the procedural macro itself, as rustc runs it
+    let (stdout, _) = project.check(&format!("app@{host}"));
+    assert_eq!(stdout, "");
+    let json = std::fs::read_to_string(project.dir.join(".rust-project.json")).unwrap();
+    assert_contains(&json, &format!(
+        "\"is_proc_macro\": true,\n            \"proc_macro_dylib_path\": \"{}/{answer}\",",
+        std::path::absolute(&project.dir).unwrap().display(),
+    ));
+}
+
+#[test]
+fn crate_type_errors() {
+    let project = Project::new("crate-type-errors", &[("Build", "\
+crate a 'a.rs'
+    crate-type 'dylib'
+crate b 'b.rs'
+    crate-type 'proc-macro'
+    target 'riscv64gc-unknown-none-elf'
+crate tool 'tool.rs'
+    crate-type 'bin'
+crate c 'c.rs'
+    use tool
+crate d 'd.rs'
+    crate-type 5
+")]);
+    let host = project.host();
+    project.configure().failed()
+        .stderr("error: invalid crate type \"dylib\", which must be \"lib\", \"bin\" or \"proc-macro\"\n --> Build:2:16")
+        .stderr(&format!("error: procedural macros cannot be compiled for target \"riscv64gc-unknown-none-elf\", only the host target \"{host}\"\n --> Build:5:12"))
+        .stderr("error: crate \"tool\" is a binary, which cannot be used by another crate\n --> Build:9:9")
+        .stderr("error: unsigned value used where str is required\n  --> Build:11:16")
+        .stderr("configuration failed with 4 errors");
+}
+
+#[test]
+fn join_and_split() {
+    let project = Project::new("join-split", &[("Build", "\
+declare features
+    default ['+m', '+a', 1, true]
+log note join(features, ',')
+log note join([], ',') == ''
+log note join([['a', 'b'], 'c'], '/')
+log note len(split('a,,b', ','))
+log note split('a::b', '::') == ['a', 'b']
+log note split('', ',') == ['']
+log note join(split('x-y-z', '-'), '_')
+declare a
+set a split('a', '')
+set a join('a', ',')
+set a split(['a'], ',')
+")]);
+    project.configure().failed()
+        // items are converted as in a string template
+        .stderr("note: +m,+a,1,true\n")
+        .stderr("note: true\n --> Build:4:10")
+        .stderr("note: a b/c\n")
+        // empty items are kept
+        .stderr("note: 3\n")
+        .stderr("note: true\n --> Build:7:10")
+        .stderr("note: true\n --> Build:8:10")
+        .stderr("note: x_y_z\n")
+        .stderr("error: the separator cannot be empty\n  --> Build:11:18")
+        .stderr("error: str value used where list is required\n  --> Build:12:12")
+        .stderr("error: list value used where str is required\n  --> Build:13:13")
+        .stderr("configuration failed with 3 errors");
+}
+
+#[test]
+fn get_function() {
+    let project = Project::new("get", &[("Build", "\
+declare items
+    default ['a', 'b', ['c']]
+log note '{get(items, 0)} {get(items, 1)} {get(items, {'1'})}'
+log note get(items, 2) == ['c']
+log note '{get(items, 5, 'none')} {get(items, -1, 'negative')} {get([], 0, 7)}'
+declare a
+set a get(items, 3)
+set a get(items, -1)
+set a get(items)
+set a get(items, 'x')
+set a get('ab', 0)
+set a get(items, 0, 1, 2)
+")]);
+    project.configure().failed()
+        .stderr("note: a b b\n")
+        .stderr("note: true\n")
+        // the default is used for an index out of range
+        .stderr("note: none negative 7\n")
+        .stderr("error: index out of range for a list of length 3\n --> Build:7:18")
+        .stderr("error: index out of range for a list of length 3\n --> Build:8:18")
+        .stderr("error: function \"get\" takes 2 or 3 arguments, but 1 was given\n --> Build:9:7")
+        .stderr("error: str value used where integer is required\n  --> Build:10:18")
+        .stderr("error: str value used where list is required\n  --> Build:11:11")
+        .stderr("error: function \"get\" takes 2 or 3 arguments, but 4 were given\n  --> Build:12:7")
+        .stderr("configuration failed with 6 errors");
+}
+
+#[test]
+fn bitwise_operators() {
+    let project = Project::new("bitwise", &[("Build", "\
+declare flags
+    default 0x0f
+log note '{flags & 0x3} {flags | 0x30} {flags ^ 0xff} {1 << 4} {0x100 >> 4} {!0} {!flags & 0xf0}'
+log note '{1 + 2 << 1} {1 | 2 & 3} {6 & 3 == 2} {-8 >> 1} {!-1} {-1 & 1}'
+log note '{1 << 63 >> 63} {0x8000000000000000 << 1} {!{0}} {!true}'
+log note '{1 << 64}'
+log note '{1 << -1}'
+log note '{true & 1}'
+")]);
+    project.configure().failed()
+        // `!` is the complement of an integer
+        .stderr("note: 3 63 240 16 16 18446744073709551615 240\n")
+        // the precedence is the same as in Rust, and `>>` keeps the sign
+        .stderr("note: 6 3 true -4 0 1\n")
+        // bits shifted out are lost, while `{}` is taken as a boolean by `!`
+        .stderr("note: 1 0 true false\n")
+        .stderr("error: shift amount must be from 0 to 63\n --> Build:6:17")
+        .stderr("error: shift amount must be from 0 to 63\n --> Build:7:17")
+        .stderr("error: bool value used where integer is required\n --> Build:8:12")
+        .stderr("configuration failed with 3 errors");
+}
+
+#[test]
+fn min_max() {
+    let project = Project::new("min-max", &[("Build", "\
+declare sizes
+    default [4, 16, 2]
+declare offset
+    type 'signed'
+    default -5
+declare unsigned
+    type 'unsigned'
+    default 1
+log note '{min(sizes)} {max(sizes)} {min(3)} {max(1, 7, 3)} {min(sizes, 1)}'
+log note '{max([3, -1])} {min(offset, 2)} {max(offset, [0])} {max([1], [9, 2], 3)} {min({'4'}, 6)}'
+log note '{min()}'
+log note '{min([])}'
+log note '{min('a')}'
+log note '{min(offset, unsigned)}'
+")]);
+    project.configure().failed()
+        // each item of a list is a value
+        .stderr("note: 2 16 3 7 1\n")
+        // literals, including in lists, can be signed or unsigned
+        .stderr("note: 3 -5 0 9 4\n")
+        .stderr("error: function \"min\" takes at least 1 argument, but 0 were given\n  --> Build:11:12")
+        .stderr("error: there are no values to compare\n  --> Build:12:12")
+        .stderr("error: str value used where integer is required\n  --> Build:13:16")
+        .stderr("error: mismatched operand types signed and unsigned\n  --> Build:14:12")
+        .stderr("configuration failed with 4 errors");
+}

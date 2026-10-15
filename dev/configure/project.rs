@@ -143,18 +143,18 @@ impl Project {
                 });
             }
         }
+        let host = self.values_idx.get("host-target").map_or_default(|&value| self.values[value].data.coerce_string());
         for c in self.crates.values() {
             for (name, span) in &c.uses {
-                if !self.crates.contains_key(&(name.clone(), c.target.clone())) {
-                    self.diagnostics.push(Diagnostic {
-                        span: Some(*span),
-                        message: Message::UnknownCrate {
-                            name: name.clone(),
-                            target: c.target.clone(),
-                        },
-                        severity: Severity::Error,
-                    });
-                }
+                // a procedural macro is for the host target, but can be used by a crate for any target
+                let used = self.crates.get(&(name.clone(), c.target.clone()))
+                    .or_else(|| self.crates.get(&(name.clone(), host.clone())).filter(|d| d.kind == rust::Kind::ProcMacro));
+                let message = match used {
+                    None => Message::UnknownCrate { name: name.clone(), target: c.target.clone() },
+                    Some(d) if d.kind == rust::Kind::Bin => Message::UseBinary(name.clone()),
+                    Some(_) => continue,
+                };
+                self.diagnostics.push(Diagnostic { span: Some(*span), message, severity: Severity::Error });
             }
         }
     }
@@ -967,6 +967,7 @@ impl Project {
         let mut test = false;
         let mut target = None;
         let mut uses = Vec::new();
+        let mut kind = rust::Kind::Lib;
         while let Some(_) = parser.indent() {
             let Some(attribute) = self.parse_attribute(parser, &["use"]) else {
                 parser.skip_line();
@@ -976,6 +977,28 @@ impl Project {
                 "builtin" => builtin = true,
                 "default" => default = true,
                 "test" => test = true,
+                "crate-type" => match attribute.data {
+                    Data::Str(crate_type) => match crate_type.as_str() {
+                        "lib" => kind = rust::Kind::Lib,
+                        "bin" => kind = rust::Kind::Bin,
+                        "proc-macro" => kind = rust::Kind::ProcMacro,
+                        _ => self.diagnostics.push(Diagnostic {
+                            span: Some(attribute.data_span),
+                            message: Message::InvalidCrateType(crate_type),
+                            severity: Severity::Error,
+                        }),
+                    },
+                    data => self.diagnostics.push(Diagnostic {
+                        span: Some(attribute.data_span),
+                        message: Message::InvalidOperand {
+                            ty: data.type_name(),
+                            expected: "str",
+                            coerce: false,
+                            origin: attribute.origin,
+                        },
+                        severity: Severity::Error,
+                    }),
+                },
                 "target" | "use" => match attribute.data {
                     Data::Str(string) if attribute.name == "target" => {
                         target = Some((vec![string], attribute.data_span));
@@ -1008,10 +1031,21 @@ impl Project {
                 }),
             }
         }
-        // without an attribute, the crate is compiled for the `target` property in effect at its declaration
+        // a procedural macro is loaded by rustc, so it is compiled for the host target, which is otherwise the `target`
+        // property in effect at its declaration
+        let host = self.property("host-target", span).map_or_default(|(data, _)| data.coerce_string());
+        let default_target = if kind == rust::Kind::ProcMacro { "host-target" } else { "target" };
         let (targets, target_span) = target.unwrap_or_else(|| {
-            (vec![self.property("target", span).map_or_default(|(data, _)| data.coerce_string())], span)
+            (vec![self.property(default_target, span).map_or_default(|(data, _)| data.coerce_string())], span)
         });
+        if kind == rust::Kind::ProcMacro && let Some(target) = targets.iter().find(|target| **target != host) {
+            self.diagnostics.push(Diagnostic {
+                span: Some(target_span),
+                message: Message::ProcMacroTarget { target: target.clone(), host },
+                severity: Severity::Error,
+            });
+            return;
+        }
         for (i, target) in targets.iter().enumerate() {
             if targets[..i].contains(target) {
                 self.diagnostics.push(Diagnostic {
@@ -1041,7 +1075,7 @@ impl Project {
                         path_span,
                         target,
                         target_span,
-                        kind: rust::Kind::Lib,
+                        kind,
                         output: None,
                         builtin,
                         implicit: false,
@@ -1683,11 +1717,16 @@ impl Project {
                 };
                 Some(Operand { data, span, coerce: Coercion::Sign, origin: None })
             },
+            // the complement of an integer, or the negation of a boolean, as which `{}` is taken
             Some('!') => {
                 parser.expect('!');
                 let operand = self.parse_operand(parser)?;
-                let value = self.bool_operand(operand)?;
-                Some(Operand { data: Data::Bool(!value), span: parser.span_from(start), coerce: Coercion::Strict, origin: None })
+                let data = match operand.data {
+                    Data::Unsigned(i) if operand.coerce != Coercion::Any => Data::Unsigned(!i),
+                    Data::Signed(i) if operand.coerce != Coercion::Any => Data::Signed(!i),
+                    _ => Data::Bool(!self.bool_operand(operand)?),
+                };
+                Some(Operand { data, span: parser.span_from(start), coerce: Coercion::Strict, origin: None })
             },
             Some('(') => {
                 parser.expect('(');
@@ -1751,8 +1790,9 @@ impl Project {
         parser.expect('(');
         let expected = match name {
             "upper" | "lower" | "env" | "path" | "read" | "exists" | "which" | "len" => "1",
-            "starts-with" | "ends-with" | "contains" => "2",
-            "select" | "run" => "at least 1",
+            "starts-with" | "ends-with" | "contains" | "join" | "split" => "2",
+            "get" => "2 or 3",
+            "select" | "run" | "min" | "max" => "at least 1",
             "try" => "1",
             _ => {
                 self.diagnostics.push(Diagnostic {
@@ -1784,13 +1824,103 @@ impl Project {
         }
         let mut arguments = self.parse_arguments(parser, ')', |this, parser| this.parse_binary(parser, 0))?.into_iter();
         let span = parser.span_from(name_span.offset);
-        if arguments.len().to_string() != expected {
+        let count = arguments.len().to_string();
+        let at_least = expected.strip_prefix("at least ").and_then(|min| min.parse::<usize>().ok());
+        if !expected.split(" or ").any(|expected| expected == count) && !at_least.is_some_and(|min| arguments.len() >= min) {
             self.argument_count(name, expected, arguments.len(), span);
             return None;
         }
         let data = match name {
             "upper" => Data::Str(self.str_operand(arguments.next()?)?.to_uppercase()),
             // the number of items in a list, or bytes in a string
+            // the item at an index, or the default if there is one when the index is out of range
+            "get" => {
+                let items = self.list_operand(arguments.next()?)?;
+                let index = arguments.next()?;
+                let index_span = index.span;
+                let index = match self.integer_operand(index)?.data {
+                    Data::Unsigned(i) => usize::try_from(i).ok(),
+                    Data::Signed(i) => usize::try_from(i).ok(),
+                    _ => unreachable!(),
+                };
+                let default = arguments.next().map(|default| default.data);
+                match index.and_then(|index| items.get(index)) {
+                    Some(item) => item.clone(),
+                    None => match default {
+                        Some(default) => default,
+                        None => {
+                            self.diagnostics.push(Diagnostic {
+                                span: Some(index_span),
+                                message: Message::IndexOutOfRange { len: items.len() },
+                                severity: Severity::Error,
+                            });
+                            return None;
+                        },
+                    },
+                }
+            },
+            "min" | "max" => {
+                // each item of a list is a value, which may be signed or unsigned like a literal
+                let mut values = Vec::new();
+                for argument in arguments {
+                    match argument.data {
+                        Data::List(items) => values.extend(items.into_iter().map(|data| {
+                            Operand { data, span: argument.span, coerce: Coercion::Sign, origin: argument.origin }
+                        })),
+                        _ => values.push(argument),
+                    }
+                }
+                let mut values = values.into_iter();
+                let Some(first) = values.next() else {
+                    self.diagnostics.push(Diagnostic {
+                        span: Some(span),
+                        message: Message::NoValues,
+                        severity: Severity::Error,
+                    });
+                    return None;
+                };
+                let mut result = self.integer_operand(first)?;
+                for value in values {
+                    let value = self.integer_operand(value)?;
+                    let (value_span, value_coerce) = (value.span, value.coerce);
+                    let (result_span, result_coerce) = (result.span, result.coerce);
+                    let (current, other) = self.unify_sign(result, value, span)?;
+                    let ordering = match (&current, &other) {
+                        (Data::Unsigned(lhs), Data::Unsigned(rhs)) => lhs.cmp(rhs),
+                        (Data::Signed(lhs), Data::Signed(rhs)) => lhs.cmp(rhs),
+                        _ => unreachable!(),
+                    };
+                    let replace = if name == "min" { ordering.is_gt() } else { ordering.is_lt() };
+                    // the result keeps the type both are unified to
+                    result = if replace {
+                        Operand { data: other, span: value_span, coerce: value_coerce, origin: None }
+                    } else {
+                        Operand { data: current, span: result_span, coerce: result_coerce, origin: None }
+                    };
+                }
+                result.data
+            },
+            "join" => {
+                let items = self.list_operand(arguments.next()?)?;
+                let separator = self.str_operand(arguments.next()?)?;
+                let items: Vec<_> = items.iter().map(Data::coerce_string).collect();
+                Data::Str(items.join(&separator))
+            },
+            "split" => {
+                let string = self.str_operand(arguments.next()?)?;
+                let separator = arguments.next()?;
+                let separator_span = separator.span;
+                let separator = self.str_operand(separator)?;
+                if separator.is_empty() {
+                    self.diagnostics.push(Diagnostic {
+                        span: Some(separator_span),
+                        message: Message::EmptySeparator,
+                        severity: Severity::Error,
+                    });
+                    return None;
+                }
+                Data::List(string.split(&separator).map(|item| Data::Str(item.into())).collect())
+            },
             "len" => {
                 let operand = arguments.next()?;
                 match &operand.data {
@@ -2225,7 +2355,16 @@ impl Project {
                 lhs_items.extend(rhs_items);
                 Data::List(lhs_items)
             },
-            Operator::Add | Operator::Subtract | Operator::Multiply | Operator::Divide | Operator::Remainder => {
+            Operator::Add
+            | Operator::Subtract
+            | Operator::Multiply
+            | Operator::Divide
+            | Operator::Remainder
+            | Operator::BitOr
+            | Operator::BitXor
+            | Operator::BitAnd
+            | Operator::ShiftLeft
+            | Operator::ShiftRight => {
                 coerce = lhs.coerce.min(rhs.coerce);
                 let (lhs, rhs) = self.integer_operands(lhs, rhs, span)?;
                 if matches!(operator, Operator::Divide | Operator::Remainder) && matches!(rhs, Data::Unsigned(0) | Data::Signed(0)) {
@@ -2243,7 +2382,13 @@ impl Project {
                             Operator::Subtract => $lhs.checked_sub($rhs),
                             Operator::Multiply => $lhs.checked_mul($rhs),
                             Operator::Divide => $lhs.checked_div($rhs),
-                            _ => $lhs.checked_rem($rhs),
+                            Operator::Remainder => $lhs.checked_rem($rhs),
+                            Operator::BitOr => Some($lhs | $rhs),
+                            Operator::BitXor => Some($lhs ^ $rhs),
+                            Operator::BitAnd => Some($lhs & $rhs),
+                            // the amount must be less than the number of bits, while the bits shifted out are lost
+                            Operator::ShiftLeft => u32::try_from($rhs).ok().and_then(|rhs| $lhs.checked_shl(rhs)),
+                            _ => u32::try_from($rhs).ok().and_then(|rhs| $lhs.checked_shr(rhs)),
                         }
                     };
                 }
@@ -2253,9 +2398,10 @@ impl Project {
                     _ => unreachable!(),
                 };
                 let Some(data) = data else {
+                    let shift = matches!(operator, Operator::ShiftLeft | Operator::ShiftRight);
                     self.diagnostics.push(Diagnostic {
-                        span: Some(span),
-                        message: Message::IntegerOverflow,
+                        span: Some(if shift { rhs_span } else { span }),
+                        message: if shift { Message::ShiftAmount } else { Message::IntegerOverflow },
                         severity: Severity::Error,
                     });
                     return None;
@@ -2618,15 +2764,25 @@ enum Operator {
     Multiply,
     Divide,
     Remainder,
+    BitOr,
+    BitXor,
+    BitAnd,
+    ShiftLeft,
+    ShiftRight,
 }
 impl Operator {
+    /// The precedence of the operator, which is the same as in Rust.
     const fn precedence(self) -> u8 {
         match self {
             Self::Or => 0,
             Self::And => 1,
             Self::Equal | Self::NotEqual | Self::Less | Self::LessEqual | Self::Greater | Self::GreaterEqual => 2,
-            Self::Add | Self::Subtract => 3,
-            Self::Multiply | Self::Divide | Self::Remainder => 4,
+            Self::BitOr => 3,
+            Self::BitXor => 4,
+            Self::BitAnd => 5,
+            Self::ShiftLeft | Self::ShiftRight => 6,
+            Self::Add | Self::Subtract => 7,
+            Self::Multiply | Self::Divide | Self::Remainder => 8,
         }
     }
 }
@@ -2776,6 +2932,7 @@ pub enum Message {
         rhs_origin: Option<Span>,
     },
     IntegerOverflow,
+    ShiftAmount,
     DivisionByZero,
     InvalidType(String),
     ExpectedPath,
@@ -2827,6 +2984,17 @@ pub enum Message {
         target: String,
     },
     BuiltinTargetName(String),
+    InvalidCrateType(String),
+    EmptySeparator,
+    NoValues,
+    IndexOutOfRange {
+        len: usize,
+    },
+    ProcMacroTarget {
+        target: String,
+        host: String,
+    },
+    UseBinary(String),
     OverrideAttribute(String),
     RepeatedTarget(String),
     RedeclareCrate {
@@ -2897,6 +3065,7 @@ impl core::fmt::Display for Message {
             Self::InvalidOperand { ty, expected, coerce: true, .. } => write!(f, "{ty} value cannot be coerced to {expected}"),
             Self::MismatchedOperands { lhs, rhs, .. } => write!(f, "mismatched operand types {lhs} and {rhs}"),
             Self::IntegerOverflow => write!(f, "integer overflow"),
+            Self::ShiftAmount => write!(f, "shift amount must be from 0 to 63"),
             Self::DivisionByZero => write!(f, "division by zero"),
             Self::InvalidType(ty) => write!(f, "invalid data type {ty:?}"),
             Self::ExpectedPath => write!(f, "expected path"),
@@ -2918,6 +3087,17 @@ impl core::fmt::Display for Message {
             Self::RedeclareCustom { statement: "target", name, .. } => write!(f, "redeclaration of target {name:?}"),
             Self::RedeclareCustom { name, .. } => write!(f, "redeclaration of custom command {name:?}"),
             Self::NewlineInArgument => write!(f, "command arguments cannot contain a newline"),
+            Self::EmptySeparator => write!(f, "the separator cannot be empty"),
+            Self::NoValues => write!(f, "there are no values to compare"),
+            Self::IndexOutOfRange { len } => write!(f, "index out of range for a list of length {len}"),
+            Self::InvalidCrateType(name) => {
+                write!(f, "invalid crate type {name:?}, which must be \"lib\", \"bin\" or \"proc-macro\"")
+            },
+            Self::ProcMacroTarget { target, host } => write!(
+                f,
+                "procedural macros cannot be compiled for target {target:?}, only the host target {host:?}",
+            ),
+            Self::UseBinary(name) => write!(f, "crate {name:?} is a binary, which cannot be used by another crate"),
             Self::BuiltinTargetName(name) => {
                 write!(f, "{name:?} is the name of a builtin target, which can be changed with `override`")
             },
@@ -3353,6 +3533,11 @@ impl <'a> Parser<'a> {
             "*" => Operator::Multiply,
             "/" => Operator::Divide,
             "%" => Operator::Remainder,
+            "|" => Operator::BitOr,
+            "^" => Operator::BitXor,
+            "&" => Operator::BitAnd,
+            "<<" => Operator::ShiftLeft,
+            ">>" => Operator::ShiftRight,
             _ => return None,
         };
         if operator.precedence() < min_precedence {

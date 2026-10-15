@@ -124,12 +124,15 @@ A list is written as expressions in `[]`, separated by `, `, such as `['-O', 'dt
 Lists can be joined with `+` and compared with `==` and `!=`. As a string, such as in a string template, the items of
 a list are separated by spaces, while each item is a separate argument of a command, such as for `run`.
 
-Integers and integer properties can be combined with `+`, `-`, `*`, `/` and `%`, with a single space on either side
-of the operator, and grouped with `(` and `)`. Both operands must have the same type, `unsigned` or `signed`.
+Integers and integer properties can be combined with `+`, `-`, `*`, `/` and `%`, the bitwise `&`, `|` and `^`, and the
+shifts `<<` and `>>`, with a single space on either side of the operator, and grouped with `(` and `)`. Both operands
+must have the same type, `unsigned` or `signed`. A shift must be by `0` to `63` bits, and the bits shifted out are
+lost, while `>>` keeps the sign of a `signed` integer.
 
 Integers can be compared with `<`, `<=`, `>` and `>=`, and any two values of the same type with `==` and `!=`.
-A `bool` can be negated with a leading `!` and combined with `&&` and `||`. From lowest to highest, the precedence is
-`||`, `&&`, comparisons, `+` and `-`, then `*`, `/` and `%`.
+A `bool` can be negated with a leading `!` and combined with `&&` and `||`, while a leading `!` is the complement of
+an integer, except in `{}`, which it takes as a `bool`. As in Rust, from lowest to highest, the precedence is `||`,
+`&&`, comparisons, `|`, `^`, `&`, `<<` and `>>`, `+` and `-`, then `*`, `/` and `%`.
 
 An expression written in `{}` is coerced to the type the operator requires, or to the type of the other operand.
 This converts between `unsigned` and `signed`, parses a `str` as an integer or as `true` or `false`, treats a `bool`
@@ -150,6 +153,11 @@ Functions are called with their arguments in `()`, separated by `, `:
 - `env(name)`: the value of an environment variable, which must be set. The build is not reconfigured when it changes
 - `len(value)`: the number of items in a list, or of bytes in a `str`, which is UTF-8, as an `unsigned`
 - `contains(list, value)`: whether a list has an item equal to a value, as a `bool`
+- `get(list, index, default)`: the item of a list at an index, counting from `0`, or the default if the index is out of
+  range, which is an error without a default
+- `min(value, ...)` and `max(value, ...)`: the smallest or largest of integers, where each item of a list is a value
+- `join(list, separator)`: the items of a list, converted to strings as in a string template, separated by a `str`
+- `split(str, separator)`: the parts of a `str` between each non-empty separator, as a list, including empty parts
 - `path(str)`: a path relative to the directory of the file containing the expression, as a `str`. An absolute path
   is not made relative. `.` and `..` are resolved without following symbolic links
 - `read(path)`: the contents of a file, without trailing newlines, where the path is relative to the file containing
@@ -215,6 +223,10 @@ A `crate` statement may be followed by indented attributes:
   repeated, and the crate can be declared later or in another file
 - `builtin`: pass the crate with `--extern` to every crate for the same target which is not builtin, like the standard
   library. Builtin crates are not passed to each other, so a builtin crate must `use` the ones it depends on
+- `crate-type <type>`: `'lib'`, which is the default, `'bin'` for an executable, `target/<target>/<name>`, which
+  cannot be used by other crates, or `'proc-macro'` for a procedural macro. A procedural macro is compiled for the
+  host target, as rustc runs it, so it is not compiled for the `target` property, and can be used by crates for any
+  target
 - `default`: build the crate when `ninja` is run without targets
 - `test`: build the crate's tests with `--test` as `target/<target>/test/<name>`, and register a test which runs them,
   named after the crate, or as `<name>@<target>` if the target is not the host target. Only crates for the host target,

@@ -260,7 +260,7 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
         // a dependency is a library, so it has an output
         let deps: Vec<_> = externs(c, &crates).map(|(_, d)| (d.name.as_str(), d.output().unwrap())).collect();
         let (target, spec) = target_flag(&c.target);
-        let flags = rustc_flags(&target, Path::new(&format!("target/{}", c.target)), &deps);
+        let flags = rustc_flags(&target, Path::new(&format!("target/{}", c.target)), c.kind, &deps);
         let deps: Vec<_> = deps.iter().map(|(_, path)| path.as_path()).chain(spec.as_deref()).collect();
         let crate_type = c.crate_type();
         let output = c.output();
@@ -296,7 +296,9 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
         target: c.target.clone(),
         spec: target_flag(&c.target).1,
         // a library is checked without `--test`, as its metadata is used by the crates which depend on it
-        test: c.test && c.kind != project::rust::Kind::Lib,
+        test: c.test && !matches!(c.kind, project::rust::Kind::Lib | project::rust::Kind::ProcMacro),
+        kind: c.kind,
+        output: c.output(),
         deps: externs(c, &crates).map(|(index, _)| index).collect(),
         // crates from the toolchain, such as `core`, are not edited
         member: c.implicit || !rust_analyzer::absolute(&c.path).starts_with(&sysroot),
@@ -306,11 +308,19 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
     // each check is an ordinary edge which saves its diagnostics, so that a flycheck can replay them when it is up to
     // date, as rust-analyzer only shows the diagnostics from the latest flycheck
     for unit in &units {
+        // a procedural macro is run by rustc, even when checking, so its own output is used rather than its metadata
         let deps: Vec<_> = unit.deps.iter()
-            .map(|&index| (units[index].name.as_str(), units[index].check_rmeta()))
+            .map(|&index| {
+                let dep = &units[index];
+                let path = match dep.kind {
+                    project::rust::Kind::ProcMacro => dep.output.clone().unwrap(),
+                    _ => dep.check_rmeta(),
+                };
+                (dep.name.as_str(), path)
+            })
             .collect();
         let (target, spec) = target_flag(&unit.target);
-        let mut flags = rustc_flags(&target, &unit.check_dir(), &deps);
+        let mut flags = rustc_flags(&target, &unit.check_dir(), unit.kind, &deps);
         if unit.test {
             flags.push_str(" --test");
         }
@@ -326,7 +336,7 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
             implicit: &deps,
             variables: &[
                 ("crate-name", &unit.name),
-                ("crate-type", if unit.test { "bin" } else { "lib" }),
+                ("crate-type", unit.kind.crate_type()),
                 ("flags", &flags),
                 ("outdir", &outdir.display().to_string()),
                 ("diagnostics", &diagnostics.display().to_string()),
@@ -395,6 +405,9 @@ pub struct Unit {
     pub spec: Option<PathBuf>,
     /// Whether the crate is compiled as a test, as the configure tool is.
     pub test: bool,
+    pub kind: project::rust::Kind,
+    /// The library or binary built from the crate, if it has one.
+    pub output: Option<PathBuf>,
     /// The indices of the crates passed with `--extern`.
     pub deps: Vec<usize>,
     /// Whether the crate is edited, rather than part of the toolchain.
@@ -545,11 +558,16 @@ fn test(names: &[String]) -> Result<(), Error> {
     if failures.is_empty() { Ok(()) } else { Err(Error::TestsFailed(failures.len())) }
 }
 
-/// Returns the flags for compiling a crate with the flag for its target and its dependencies, as names and paths.
+/// Returns the flags for compiling a crate of a kind with the flag for its target and its dependencies, as names and
+/// paths.
 ///
 /// The outputs for a target share a directory, `search`, for the dependencies of `--extern` crates.
-fn rustc_flags(target: &str, search: &Path, deps: &[(&str, PathBuf)]) -> String {
+fn rustc_flags(target: &str, search: &Path, kind: project::rust::Kind, deps: &[(&str, PathBuf)]) -> String {
     let mut flags = format!("{target} -L dependency={}", search.display());
+    // the toolchain's `proc_macro` crate is not in the extern prelude otherwise
+    if kind == project::rust::Kind::ProcMacro {
+        flags.push_str(" --extern proc_macro");
+    }
     for (name, path) in deps {
         flags.push_str(&format!(" --extern {name}={}", path.display()));
     }
@@ -575,8 +593,10 @@ fn externs<'a>(
     crates: &'a [project::rust::Crate],
 ) -> impl Iterator<Item = (usize, &'a project::rust::Crate)> {
     crates.iter().enumerate().filter(move |(_, d)| {
-        let builtin = d.builtin && !c.builtin && !c.implicit;
-        d.target == c.target && (builtin || c.uses.iter().any(|(name, _)| *name == d.name))
+        let builtin = d.target == c.target && d.builtin && !c.builtin && !c.implicit;
+        // a procedural macro is for the host target, but can be used by a crate for any target
+        let target = d.target == c.target || d.kind == project::rust::Kind::ProcMacro;
+        builtin || target && d.kind != project::rust::Kind::Bin && c.uses.iter().any(|(name, _)| *name == d.name)
     })
 }
 
