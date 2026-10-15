@@ -2,11 +2,14 @@ use std::{collections::{HashMap, hash_map::Entry}, path::{Path, PathBuf}};
 
 pub mod rust;
 mod syntax;
+mod value;
 
 pub use syntax::Span;
+pub use value::{Data, Property, Type, Value};
 use syntax::{
     Operator, Parser, argument_end, expression_end, invalid_ident_char, is_attribute_access, is_crate_reference,
 };
+use value::{Coercion, Operand};
 
 pub struct Project {
     root: PathBuf,
@@ -2933,26 +2936,6 @@ enum RunArgument {
     Env(String, Operand),
 }
 
-/// An evaluated part of an expression.
-struct Operand {
-    data: Data,
-    span: Span,
-    coerce: Coercion,
-    /// Where the value was set, if the operand is the value of a property.
-    origin: Option<Span>,
-}
-
-/// How far an operand may be converted to the type an operator requires.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Coercion {
-    /// The operand must already have the required type.
-    Strict,
-    /// An integer literal, which may change between signed and unsigned.
-    Sign,
-    /// An expression in `{}`, which may be converted to any type.
-    Any,
-}
-
 struct Attribute<'a> {
     name: &'a str,
     name_span: Span,
@@ -3424,202 +3407,5 @@ impl Custom {
     pub fn inputs(&self, runners: &[Runner]) -> Vec<PathBuf> {
         let program = self.runner.and_then(|runner| runners[runner].program.clone());
         self.inputs.iter().cloned().chain(program).collect()
-    }
-}
-
-pub struct Property {
-    span: Option<Span>,
-    name: String,
-    ty: Type,
-    /// Whether `set` is forbidden, leaving the property with its default or builtin value.
-    read_only: bool,
-    /// A description of the property, included in diagnostics about it.
-    info: Option<String>,
-    /// The value of a `default` attribute, which has the property's type.
-    default: Option<Data>,
-}
-impl Property {
-    pub fn new(name: String, ty: Type) -> Self {
-        Self {
-            span: None,
-            name,
-            ty,
-            read_only: false,
-            info: None,
-            default: None,
-        }
-    }
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-    pub fn info(self, info: &str) -> Self {
-        Self { info: Some(info.into()), ..self }
-    }
-    pub fn read_only(self) -> Self {
-        Self { read_only: true, ..self }
-    }
-}
-
-pub enum Type {
-    Any,
-    String,
-    Bool,
-    Unsigned,
-    Signed,
-    List,
-}
-impl Type {
-    /// The name of the type, as used by `declare`.
-    fn name(&self) -> &'static str {
-        match self {
-            Type::Any => "any",
-            Type::String => "str",
-            Type::Bool => "bool",
-            Type::Unsigned => "unsigned",
-            Type::Signed => "signed",
-            Type::List => "list",
-        }
-    }
-    /// Returns the data if it has this type, or returns it as an error.
-    ///
-    /// An unsigned integer is converted for a signed type if it is in range, as a literal without a sign is unsigned.
-    fn accept(&self, data: Data) -> Result<Data, Data> {
-        match (self, data) {
-            (Type::Any, data)
-            | (Type::String, data @ Data::Str(_))
-            | (Type::Bool, data @ Data::Bool(_))
-            | (Type::Unsigned, data @ Data::Unsigned(_))
-            | (Type::Signed, data @ Data::Signed(_))
-            | (Type::List, data @ Data::List(_)) => Ok(data),
-            (Type::Signed, Data::Unsigned(i)) => i64::try_from(i).map(Data::Signed).map_err(|_| Data::Unsigned(i)),
-            (_, data) => Err(data),
-        }
-    }
-}
-
-pub struct Value {
-    property: usize,
-    span: Option<Span>,
-    data: Data,
-    data_span: Option<Span>,
-    /// Where the data was written, which is the origin of a referenced property rather than the reference itself.
-    origin: Option<Span>,
-    local: bool,
-}
-impl Value {
-    pub fn new(property: usize, data: Data) -> Self {
-        Self {
-            property,
-            span: None,
-            data,
-            data_span: None,
-            origin: None,
-            local: false,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum Data {
-    None,
-    Str(String),
-    Bool(bool),
-    Unsigned(u64),
-    Signed(i64),
-    List(Vec<Data>),
-}
-impl Data {
-    /// Returns the name of the type as used by `declare`.
-    pub fn type_name(&self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Str(_) => "str",
-            Self::Bool(_) => "bool",
-            Self::Unsigned(_) => "unsigned",
-            Self::Signed(_) => "signed",
-            Self::List(_) => "list",
-        }
-    }
-    pub fn is_integer(&self) -> bool {
-        matches!(self, Self::Unsigned(_) | Self::Signed(_))
-    }
-    /// Convert to an integer: a `bool` is `0` or `1` and a `str` is parsed.
-    pub fn coerce_integer(&self) -> Option<Self> {
-        match self {
-            Self::None => None,
-            Self::Str(string) => {
-                let mut parser = Parser::new(0, string);
-                match parser.integer() {
-                    Some((data, _)) if parser.is_empty() => Some(data),
-                    _ => None,
-                }
-            },
-            Self::Bool(value) => Some(Self::Unsigned(*value as u64)),
-            Self::Unsigned(_) | Self::Signed(_) => Some(self.clone()),
-            Self::List(_) => None,
-        }
-    }
-    /// Convert to a boolean: an integer is true if it is not zero and a `str` must be `true` or `false`.
-    pub fn coerce_bool(&self) -> Option<bool> {
-        match self {
-            Self::None => None,
-            Self::Str(string) => match string.as_str() {
-                "true" => Some(true),
-                "false" => Some(false),
-                _ => None,
-            },
-            Self::Bool(value) => Some(*value),
-            Self::Unsigned(i) => Some(*i != 0),
-            Self::Signed(i) => Some(*i != 0),
-            Self::List(_) => None,
-        }
-    }
-    /// Convert to the type of `other`.
-    pub fn coerce_like(&self, other: &Self) -> Option<Self> {
-        match other {
-            Self::None => None,
-            Self::Str(_) => Some(Self::Str(self.coerce_string())),
-            Self::Bool(_) => self.coerce_bool().map(Self::Bool),
-            Self::Unsigned(_) | Self::Signed(_) => {
-                let integer = self.coerce_integer()?;
-                if integer.type_name() == other.type_name() {
-                    Some(integer)
-                } else {
-                    integer.convert_sign()
-                }
-            },
-            // a single value is not converted to a list, as it would be ambiguous with a list of values
-            Self::List(_) => None,
-        }
-    }
-    /// Convert between a signed and unsigned integer, if the value can be represented.
-    pub fn convert_sign(&self) -> Option<Self> {
-        match self {
-            Self::Unsigned(i) => i64::try_from(*i).ok().map(Self::Signed),
-            Self::Signed(i) => u64::try_from(*i).ok().map(Self::Unsigned),
-            _ => None,
-        }
-    }
-    /// Convert to a string, where the items of a list are separated by spaces.
-    pub fn coerce_string(&self) -> String {
-        match self {
-            Self::None => String::new(),
-            Self::Str(s) => s.clone(),
-            Self::Bool(b) => b.to_string(),
-            Self::Unsigned(i) => i.to_string(),
-            Self::Signed(i) => i.to_string(),
-            Self::List(items) => {
-                let items: Vec<_> = items.iter().map(Self::coerce_string).collect();
-                items.join(" ")
-            },
-        }
-    }
-    /// Returns the strings of a value which is spread into several, such as arguments: each item of a list, or a single
-    /// value.
-    pub fn spread(&self) -> Vec<String> {
-        match self {
-            Self::List(items) => items.iter().flat_map(Self::spread).collect(),
-            data => vec![data.coerce_string()],
-        }
     }
 }
