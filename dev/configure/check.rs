@@ -12,9 +12,10 @@ pub fn replayed(unit: &Unit, units: &[Unit]) -> Vec<PathBuf> {
     let mut stack: Vec<_> = unit.deps.iter().rev().copied().collect();
     let mut paths = vec![unit.diagnostics()];
     while let Some(index) = stack.pop() {
-        if std::mem::replace(&mut seen[index], true) {
+        if seen[index] {
             continue;
         }
+        seen[index] = true;
         if units[index].member {
             paths.push(units[index].diagnostics());
         }

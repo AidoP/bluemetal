@@ -244,7 +244,6 @@ impl Project {
         if outputs.is_empty() {
             return;
         }
-        let mut items: Vec<_> = outputs.iter().map(|path| Data::Str(path.display().to_string())).collect();
         let property = Property {
             span: Some(span),
             name: name.clone(),
@@ -258,6 +257,11 @@ impl Project {
         // a property with the name has been declared already
         if self.diagnostics.len() > reported {
             return;
+        }
+        // a single output is a string, rather than a list
+        let mut items = Vec::new();
+        for path in &outputs {
+            items.push(Data::Str(path.display().to_string()));
         }
         let data = if items.len() == 1 { items.remove(0) } else { Data::List(items) };
         self.set(name, Value { property: id, span: Some(span), data, data_span: Some(span), origin: Some(span), local: false });
