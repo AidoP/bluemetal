@@ -3,63 +3,99 @@
 use std::path::PathBuf;
 
 use crate::project::{CustomTarget, Data};
+use crate::rust_analyzer::string;
 
 /// The specification of a custom target.
 pub fn path(name: &str) -> PathBuf {
     PathBuf::from(format!("target/targets/{name}.json"))
 }
 
+/// A field of a JSON object, whose value is kept as JSON so that it is written as it was read.
+#[derive(Debug, PartialEq)]
+struct JsonField {
+    name: String,
+    /// The JSON of the value.
+    json: String,
+}
+
 /// Returns the specification of a target, from the specification of the builtin target it inherits, if any, with its
 /// fields replaced or added.
 pub fn spec(target: &CustomTarget, inherited: Option<&str>) -> Result<String, &'static str> {
-    let mut fields = match inherited {
-        Some(json) => object_fields(json).ok_or("invalid target specification from rustc")?,
-        None => Vec::new(),
-    };
+    let mut fields = Vec::new();
+    if let Some(inherited) = inherited {
+        let Some(inherited) = object_fields(inherited) else {
+            return Err("invalid target specification from rustc");
+        };
+        fields = inherited;
+    }
     for field in &target.fields {
-        let value = json(&field.value);
-        match fields.iter_mut().find(|(name, _)| *name == field.name) {
-            Some((_, inherited)) => *inherited = value,
-            None => fields.push((field.name.clone(), value)),
+        let json = json(&field.value);
+        // a field replaces an inherited one in place, so that the order of the inherited fields is kept
+        match fields.iter_mut().find(|inherited| inherited.name == field.name) {
+            Some(inherited) => inherited.json = json,
+            None => fields.push(JsonField { name: field.name.clone(), json }),
         }
     }
-    let fields: Vec<_> = fields.iter().map(|(name, value)| format!("  {}: {value}", crate::rust_analyzer::string(name))).collect();
-    Ok(format!("{{\n{}\n}}\n", fields.join(",\n")))
+    let mut spec = String::from("{\n");
+    for (i, field) in fields.iter().enumerate() {
+        if i > 0 {
+            spec.push_str(",\n");
+        }
+        spec.push_str(&format!("  {}: {}", string(&field.name), field.json));
+    }
+    spec.push_str("\n}\n");
+    Ok(spec)
 }
 
 /// Returns a value as JSON.
 fn json(data: &Data) -> String {
     match data {
         Data::None => "null".into(),
-        Data::Str(s) => crate::rust_analyzer::string(s),
+        Data::Str(s) => string(s),
         Data::Bool(b) => b.to_string(),
         Data::Unsigned(i) => i.to_string(),
         Data::Signed(i) => i.to_string(),
         Data::List(items) => {
-            let items: Vec<_> = items.iter().map(json).collect();
-            format!("[{}]", items.join(", "))
+            let mut json = String::from("[");
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    json.push_str(", ");
+                }
+                json.push_str(&self::json(item));
+            }
+            json.push(']');
+            json
         },
     }
 }
 
-/// Split a JSON object into its fields, as names and the JSON of their values, which are kept as they are.
-fn object_fields(json: &str) -> Option<Vec<(String, String)>> {
+/// Split a JSON object into its fields, or return [`None`] if it is not an object.
+fn object_fields(json: &str) -> Option<Vec<JsonField>> {
     let mut rest = json.trim().strip_prefix('{')?.trim_start();
     let mut fields = Vec::new();
     if let Some(after) = rest.strip_prefix('}') {
-        return after.trim().is_empty().then_some(fields);
+        if !after.trim().is_empty() {
+            return None;
+        }
+        return Some(fields);
     }
     loop {
         // the names of specification fields do not need escapes
-        let name_end = rest.strip_prefix('"')?.find('"')?;
-        let name = rest[1..1 + name_end].to_string();
-        rest = rest[name_end + 2..].trim_start().strip_prefix(':')?.trim_start();
+        let quoted = rest.strip_prefix('"')?;
+        let name_end = quoted.find('"')?;
+        let name = quoted[..name_end].to_string();
+        rest = quoted[name_end + 1..].trim_start().strip_prefix(':')?.trim_start();
         let len = value_len(rest)?;
-        fields.push((name, rest[..len].trim_end().to_string()));
+        fields.push(JsonField { name, json: rest[..len].trim_end().to_string() });
         rest = rest[len..].trim_start();
         match rest.as_bytes().first()? {
             b',' => rest = rest[1..].trim_start(),
-            b'}' => return rest[1..].trim().is_empty().then_some(fields),
+            b'}' => {
+                if !rest[1..].trim().is_empty() {
+                    return None;
+                }
+                return Some(fields);
+            },
             _ => return None,
         }
     }
@@ -84,7 +120,11 @@ fn value_len(s: &str) -> Option<usize> {
         }
         i += 1;
     }
-    (depth == 0 && !in_string).then_some(bytes.len())
+    // the value is the rest of `s`, which must be complete
+    if depth != 0 || in_string {
+        return None;
+    }
+    Some(bytes.len())
 }
 
 #[cfg(test)]
@@ -99,11 +139,12 @@ mod tests {
   "list": [1, [2, 3]],
   "flag": true
 }"#;
+        let field = |name: &str, json: &str| JsonField { name: name.into(), json: json.into() };
         assert_eq!(object_fields(json).unwrap(), [
-            ("arch".to_string(), "\"riscv64\"".to_string()),
-            ("metadata".into(), r#"{ "description": "a, \"b\" {", "tier": 2 }"#.into()),
-            ("list".into(), "[1, [2, 3]]".into()),
-            ("flag".into(), "true".into()),
+            field("arch", "\"riscv64\""),
+            field("metadata", r#"{ "description": "a, \"b\" {", "tier": 2 }"#),
+            field("list", "[1, [2, 3]]"),
+            field("flag", "true"),
         ]);
         assert_eq!(object_fields("{}").unwrap(), []);
         assert!(object_fields("{\"a\": 1").is_none());
