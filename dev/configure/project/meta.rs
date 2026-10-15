@@ -14,6 +14,37 @@ pub(super) enum Meta {
     Done,
 }
 
+/// What the meta-statements of a statement have decided so far.
+struct MetaState {
+    /// Whether the statement is processed, as far as the conditions so far.
+    active: bool,
+    /// Whether the statement is conditional, so that it starts or continues a chain.
+    conditional: bool,
+    /// Whether the chain had already processed a statement, if this statement continues it with `@else`.
+    continues: Option<bool>,
+    /// Whether a meta-statement is invalid, which skips the statement, and any `@else` after it.
+    failed: bool,
+}
+impl MetaState {
+    /// The chain after the statement, given whether it is processed: whether any statement in the chain has been
+    /// processed, or [`None`] if the statement is unconditional.
+    fn chain(&self, processed: bool) -> Option<bool> {
+        match self.continues {
+            Some(previous) => Some(previous || processed),
+            None if self.conditional => Some(processed),
+            None => None,
+        }
+    }
+}
+
+/// The header of a `@for`.
+struct ForLoop {
+    /// The property which takes each value in turn, as a local.
+    name: String,
+    /// The values, where each item of a list is a value.
+    values: Vec<Data>,
+}
+
 impl Project {
     /// Take the meta-statements which precede a statement, returning whether the statement should be processed.
     ///
@@ -25,41 +56,35 @@ impl Project {
     ///
     /// `@for` processes the meta-statements and statement after it for each value, leaving nothing more to process.
     pub(super) fn parse_meta(&mut self, parser: &mut Parser, chain: &mut Option<bool>) -> Meta {
-        let mut active = true;
-        // whether the statement is conditional, so that it starts or continues a chain
-        let mut conditional = false;
-        // whether the chain had already processed a statement, if this statement continues it with `@else`
-        let mut continues = None;
-        // an invalid meta-statement skips the statement, and any `@else` after it
-        let mut failed = false;
+        let mut state = MetaState { active: true, conditional: false, continues: None, failed: false };
         let mut first = true;
         while parser.peek() == Some('@') {
             let start = parser.offset;
             parser.expect('@');
             let Some((name, span)) = self.parse_ident(parser) else {
                 parser.skip_line();
-                failed = true;
+                state.failed = true;
                 continue;
             };
             let meta_span = Span { file: span.file, offset: start, len: span.offset + span.len - start };
             match name {
                 "if" => {
-                    conditional = true;
-                    if !active {
+                    state.conditional = true;
+                    if !state.active {
                         parser.skip_line();
                     } else if let Some(condition) = self.parse_condition(parser) {
-                        active = condition;
+                        state.active = condition;
                     } else {
-                        failed = true;
+                        state.failed = true;
                     }
                 },
                 // a skipped statement is not repeated
-                "for" if !active || failed => {
+                "for" if !state.active || state.failed => {
                     parser.skip_line();
                 },
                 "for" => {
-                    let Some((name, values)) = self.parse_for(parser) else {
-                        failed = true;
+                    let Some(for_loop) = self.parse_for(parser) else {
+                        state.failed = true;
                         continue;
                     };
                     if matches!(parser.peek(), None | Some('\n' | '#')) {
@@ -71,30 +96,9 @@ impl Project {
                         *chain = None;
                         return Meta::Skip;
                     }
-                    *chain = match continues {
-                        Some(_) => Some(true),
-                        None if conditional => Some(true),
-                        None => None,
-                    };
-                    let body = parser.offset;
-                    let previous = self.files[parser.file].locals.get(&name).copied();
-                    for value in &values {
-                        parser.offset = body;
-                        self.set_local(&name, value.clone(), parser.file);
-                        self.parse_statement(parser, &mut None);
-                    }
-                    match previous {
-                        Some(previous) => self.files[parser.file].locals.insert(name, previous),
-                        None => self.files[parser.file].locals.remove(&name),
-                    };
-                    if !values.is_empty() {
-                        return Meta::Done;
-                    }
-                    // without any values, the rest is skipped
-                    while parser.peek() == Some('@') {
-                        parser.skip_line();
-                    }
-                    return Meta::Skip;
+                    // a statement with `@for` counts as processed in its chain, even without any values
+                    *chain = state.chain(true);
+                    return self.repeat(parser, for_loop);
                 },
                 // `@then` is taken with the statement before it
                 "then" => {
@@ -104,14 +108,14 @@ impl Project {
                         message: Message::ThenWithoutStatement,
                         severity: Severity::Error,
                     });
-                    failed = true;
+                    state.failed = true;
                 },
                 "else" | "else-if" => {
-                    conditional = true;
+                    state.conditional = true;
                     match *chain {
                         Some(processed) if first => {
-                            continues = Some(processed);
-                            active &= !processed;
+                            state.continues = Some(processed);
+                            state.active &= !processed;
                         },
                         _ => {
                             let message = if first {
@@ -124,20 +128,20 @@ impl Project {
                                 message,
                                 severity: Severity::Error,
                             });
-                            failed = true;
+                            state.failed = true;
                         },
                     }
                     if name == "else" {
                         if !self.parse_line_end(parser) {
                             parser.skip_line();
-                            failed = true;
+                            state.failed = true;
                         }
-                    } else if !active || failed {
+                    } else if !state.active || state.failed {
                         parser.skip_line();
                     } else if let Some(condition) = self.parse_condition(parser) {
-                        active = condition;
+                        state.active = condition;
                     } else {
-                        failed = true;
+                        state.failed = true;
                     }
                 },
                 _ => {
@@ -147,7 +151,7 @@ impl Project {
                         message: Message::UnknownMetaStatement(name.into()),
                         severity: Severity::Error,
                     });
-                    failed = true;
+                    state.failed = true;
                 },
             }
             first = false;
@@ -161,56 +165,78 @@ impl Project {
                 return Meta::Skip;
             }
         }
-        if failed {
+        if state.failed {
             *chain = Some(true);
             return Meta::Skip;
         }
-        *chain = match continues {
-            Some(processed) => Some(processed || active),
-            None if conditional => Some(active),
-            None => None,
-        };
-        if active { Meta::Process } else { Meta::Skip }
+        *chain = state.chain(state.active);
+        if state.active { Meta::Process } else { Meta::Skip }
     }
-    /// Take the rest of a `@for`, a property and the values it takes, separated by spaces, where each item of a list is
-    /// a value.
-    fn parse_for(&mut self, parser: &mut Parser) -> Option<(String, Vec<Data>)> {
-        let header = (|| {
-            if !self.parse_space(parser) {
-                return None;
-            }
-            let (name, _, _) = self.parse_name(parser)?;
-            if !self.parse_space(parser) {
-                return None;
-            }
-            if !matches!(parser.as_str().strip_prefix("in"), Some(rest) if rest.starts_with([' ', '\n'])) {
-                self.diagnostics.push(Diagnostic {
-                    span: Some(parser.span_until(|c| c == ' ' || c == '\n')),
-                    message: Message::ExpectedExact("in"),
-                    severity: Severity::Error,
-                });
-                return None;
-            }
-            parser.offset += 2;
-            let mut values = Vec::new();
-            loop {
-                if !self.parse_space(parser) {
-                    return None;
-                }
-                match self.parse_expression(parser)?.data {
-                    Data::List(items) => values.extend(items),
-                    data => values.push(data),
-                }
-                if parser.peek() != Some(' ') {
-                    break;
-                }
-            }
-            self.parse_line_end(parser).then_some((name, values))
-        })();
-        if header.is_none() {
+    /// Process the meta-statements and statement after a `@for` for each of its values, with the property as a local.
+    fn repeat(&mut self, parser: &mut Parser, for_loop: ForLoop) -> Meta {
+        let body = parser.offset;
+        let previous = self.files[parser.file].locals.get(&for_loop.name).copied();
+        for value in &for_loop.values {
+            parser.offset = body;
+            self.set_local(&for_loop.name, value.clone(), parser.file);
+            self.parse_statement(parser, &mut None);
+        }
+        match previous {
+            Some(previous) => self.files[parser.file].locals.insert(for_loop.name, previous),
+            None => self.files[parser.file].locals.remove(&for_loop.name),
+        };
+        if !for_loop.values.is_empty() {
+            return Meta::Done;
+        }
+        // without any values, the rest is skipped
+        while parser.peek() == Some('@') {
             parser.skip_line();
         }
-        header
+        Meta::Skip
+    }
+    /// Take the rest of a `@for`, skipping the line if it is invalid.
+    fn parse_for(&mut self, parser: &mut Parser) -> Option<ForLoop> {
+        let for_loop = self.parse_for_header(parser);
+        if for_loop.is_none() {
+            parser.skip_line();
+        }
+        for_loop
+    }
+    /// Take the rest of a `@for`, a property and the values it takes, separated by spaces.
+    fn parse_for_header(&mut self, parser: &mut Parser) -> Option<ForLoop> {
+        if !self.parse_space(parser) {
+            return None;
+        }
+        let (name, _, _) = self.parse_name(parser)?;
+        if !self.parse_space(parser) {
+            return None;
+        }
+        if !matches!(parser.as_str().strip_prefix("in"), Some(rest) if rest.starts_with([' ', '\n'])) {
+            self.diagnostics.push(Diagnostic {
+                span: Some(parser.span_until(|c| c == ' ' || c == '\n')),
+                message: Message::ExpectedExact("in"),
+                severity: Severity::Error,
+            });
+            return None;
+        }
+        parser.offset += 2;
+        let mut values = Vec::new();
+        loop {
+            if !self.parse_space(parser) {
+                return None;
+            }
+            match self.parse_expression(parser)?.data {
+                Data::List(items) => values.extend(items),
+                data => values.push(data),
+            }
+            if parser.peek() != Some(' ') {
+                break;
+            }
+        }
+        if !self.parse_line_end(parser) {
+            return None;
+        }
+        Some(ForLoop { name, values })
     }
     /// Take the condition of an `@if` to the end of the line, returning [`None`] if it is invalid.
     fn parse_condition(&mut self, parser: &mut Parser) -> Option<bool> {
