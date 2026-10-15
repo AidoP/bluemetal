@@ -7,6 +7,69 @@ use super::syntax::{Parser, Span, argument_end, expression_end};
 use super::value::{Coercion, Data, Operand};
 use super::{Project, normalize};
 
+/// A function which can be called in an expression.
+struct Function {
+    name: &'static str,
+    /// The number of arguments the function takes.
+    arguments: Arguments,
+}
+
+/// The functions which can be called in an expression.
+const FUNCTIONS: &[Function] = &[
+    Function { name: "upper", arguments: Arguments::Exactly(1) },
+    Function { name: "lower", arguments: Arguments::Exactly(1) },
+    Function { name: "env", arguments: Arguments::Exactly(1) },
+    Function { name: "path", arguments: Arguments::Exactly(1) },
+    Function { name: "read", arguments: Arguments::Exactly(1) },
+    Function { name: "exists", arguments: Arguments::Exactly(1) },
+    Function { name: "which", arguments: Arguments::Exactly(1) },
+    Function { name: "len", arguments: Arguments::Exactly(1) },
+    Function { name: "starts-with", arguments: Arguments::Exactly(2) },
+    Function { name: "ends-with", arguments: Arguments::Exactly(2) },
+    Function { name: "contains", arguments: Arguments::Exactly(2) },
+    Function { name: "join", arguments: Arguments::Exactly(2) },
+    Function { name: "split", arguments: Arguments::Exactly(2) },
+    Function { name: "get", arguments: Arguments::Either(2, 3) },
+    Function { name: "select", arguments: Arguments::AtLeast(1) },
+    Function { name: "run", arguments: Arguments::AtLeast(1) },
+    Function { name: "min", arguments: Arguments::AtLeast(1) },
+    Function { name: "max", arguments: Arguments::AtLeast(1) },
+    // the first argument is evaluated with its errors as warnings
+    Function { name: "try", arguments: Arguments::Exactly(2) },
+];
+
+/// The number of arguments a function takes.
+#[derive(Clone, Copy)]
+pub enum Arguments {
+    Exactly(usize),
+    /// Either of two numbers of arguments.
+    Either(usize, usize),
+    AtLeast(usize),
+}
+impl Arguments {
+    /// Returns whether a function can be called with `count` arguments.
+    fn accepts(self, count: usize) -> bool {
+        match self {
+            Self::Exactly(expected) => count == expected,
+            Self::Either(first, second) => count == first || count == second,
+            Self::AtLeast(min) => count >= min,
+        }
+    }
+    /// Returns whether the number ends with 1, so that it is followed by "argument" rather than "arguments".
+    pub fn singular(self) -> bool {
+        matches!(self, Self::Exactly(1) | Self::Either(_, 1) | Self::AtLeast(1))
+    }
+}
+impl core::fmt::Display for Arguments {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Exactly(expected) => write!(f, "{expected}"),
+            Self::Either(first, second) => write!(f, "{first} or {second}"),
+            Self::AtLeast(min) => write!(f, "at least {min}"),
+        }
+    }
+}
+
 /// An argument of the `run` function.
 enum RunArgument {
     Positional(Operand),
@@ -20,21 +83,15 @@ impl Project {
     /// Arguments are separated by `, ` and are expressions, except for `select`, which takes property names.
     pub(super) fn parse_call(&mut self, parser: &mut Parser, name: &str, name_span: Span) -> Option<Operand> {
         parser.expect('(');
-        let expected = match name {
-            "upper" | "lower" | "env" | "path" | "read" | "exists" | "which" | "len" => "1",
-            "starts-with" | "ends-with" | "contains" | "join" | "split" => "2",
-            "get" => "2 or 3",
-            "select" | "run" | "min" | "max" => "at least 1",
-            "try" => "2",
-            _ => {
-                self.diagnostics.push(Diagnostic {
-                    span: Some(name_span),
-                    message: Message::UnknownFunction(name.into()),
-                    severity: Severity::Error,
-                });
-                return None;
-            },
+        let Some(function) = FUNCTIONS.iter().find(|function| function.name == name) else {
+            self.diagnostics.push(Diagnostic {
+                span: Some(name_span),
+                message: Message::UnknownFunction(name.into()),
+                severity: Severity::Error,
+            });
+            return None;
         };
+        let expected = function.arguments;
         if name == "try" {
             return self.parse_try(parser, name_span);
         }
@@ -56,9 +113,7 @@ impl Project {
         }
         let mut arguments = self.parse_arguments(parser, ')', |this, parser| this.parse_binary(parser, 0))?.into_iter();
         let span = parser.span_from(name_span.offset);
-        let count = arguments.len().to_string();
-        let at_least = expected.strip_prefix("at least ").and_then(|min| min.parse::<usize>().ok());
-        if !expected.split(" or ").any(|expected| expected == count) && !at_least.is_some_and(|min| arguments.len() >= min) {
+        if !expected.accepts(arguments.len()) {
             self.argument_count(name, expected, arguments.len(), span);
             return None;
         }
@@ -277,7 +332,7 @@ impl Project {
         // the default is required, and its errors are not suppressed
         if !parser.as_str().starts_with(", ") {
             parser.expect(')');
-            self.argument_count("try", "2", 1, parser.span_from(name_span.offset));
+            self.argument_count("try", Arguments::Exactly(2), 1, parser.span_from(name_span.offset));
             return None;
         }
         parser.offset += 2;
@@ -346,7 +401,7 @@ impl Project {
             return None;
         }
         let Some((program, args)) = command_line.split_first() else {
-            self.argument_count("run", "at least 1", 0, span);
+            self.argument_count("run", Arguments::AtLeast(1), 0, span);
             return None;
         };
         // as in `sh`, a program with a `/` is a path, here relative to the file, otherwise it is searched for in `PATH`
@@ -452,7 +507,7 @@ impl Project {
             parser.offset += 2;
         }
     }
-    fn argument_count(&mut self, function: &str, expected: &'static str, found: usize, span: Span) {
+    fn argument_count(&mut self, function: &str, expected: Arguments, found: usize, span: Span) {
         self.diagnostics.push(Diagnostic {
             span: Some(span),
             message: Message::ArgumentCount { function: function.into(), expected, found },

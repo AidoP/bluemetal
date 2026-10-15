@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use super::functions::Arguments;
 use super::{File, Project, Property, Span};
 
 #[derive(Clone, Copy)]
@@ -51,7 +52,7 @@ pub enum Message {
     ExpectedSeparator(char),
     ArgumentCount {
         function: String,
-        expected: &'static str,
+        expected: Arguments,
         found: usize,
     },
     NoneSelected(Vec<String>),
@@ -226,7 +227,7 @@ impl core::fmt::Display for Message {
             Self::UnknownFunction(name) => write!(f, "unknown function {name:?}"),
             Self::ExpectedSeparator(close) => write!(f, "expected \", \" or \"{close}\""),
             Self::ArgumentCount { function, expected, found } => {
-                let suffix = if expected.ends_with(" 1") || *expected == "1" { "" } else { "s" };
+                let suffix = if expected.singular() { "" } else { "s" };
                 let verb = if *found == 1 { "was" } else { "were" };
                 write!(f, "function {function:?} takes {expected} argument{suffix}, but {found} {verb} given")
             },
