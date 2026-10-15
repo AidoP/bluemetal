@@ -86,6 +86,18 @@ pub struct CustomTarget {
     pub runner: Option<usize>,
 }
 
+impl CustomTarget {
+    /// Returns the value of a field of the specification, if it is replaced.
+    pub(super) fn field(&self, name: &str) -> Option<&Data> {
+        for field in &self.fields {
+            if field.name == name {
+                return Some(&field.value);
+            }
+        }
+        None
+    }
+}
+
 impl Project {
     /// Take a custom target, whose attributes are `inherit`, the builtin target whose specification it is based on, and
     /// the fields of its specification which may be replaced.

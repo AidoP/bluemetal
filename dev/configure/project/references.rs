@@ -31,41 +31,48 @@ impl Project {
         }
         let (attribute, attribute_span) = self.parse_attribute_access(parser)?;
         let c = &self.crates[&(name.to_string(), target)];
-        let data = match attribute {
-            "target" => Some(Data::Str(c.target.clone())),
-            "crate-type" => Some(Data::Str(c.kind.crate_type().into())),
-            "path" => Some(Data::Str(c.path.display().to_string())),
-            "builtin" => Some(Data::Bool(c.builtin)),
-            "default" => Some(Data::Bool(c.default)),
-            "test" => Some(Data::Bool(c.test)),
-            "use" => Some(Data::List(c.uses.iter().map(|used| Data::Str(used.name.clone())).collect())),
-            _ => None,
+        let value = match attribute {
+            "target" => AttributeValue::Set(Data::Str(c.target.clone())),
+            "crate-type" => AttributeValue::Set(Data::Str(c.kind.crate_type().into())),
+            "path" => AttributeValue::Set(Data::Str(c.path.display().to_string())),
+            "builtin" => AttributeValue::Set(Data::Bool(c.builtin)),
+            "default" => AttributeValue::Set(Data::Bool(c.default)),
+            "test" => AttributeValue::Set(Data::Bool(c.test)),
+            "use" => {
+                let mut names = Vec::new();
+                for used in &c.uses {
+                    names.push(Data::Str(used.name.clone()));
+                }
+                AttributeValue::Set(Data::List(names))
+            },
+            _ => AttributeValue::Unknown,
         };
-        self.attribute_value("crate", name, attribute, attribute_span, data.map(Some), start, parser)
+        self.attribute_value("crate", name, attribute, attribute_span, value, start, parser)
     }
     /// Take the name of an attribute after a `.`, which is at the parser.
     fn parse_attribute_access<'a>(&mut self, parser: &mut Parser<'a>) -> Option<(&'a str, Span)> {
         parser.expect('.');
         self.parse_ident(parser)
     }
-    /// Returns the value of an attribute, where `data` is [`None`] for an unknown attribute, or [`Some`] of [`None`] for
-    /// one which is not set.
+    /// Returns the value of an attribute as an operand, or reports an attribute which is unknown or not set.
     fn attribute_value(
         &mut self,
         kind: &'static str,
         name: &str,
         attribute: &str,
         attribute_span: Span,
-        data: Option<Option<Data>>,
+        value: AttributeValue,
         start: usize,
         parser: &Parser,
     ) -> Option<Operand> {
-        let message = match data {
-            Some(Some(data)) => {
+        let message = match value {
+            AttributeValue::Set(data) => {
                 return Some(Operand { data, span: parser.span_from(start), coerce: Coercion::Strict, origin: None });
             },
-            Some(None) => Message::AttributeNotSet { kind, name: name.into(), attribute: attribute.into() },
-            None => Message::UnknownAttributeOf { kind, name: name.into(), attribute: attribute.into() },
+            AttributeValue::Unset => Message::AttributeNotSet { kind, name: name.into(), attribute: attribute.into() },
+            AttributeValue::Unknown => {
+                Message::UnknownAttributeOf { kind, name: name.into(), attribute: attribute.into() }
+            },
         };
         self.diagnostics.push(Diagnostic { span: Some(attribute_span), message, severity: Severity::Error });
         None
@@ -78,58 +85,92 @@ impl Project {
         let (attribute, attribute_span) = self.parse_attribute_access(parser)?;
         let custom = self.customs.iter().find(|custom| !custom.is_test() && custom.name == name);
         if let Some(custom) = custom && let CustomKind::Command { outputs, default } = &custom.kind {
-            let paths = |paths: &[PathBuf]| Data::List(paths.iter().map(|path| Data::Str(path.display().to_string())).collect());
-            let data = match attribute {
-                "input" => Some(Some(paths(&custom.inputs))),
-                "output" => Some(Some(paths(outputs))),
-                "command" => Some(Some(Data::List(custom.command.iter().map(|s| Data::Str(s.clone())).collect()))),
-                "default" => Some(Some(Data::Bool(*default))),
-                _ => None,
+            let value = match attribute {
+                "input" => AttributeValue::Set(paths(&custom.inputs)),
+                "output" => AttributeValue::Set(paths(outputs)),
+                "command" => AttributeValue::Set(strings(&custom.command)),
+                "default" => AttributeValue::Set(Data::Bool(*default)),
+                _ => AttributeValue::Unknown,
             };
-            return self.attribute_value("custom command", name, attribute, attribute_span, data, start, parser);
+            return self.attribute_value("custom command", name, attribute, attribute_span, value, start, parser);
         }
-        if let Some(property) = self.properties_idx.get(name).and_then(|&id| self.properties[id].as_ref()) {
-            let data = match attribute {
-                "default" => Some(property.default.clone()),
-                "type" => Some(Some(Data::Str(property.ty.name().into()))),
-                "read-only" => Some(Some(Data::Bool(property.read_only))),
-                "info" => Some(property.info.clone().map(Data::Str)),
-                _ => None,
+        if let Some(&id) = self.properties_idx.get(name) && let Some(property) = &self.properties[id] {
+            let value = match attribute {
+                "default" => AttributeValue::optional(property.default.clone()),
+                "type" => AttributeValue::Set(Data::Str(property.ty.name().into())),
+                "read-only" => AttributeValue::Set(Data::Bool(property.read_only)),
+                "info" => AttributeValue::optional(property.info.clone().map(Data::Str)),
+                _ => AttributeValue::Unknown,
             };
-            return self.attribute_value("property", name, attribute, attribute_span, data, start, parser);
+            return self.attribute_value("property", name, attribute, attribute_span, value, start, parser);
         }
-        let Some(target) = self.custom_targets.iter().find(|target| target.name == name) else {
-            // a test has its own name, which is looked for last
-            if let Some(test) = self.customs.iter().find(|test| test.is_test() && test.name == name) {
-                let strings = |strings: Vec<String>| Data::List(strings.into_iter().map(Data::Str).collect());
-                let data = match attribute {
-                    "input" => {
-                        let inputs = test.inputs(&self.runners).iter().map(|path| path.display().to_string()).collect();
-                        Some(Some(strings(inputs)))
-                    },
-                    "command" => Some(Some(strings(test.command(&self.runners)))),
-                    _ => None,
-                };
-                return self.attribute_value("test", name, attribute, attribute_span, data, start, parser);
-            }
-            self.diagnostics.push(Diagnostic {
-                span: Some(span),
-                message: Message::UnknownReference(name.into()),
-                severity: Severity::Error,
-            });
-            return None;
-        };
-        let strings = |strings: &[String]| Data::List(strings.iter().map(|s| Data::Str(s.clone())).collect());
-        let data = match attribute {
-            "inherit" => Some(target.inherit.clone().map(Data::Str)),
-            "test" => Some(Some(Data::Bool(target.test))),
-            "override" => Some(Some(Data::Bool(target.overrides))),
-            "runner" => Some(target.runner.map(|runner| strings(&self.runners[runner].command))),
-            // a field of the specification, which is named after its option
-            option => target_option(option).map(|option| {
-                target.fields.iter().find(|field| field.name == option.field).map(|field| field.value.clone())
-            }),
-        };
-        self.attribute_value("target", name, attribute, attribute_span, data, start, parser)
+        if let Some(target) = self.custom_targets.iter().find(|target| target.name == name) {
+            let value = match attribute {
+                "inherit" => AttributeValue::optional(target.inherit.clone().map(Data::Str)),
+                "test" => AttributeValue::Set(Data::Bool(target.test)),
+                "override" => AttributeValue::Set(Data::Bool(target.overrides)),
+                "runner" => match target.runner {
+                    Some(runner) => AttributeValue::Set(strings(&self.runners[runner].command)),
+                    None => AttributeValue::Unset,
+                },
+                // a field of the specification, which is named after its option
+                option => match target_option(option) {
+                    Some(option) => AttributeValue::optional(target.field(option.field).cloned()),
+                    None => AttributeValue::Unknown,
+                },
+            };
+            return self.attribute_value("target", name, attribute, attribute_span, value, start, parser);
+        }
+        // a test has its own name, which is looked for last
+        if let Some(test) = self.customs.iter().find(|test| test.is_test() && test.name == name) {
+            let value = match attribute {
+                "input" => AttributeValue::Set(paths(&test.inputs(&self.runners))),
+                "command" => AttributeValue::Set(strings(&test.command(&self.runners))),
+                _ => AttributeValue::Unknown,
+            };
+            return self.attribute_value("test", name, attribute, attribute_span, value, start, parser);
+        }
+        self.diagnostics.push(Diagnostic {
+            span: Some(span),
+            message: Message::UnknownReference(name.into()),
+            severity: Severity::Error,
+        });
+        None
     }
+}
+
+/// The value of an attribute of something which is referred to.
+enum AttributeValue {
+    Set(Data),
+    /// The attribute is known, but has no value.
+    Unset,
+    /// There is no attribute with the name.
+    Unknown,
+}
+impl AttributeValue {
+    /// The value of an attribute which may not be set.
+    fn optional(data: Option<Data>) -> Self {
+        match data {
+            Some(data) => Self::Set(data),
+            None => Self::Unset,
+        }
+    }
+}
+
+/// Returns paths as a list of strings.
+fn paths(paths: &[PathBuf]) -> Data {
+    let mut items = Vec::new();
+    for path in paths {
+        items.push(Data::Str(path.display().to_string()));
+    }
+    Data::List(items)
+}
+
+/// Returns strings as a list.
+fn strings(strings: &[String]) -> Data {
+    let mut items = Vec::new();
+    for string in strings {
+        items.push(Data::Str(string.clone()));
+    }
+    Data::List(items)
 }
