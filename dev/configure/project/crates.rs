@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use super::diagnostic::{Diagnostic, Message, Severity};
 use super::syntax::{Parser, Span};
 use super::value::Data;
-use super::{Custom, Project, rust};
+use super::customs::{Custom, CustomKind};
+use super::{Project, rust};
 
 /// The name of the test of a crate, which is the name of the crate, with its target if that is not the host target.
 fn crate_test_name(c: &rust::Crate, host: &str) -> String {
@@ -177,12 +178,9 @@ impl Project {
             name,
             name_span: span,
             inputs,
-            outputs: Vec::new(),
             command,
             program: None,
-            default: false,
-            test: true,
-            runner: None,
+            kind: CustomKind::Test { runner: None },
         });
     }
     /// Complete the tests of the crates with a `test` attribute, which were forward declared, with the runner of their
@@ -200,7 +198,7 @@ impl Project {
             let (name, span, target_span) = (crate_test_name(c, &host), c.name_span, c.target_span);
             // the test which was forward declared, unless another had its name
             let declared = self.customs.iter().position(|test| {
-                test.test && test.name == name && (test.name_span.file, test.name_span.offset) == (span.file, span.offset)
+                test.is_test() && test.name == name && (test.name_span.file, test.name_span.offset) == (span.file, span.offset)
             });
             let custom = self.custom_targets.iter().find(|target| target.name == c.target);
             let runner = match custom {
@@ -223,7 +221,7 @@ impl Project {
                 },
             };
             if let Some(declared) = declared {
-                self.customs[declared].runner = runner;
+                self.customs[declared].kind = CustomKind::Test { runner };
             }
         }
     }

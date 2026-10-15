@@ -19,30 +19,55 @@ pub struct Custom {
     pub name: String,
     pub name_span: Span,
     pub inputs: Vec<PathBuf>,
-    pub outputs: Vec<PathBuf>,
     /// The program and its arguments, where a program with a `/` is relative to the project root.
     pub command: Vec<String>,
     /// The program, if it is a path, which the outputs depend on.
     pub program: Option<PathBuf>,
-    /// Whether the outputs are built by `ninja` without targets.
-    pub default: bool,
-    /// Whether this is a test, which has no outputs and is run by `configure --test` rather than ninja.
-    pub test: bool,
-    /// The index of the runner of the test's target, which runs its command, as with the test harness of a crate.
-    pub runner: Option<usize>,
+    pub kind: CustomKind,
 }
+
+/// Whether a [`Custom`] is a build command or a test, with what only that kind has.
+pub enum CustomKind {
+    /// A build command, which ninja runs to build its outputs.
+    Command {
+        outputs: Vec<PathBuf>,
+        /// Whether the outputs are built by `ninja` without targets.
+        default: bool,
+    },
+    /// A test, which has no outputs and is run by `configure --test` rather than ninja.
+    Test {
+        /// The index of the runner of the test's target, which runs its command, as with the test harness of a crate.
+        runner: Option<usize>,
+    },
+}
+
 impl Custom {
+    pub fn is_test(&self) -> bool {
+        matches!(self.kind, CustomKind::Test { .. })
+    }
+    /// The index of the runner of a test, if it has one.
+    fn runner(&self) -> Option<usize> {
+        match self.kind {
+            CustomKind::Test { runner } => runner,
+            CustomKind::Command { .. } => None,
+        }
+    }
     /// The command which is run, by the runner, if there is one.
     pub fn command(&self, runners: &[Runner]) -> Vec<String> {
-        match self.runner {
-            Some(runner) => runners[runner].command.iter().chain(&self.command).cloned().collect(),
-            None => self.command.clone(),
-        }
+        let Some(runner) = self.runner() else {
+            return self.command.clone();
+        };
+        let mut command = runners[runner].command.clone();
+        command.extend(self.command.iter().cloned());
+        command
     }
     /// The inputs, which include the program of the runner, if there is one.
     pub fn inputs(&self, runners: &[Runner]) -> Vec<PathBuf> {
-        let program = self.runner.and_then(|runner| runners[runner].program.clone());
-        self.inputs.iter().cloned().chain(program).collect()
+        let mut inputs = self.inputs.clone();
+        if let Some(runner) = self.runner() && let Some(program) = &runners[runner].program {
+            inputs.push(program.clone());
+        }
+        inputs
     }
 }
 
@@ -138,11 +163,14 @@ impl Project {
             });
             return;
         }
-        let Runner { command, program } = self.resolve_command(command.unwrap_or_default(), parser.file);
-        let declared = (name.clone(), outputs.clone());
-        let custom = Custom { name, name_span: span, inputs, outputs, command, program, default, test, runner: None };
+        let runner = self.resolve_command(command.unwrap_or_default(), parser.file);
+        // the outputs are declared as a property named after the command, once it is known to be unique
+        let declared = name.clone();
+        let declared_outputs = outputs.clone();
+        let kind = if test { CustomKind::Test { runner: None } } else { CustomKind::Command { outputs, default } };
+        let custom = Custom { name, name_span: span, inputs, command: runner.command, program: runner.program, kind };
         if self.add_custom(custom) {
-            self.declare_outputs(declared.0, span, "custom command", declared.1);
+            self.declare_outputs(declared, span, "custom command", declared_outputs);
         }
     }
     /// Returns a command whose program, as in `run`, is a path relative to a file if it has a `/`, and which it then
@@ -161,13 +189,13 @@ impl Project {
     }
     /// Add a custom build command or a test, unless one of the same kind has the same name.
     pub(super) fn add_custom(&mut self, custom: Custom) -> bool {
-        let previous = self.customs.iter().find(|previous| previous.name == custom.name && previous.test == custom.test);
+        let previous = self.customs.iter().find(|previous| previous.name == custom.name && previous.is_test() == custom.is_test());
         if let Some(previous) = previous {
             let previous = previous.name_span;
             self.diagnostics.push(Diagnostic {
                 span: Some(custom.name_span),
                 message: Message::RedeclareCustom {
-                    statement: if custom.test { "test" } else { "custom" },
+                    statement: if custom.is_test() { "test" } else { "custom" },
                     name: custom.name,
                     previous,
                 },

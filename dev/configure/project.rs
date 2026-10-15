@@ -14,7 +14,7 @@ mod syntax;
 mod targets;
 mod value;
 
-pub use customs::{Custom, Runner};
+pub use customs::{Custom, CustomKind, Runner};
 pub use diagnostic::{Diagnostic, Message, Severity};
 pub use syntax::Span;
 pub use targets::CustomTarget;

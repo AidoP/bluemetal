@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use super::diagnostic::{Diagnostic, Message, Severity};
 use super::syntax::{Parser, Span, is_attribute_access};
 use super::value::{Coercion, Data, Operand};
+use super::customs::CustomKind;
 use super::targets::TARGET_OPTIONS;
 use super::Project;
 
@@ -75,13 +76,14 @@ impl Project {
     /// is looked for last.
     pub(super) fn parse_named_attribute(&mut self, parser: &mut Parser, name: &str, span: Span, start: usize) -> Option<Operand> {
         let (attribute, attribute_span) = self.parse_attribute_access(parser)?;
-        if let Some(custom) = self.customs.iter().find(|custom| !custom.test && custom.name == name) {
+        let custom = self.customs.iter().find(|custom| !custom.is_test() && custom.name == name);
+        if let Some(custom) = custom && let CustomKind::Command { outputs, default } = &custom.kind {
             let paths = |paths: &[PathBuf]| Data::List(paths.iter().map(|path| Data::Str(path.display().to_string())).collect());
             let data = match attribute {
                 "input" => Some(Some(paths(&custom.inputs))),
-                "output" => Some(Some(paths(&custom.outputs))),
+                "output" => Some(Some(paths(outputs))),
                 "command" => Some(Some(Data::List(custom.command.iter().map(|s| Data::Str(s.clone())).collect()))),
-                "default" => Some(Some(Data::Bool(custom.default))),
+                "default" => Some(Some(Data::Bool(*default))),
                 _ => None,
             };
             return self.attribute_value("custom command", name, attribute, attribute_span, data, start, parser);
@@ -98,7 +100,7 @@ impl Project {
         }
         let Some(target) = self.custom_targets.iter().find(|target| target.name == name) else {
             // a test has its own name, which is looked for last
-            if let Some(test) = self.customs.iter().find(|test| test.test && test.name == name) {
+            if let Some(test) = self.customs.iter().find(|test| test.is_test() && test.name == name) {
                 let strings = |strings: Vec<String>| Data::List(strings.into_iter().map(Data::Str).collect());
                 let data = match attribute {
                     "input" => {

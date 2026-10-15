@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::ninja::{self, NinjaFile};
 use crate::project::rust::{Crate, Kind};
-use crate::project::{CustomTarget, Project};
+use crate::project::{CustomKind, CustomTarget, Project};
 use crate::{CONFIGURE, Error, check, database, rust_analyzer, target_spec};
 
 /// Write the files generated from a project, which has been read and checked.
@@ -217,18 +217,18 @@ fn write_build_ninja(
     let mut tests = Vec::new();
     for custom in &project.customs {
         // a test is run by `configure --test`, which builds its inputs and program with this target first
-        if custom.test {
+        let CustomKind::Command { outputs, default } = &custom.kind else {
             let phony = Path::new("test").join(&custom.name);
             let inputs = custom.inputs(&project.runners);
             let inputs: Vec<_> = inputs.iter().chain(&custom.program).map(PathBuf::as_path).collect();
             build_ninja.build(&ninja::Build { rule: "phony", outputs: &[&phony], inputs: &inputs, ..Default::default() })?;
             tests.push(phony);
             continue;
-        }
+        };
         // ninja runs commands with `sh`, which must not split or expand the arguments
         let command: Vec<_> = custom.command.iter().map(|argument| shell_quote(argument)).collect();
         let command = command.join(" ").replace('$', "$$");
-        let outputs: Vec<_> = custom.outputs.iter().map(PathBuf::as_path).collect();
+        let outputs: Vec<_> = outputs.iter().map(PathBuf::as_path).collect();
         let inputs: Vec<_> = custom.inputs.iter().map(PathBuf::as_path).collect();
         let program: Vec<_> = custom.program.iter().map(PathBuf::as_path).collect();
         build_ninja.build(&ninja::Build {
@@ -247,7 +247,7 @@ fn write_build_ninja(
             inputs: &outputs,
             ..Default::default()
         })?;
-        if custom.default {
+        if *default {
             defaults.push(phony);
         }
     }
@@ -376,7 +376,7 @@ fn write_database(project: &Project, units: &[Unit]) -> Result<(), Error> {
     }
     let mut commands = Vec::new();
     for custom in &project.customs {
-        if custom.test {
+        if custom.is_test() {
             commands.push(TestCommand { name: &custom.name, command: custom.command(&project.runners) });
         }
     }
