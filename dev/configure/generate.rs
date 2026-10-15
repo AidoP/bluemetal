@@ -262,7 +262,7 @@ fn write_build_ninja(
         let target = TargetFlag::new(&c.target, &project.custom_targets);
         let flags = rustc_flags(&target.flag, Path::new(&format!("target/{}", c.target)), c.kind, &deps);
         let deps: Vec<_> = deps.iter().map(|d| d.path.as_path()).chain(target.spec.as_deref()).collect();
-        let crate_type = c.crate_type();
+        let crate_type = c.kind.crate_type();
         let output = c.output();
         if let Some(output) = &output {
             build_ninja.build(&ninja::Build {

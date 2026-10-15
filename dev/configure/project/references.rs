@@ -32,7 +32,7 @@ impl Project {
         let c = &self.crates[&(name.to_string(), target)];
         let data = match attribute {
             "target" => Some(Data::Str(c.target.clone())),
-            "crate-type" => Some(Data::Str(c.crate_type().into())),
+            "crate-type" => Some(Data::Str(c.kind.crate_type().into())),
             "path" => Some(Data::Str(c.path.display().to_string())),
             "builtin" => Some(Data::Bool(c.builtin)),
             "default" => Some(Data::Bool(c.default)),

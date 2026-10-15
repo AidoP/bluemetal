@@ -80,7 +80,6 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
             name: name.into(),
             name_span: span,
             path: path.into(),
-            path_span: span,
             target: host.clone(),
             target_span: span,
             kind,

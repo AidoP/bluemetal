@@ -5,7 +5,6 @@ pub struct Crate {
     pub name: String,
     pub name_span: Span,
     pub path: PathBuf,
-    pub path_span: Span,
     /// The target the crate is compiled for, which is a builtin target or one declared by a `target` statement.
     pub target: String,
     pub target_span: Span,
@@ -46,10 +45,6 @@ impl Kind {
 }
 
 impl Crate {
-    /// The `--crate-type` of the crate.
-    pub fn crate_type(&self) -> &'static str {
-        self.kind.crate_type()
-    }
     /// The library or binary built from the crate, which a crate which is only a test harness does not have.
     pub fn output(&self) -> Option<PathBuf> {
         match self.kind {

@@ -39,17 +39,12 @@ impl Project {
             });
             return;
         }
-        let path;
-        let path_span;
-        if parser.peek() == Some(' ') && self.parse_space(parser) && let Some((p, s)) = self.parse_path(parser) {
-            path = p;
-            path_span = s;
+        let has_path = parser.peek() == Some(' ') && self.parse_space(parser);
+        let path = if has_path && let Some((path, _)) = self.parse_path(parser) {
+            path
         } else {
-            let mut rel_path = self.files[parser.file].relative_path(&name);
-            rel_path.push("lib.rs");
-            path = rel_path;
-            path_span = span;
-        }
+            self.files[parser.file].relative_path(&name).join("lib.rs")
+        };
         if !self.parse_line_end(parser) {
             parser.skip_statement();
         }
@@ -164,7 +159,6 @@ impl Project {
                         name: name.clone(),
                         name_span: span,
                         path: path.clone(),
-                        path_span,
                         target,
                         target_span,
                         kind,
