@@ -222,7 +222,8 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
         // a test is run by `configure --test`, which builds its inputs and program with this target first
         if custom.test {
             let phony = Path::new("test").join(&custom.name);
-            let inputs: Vec<_> = custom.inputs.iter().chain(&custom.program).map(PathBuf::as_path).collect();
+            let inputs = custom.inputs(&project.runners);
+            let inputs: Vec<_> = inputs.iter().chain(&custom.program).map(PathBuf::as_path).collect();
             build_ninja.build(&ninja::Build { rule: "phony", outputs: &[&phony], inputs: &inputs, ..Default::default() })?;
             tests.push(phony);
             continue;
@@ -378,9 +379,13 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
         label: &unit.label,
         diagnostics: diagnostics.iter().map(String::as_str).collect(),
     });
-    let tests = project.customs.iter().filter(|custom| custom.test).map(|test| database::Test {
-        name: &test.name,
-        command: test.command.iter().map(String::as_str).collect(),
+    // the database borrows the commands
+    let commands: Vec<_> = project.customs.iter().filter(|custom| custom.test).map(|test| {
+        (test.name.as_str(), test.command(&project.runners))
+    }).collect();
+    let tests = commands.iter().map(|(name, command)| database::Test {
+        name,
+        command: command.iter().map(String::as_str).collect(),
     });
     let mut bytes = Vec::new();
     let _ = database::write(&mut bytes, &database::Database { flychecks: flychecks.collect(), tests: tests.collect() });

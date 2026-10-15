@@ -24,6 +24,8 @@ pub struct Project {
     pub customs: Vec<Custom>,
     /// Targets declared by `target` statements, in the order they were declared.
     pub custom_targets: Vec<CustomTarget>,
+    /// The runners of targets, which targets and tests refer to by index.
+    pub runners: Vec<Runner>,
 }
 impl Project {
     pub fn new(root: PathBuf, targets: Vec<String>) -> Self {
@@ -42,6 +44,7 @@ impl Project {
             crates: HashMap::new(),
             customs: Vec::new(),
             custom_targets: Vec::new(),
+            runners: Vec::new(),
         }
     }
     pub fn file(&self, idx: usize) -> &File {
@@ -151,7 +154,7 @@ impl Project {
                     .or_else(|| self.crates.get(&(name.clone(), host.clone())).filter(|d| d.kind == rust::Kind::ProcMacro));
                 let message = match used {
                     None => Message::UnknownCrate { name: name.clone(), target: c.target.clone() },
-                    Some(d) if d.kind == rust::Kind::Bin => Message::UseBinary(name.clone()),
+                    Some(d) if d.kind == rust::Kind::Bin => Message::UseBinary { name: name.clone(), declared: d.name_span },
                     Some(_) => continue,
                 };
                 self.diagnostics.push(Diagnostic { span: Some(*span), message, severity: Severity::Error });
@@ -185,7 +188,13 @@ impl Project {
             }
         }
         if let Some(span) = diagnostic.span.as_ref() {
-            self.write_location(w, span, style_accent, style_reset)?;
+            match &diagnostic.message {
+                // the line is shown with the replacement
+                Message::Replacement { replacement, .. } => {
+                    self.write_replacement(w, span, replacement, style_accent, style_reset)?;
+                },
+                _ => self.write_location(w, span, style_accent, style_reset)?,
+            }
         }
         match &diagnostic.message {
             Message::RedeclareProperty { id, .. } => {
@@ -203,6 +212,10 @@ impl Project {
                     writeln!(w, "{style_note}note{style_white}: declared read-only here{style_reset}")?;
                     self.write_location(w, span, style_note, style_reset)?;
                 }
+            },
+            Message::UseBinary { declared, .. } | Message::UseWithTarget { declared: Some(declared) } => {
+                writeln!(w, "{style_note}note{style_white}: declared here{style_reset}")?;
+                self.write_location(w, declared, style_note, style_reset)?;
             },
             Message::RedeclareCustom { previous, .. } => {
                 writeln!(w, "{style_note}note{style_white}: previously declared here{style_reset}")?;
@@ -286,6 +299,32 @@ impl Project {
         self.properties[id].as_ref()
     }
     /// Write the location of a span followed by its first line with the span underlined.
+    /// Write the location of a span followed by its first line with the span replaced, and the replacement underlined.
+    fn write_replacement(
+        &self,
+        w: &mut dyn std::io::Write,
+        span: &Span,
+        replacement: &str,
+        style_accent: &str,
+        style_reset: &str,
+    ) -> std::io::Result<()> {
+        let file = &self.files[span.file];
+        let (line, col) = file.position(span.offset);
+        let line = line.to_string();
+        let gutter = " ".repeat(line.len());
+        writeln!(w, "{gutter}--> {}:{line}:{col}", file.path.display())?;
+
+        let start = span.offset - (col - 1);
+        let rest = &file.data[start..];
+        let text = rest[..rest.find('\n').unwrap_or(rest.len())].trim_end_matches('\r');
+        let (before, after) = text.split_at((col - 1).min(text.len()));
+        let after = &after[span.len.min(after.len())..];
+        let indent = " ".repeat(before.chars().count());
+        let width = replacement.chars().count().max(1);
+        writeln!(w, "{gutter} |")?;
+        writeln!(w, "{line} | {before}{replacement}{after}")?;
+        writeln!(w, "{gutter} | {indent}{style_accent}{}{style_reset}", "~".repeat(width))
+    }
     fn write_location(&self, w: &mut dyn std::io::Write, span: &Span, style_accent: &str, style_reset: &str) -> std::io::Result<()> {
         let file = &self.files[span.file];
         let (line, col) = file.position(span.offset);
@@ -745,6 +784,7 @@ impl Project {
             ty,
             read_only,
             info,
+            default: None,
         });
         // values set before the declaration could not be checked against its type, so remove any which do not match
         let mut valid_before = Vec::new();
@@ -756,6 +796,9 @@ impl Project {
         let valid_default = default_value.filter(|&value| self.check_type(value, ident));
         if valid_default.is_none() {
             default = None;
+        }
+        if let Some(value) = valid_default {
+            self.properties[idx].as_mut().unwrap().default = Some(self.values[value].data.clone());
         }
         match valid_default.or(valid_before.last().copied()) {
             Some(value) => self.values_idx.insert(ident.into(), value),
@@ -896,6 +939,7 @@ impl Project {
             "error" => Severity::Error,
             "warning" => Severity::Warning,
             "note" => Severity::Note,
+            "suggestion" => Severity::Suggestion,
             _ => {
                 self.diagnostics.push(Diagnostic {
                     span: Some(span),
@@ -1046,6 +1090,7 @@ impl Project {
             });
             return;
         }
+        let mut outputs = Vec::new();
         for (i, target) in targets.iter().enumerate() {
             if targets[..i].contains(target) {
                 self.diagnostics.push(Diagnostic {
@@ -1068,7 +1113,7 @@ impl Project {
                     severity: Severity::Error,
                 }),
                 Entry::Vacant(entry) => {
-                    entry.insert(rust::Crate {
+                    let c = entry.insert(rust::Crate {
                         name: name.clone(),
                         name_span: span,
                         path: path.clone(),
@@ -1083,22 +1128,52 @@ impl Project {
                         test,
                         uses: uses.clone(),
                     });
+                    // a crate is referred to as `<target>/<name>`, as it may be declared for several targets
+                    let output = c.output().map(|output| (format!("{}/{}", c.target, c.name), output));
+                    outputs.extend(output);
+                    // the test is forward declared, so that it can be referred to, and completed once the target is known
+                    if test {
+                        let name = crate_test_name(c, &host);
+                        let harness = c.test_harness();
+                        self.add_crate_test(name, span, harness, Vec::new());
+                    }
                 },
             }
         }
+        for (property, output) in outputs {
+            self.declare_outputs(property, span, "crate", vec![output]);
+        }
+    }
+    /// Declare a read-only property whose value is the path of an output, or a list of them, which is how crates and
+    /// custom commands are referred to.
+    fn declare_outputs(&mut self, name: String, span: Span, statement: &'static str, outputs: Vec<PathBuf>) {
+        if outputs.is_empty() {
+            return;
+        }
+        let mut items: Vec<_> = outputs.iter().map(|path| Data::Str(path.display().to_string())).collect();
+        let property = Property {
+            span: Some(span),
+            name: name.clone(),
+            ty: Type::Any,
+            read_only: true,
+            info: Some(format!("the output of the {statement}")),
+            default: None,
+        };
+        let reported = self.diagnostics.len();
+        let id = self.declare(name.clone(), Some(property));
+        // a property with the name has been declared already
+        if self.diagnostics.len() > reported {
+            return;
+        }
+        let data = if items.len() == 1 { items.remove(0) } else { Data::List(items) };
+        self.set(name, Value { property: id, span: Some(span), data, data_span: Some(span), origin: Some(span), local: false });
     }
     /// Register the test harness of a crate, like a `test` statement which runs it, which also needs `inputs`.
     ///
-    /// The harness is run by the runner of its target, if it has one, with the harness as its last argument.
-    fn add_crate_test(&mut self, name: String, span: Span, harness: PathBuf, mut inputs: Vec<PathBuf>, runner: &Runner) {
-        let mut command = runner.command.clone();
-        if command.is_empty() {
-            command.push(Path::new(".").join(&harness).display().to_string());
-        } else {
-            command.push(harness.display().to_string());
-        }
+    /// The harness is run directly, until the runner of its target is known.
+    fn add_crate_test(&mut self, name: String, span: Span, harness: PathBuf, mut inputs: Vec<PathBuf>) {
+        let command = vec![Path::new(".").join(&harness).display().to_string()];
         inputs.insert(0, harness);
-        inputs.extend(runner.program.clone());
         self.add_custom(Custom {
             name,
             name_span: span,
@@ -1108,12 +1183,11 @@ impl Project {
             program: None,
             default: false,
             test: true,
+            runner: None,
         });
     }
-    /// Register the tests of the crates with a `test` attribute, which run on the host target, or a custom target which
-    /// allows tests, by its runner.
-    ///
-    /// A test is named after its crate, or with its target too if that is not the host target.
+    /// Complete the tests of the crates with a `test` attribute, which were forward declared, with the runner of their
+    /// target. Tests run on the host target, or a custom target which allows tests, and the others are removed.
     fn add_crate_tests(&mut self) {
         let host = self.values_idx.get("host-target").map_or_default(|&value| self.values[value].data.coerce_string());
         // in the order they were declared, as the crates are not
@@ -1124,11 +1198,15 @@ impl Project {
         keys.sort_by(|(lhs, lhs_position), (rhs, rhs_position)| (lhs_position, lhs).cmp(&(rhs_position, rhs)));
         for (key, _) in keys {
             let c = &self.crates[&key];
-            let (name, span, target_span, harness) = (c.name.clone(), c.name_span, c.target_span, c.test_harness());
+            let (name, span, target_span) = (crate_test_name(c, &host), c.name_span, c.target_span);
+            // the test which was forward declared, unless another had its name
+            let declared = self.customs.iter().position(|test| {
+                test.test && test.name == name && (test.name_span.file, test.name_span.offset) == (span.file, span.offset)
+            });
             let custom = self.custom_targets.iter().find(|target| target.name == c.target);
             let runner = match custom {
-                Some(target) if target.test => target.runner.clone(),
-                _ if c.target == host => Runner::default(),
+                Some(target) if target.test => target.runner,
+                _ if c.target == host => None,
                 // an unknown target is reported anyway
                 None if !self.targets.contains(&c.target) => continue,
                 _ => {
@@ -1139,11 +1217,15 @@ impl Project {
                     });
                     // nor is its harness built
                     self.crates.get_mut(&key).unwrap().test = false;
+                    if let Some(declared) = declared {
+                        self.customs.remove(declared);
+                    }
                     continue;
                 },
             };
-            let name = if c.target == host { name } else { format!("{name}@{}", c.target) };
-            self.add_crate_test(name, span, harness, Vec::new(), &runner);
+            if let Some(declared) = declared {
+                self.customs[declared].runner = runner;
+            }
         }
     }
     /// Add a crate which is part of the build system rather than declared by the configuration, after reading it.
@@ -1160,7 +1242,7 @@ impl Project {
             return;
         }
         if c.test {
-            self.add_crate_test(c.name.clone(), c.name_span, c.test_harness(), test_inputs, &Runner::default());
+            self.add_crate_test(c.name.clone(), c.name_span, c.test_harness(), test_inputs);
         }
         self.crates.insert(key, c);
     }
@@ -1255,12 +1337,16 @@ impl Project {
             });
             return;
         }
-        let Runner { command, program } = self.runner(command.unwrap_or_default(), parser.file);
-        self.add_custom(Custom { name, name_span: span, inputs, outputs, command, program, default, test });
+        let Runner { command, program } = self.resolve_command(command.unwrap_or_default(), parser.file);
+        let declared = (name.clone(), outputs.clone());
+        let custom = Custom { name, name_span: span, inputs, outputs, command, program, default, test, runner: None };
+        if self.add_custom(custom) {
+            self.declare_outputs(declared.0, span, "custom command", declared.1);
+        }
     }
     /// Returns a command whose program, as in `run`, is a path relative to a file if it has a `/`, and which it then
     /// depends on, while otherwise it is searched for in `PATH`.
-    fn runner(&self, mut command: Vec<String>, file: usize) -> Runner {
+    fn resolve_command(&self, mut command: Vec<String>, file: usize) -> Runner {
         let mut program = None;
         if command[0].contains('/') {
             let mut path = normalize(&self.file(file).relative_path(&command[0]));
@@ -1272,8 +1358,14 @@ impl Project {
         }
         Runner { command, program }
     }
+    /// Add the runner of a target, returning its index.
+    fn add_runner(&mut self, command: Vec<String>, file: usize) -> usize {
+        let runner = self.resolve_command(command, file);
+        self.runners.push(runner);
+        self.runners.len() - 1
+    }
     /// Add a custom build command or a test, unless one of the same kind has the same name.
-    fn add_custom(&mut self, custom: Custom) {
+    fn add_custom(&mut self, custom: Custom) -> bool {
         let previous = self.customs.iter().find(|previous| previous.name == custom.name && previous.test == custom.test);
         if let Some(previous) = previous {
             let previous = previous.name_span;
@@ -1286,9 +1378,10 @@ impl Project {
                 },
                 severity: Severity::Error,
             });
-            return;
+            return false;
         }
         self.customs.push(custom);
+        true
     }
     /// Take the paths of an `input` or `output` attribute, a path or a list of them, which are relative to the file.
     fn parse_custom_paths(&mut self, parser: &mut Parser) -> Option<Vec<PathBuf>> {
@@ -1355,7 +1448,7 @@ impl Project {
         let mut inherit = None;
         let mut fields: Vec<(String, Data)> = Vec::new();
         let mut test = false;
-        let mut runner = Runner::default();
+        let mut runner = None;
         let mut overrides = false;
         // the attributes which describe the specification, which a builtin target has already
         let mut spec_attributes = Vec::new();
@@ -1386,9 +1479,9 @@ impl Project {
                 // tests are only run where they are allowed, and without a runner, they are run directly
                 ("test", Data::None) => test = true,
                 ("test", Data::Bool(value)) => test = value,
-                ("runner", Data::Str(program)) => runner = self.runner(vec![program], parser.file),
+                ("runner", Data::Str(program)) => runner = Some(self.add_runner(vec![program], parser.file)),
                 ("runner", Data::List(items)) if !items.is_empty() && items.iter().all(|item| matches!(item, Data::Str(_))) => {
-                    runner = self.runner(items.iter().map(Data::coerce_string).collect(), parser.file);
+                    runner = Some(self.add_runner(items.iter().map(Data::coerce_string).collect(), parser.file));
                 },
                 (name @ ("inherit" | "test" | "runner" | "override"), data) => self.diagnostics.push(Diagnostic {
                     span: Some(attribute.data_span),
@@ -1758,6 +1851,10 @@ impl Project {
                     });
                     return None;
                 }
+                // the target of a crate may be computed
+                if is_crate_reference(parser) {
+                    return self.parse_crate_reference(parser, inner.data.coerce_string(), start);
+                }
                 Some(Operand { span: parser.span_from(start), coerce: Coercion::Any, ..inner })
             },
             // any word is parsed as an identifier, to report its invalid characters
@@ -1765,6 +1862,17 @@ impl Project {
                 let (name, span) = self.parse_ident(parser)?;
                 if parser.peek() == Some('(') {
                     return self.parse_call(parser, name, span);
+                }
+                if is_crate_reference(parser) {
+                    // the target is a property, such as `host-target`, or the name of a target
+                    let target = match self.value(name, span.file) {
+                        Some(Value { data: Data::Str(target), .. }) => target.clone(),
+                        _ => name.into(),
+                    };
+                    return self.parse_crate_reference(parser, target, start);
+                }
+                if is_attribute_access(parser) {
+                    return self.parse_named_attribute(parser, name, span, start);
                 }
                 let (data, origin) = match name {
                     "true" => (Data::Bool(true), None),
@@ -1793,7 +1901,7 @@ impl Project {
             "starts-with" | "ends-with" | "contains" | "join" | "split" => "2",
             "get" => "2 or 3",
             "select" | "run" | "min" | "max" => "at least 1",
-            "try" => "1",
+            "try" => "2",
             _ => {
                 self.diagnostics.push(Diagnostic {
                     span: Some(name_span),
@@ -2021,38 +2129,55 @@ impl Project {
         };
         Some(Operand { data, span, coerce: Coercion::Strict, origin: None })
     }
-    /// Take the argument of `try`, returning whether it was evaluated without errors.
+    /// Take the arguments of `try`, returning the value of the first, or the default, the second, if evaluating the
+    /// first failed.
     ///
-    /// Errors from the argument are reported as warnings instead. As evaluation stops at the first error, the rest of
-    /// the argument is skipped to the closing parenthesis.
+    /// Errors from the first argument are reported as warnings instead. As evaluation stops at the first error, the rest
+    /// of the argument is skipped to the separator.
     fn parse_try(&mut self, parser: &mut Parser, name_span: Span) -> Option<Operand> {
         let start = parser.offset;
-        if parser.peek() == Some(')') {
+        let first = self.diagnostics.len();
+        let operand = if parser.peek() == Some(')') {
+            None
+        } else {
+            self.parse_binary(parser, 0)
+        };
+        // without the end of the expression, what follows it cannot be found, so the errors stand
+        let end = start + argument_end(&parser.data[start..])?;
+        if operand.is_some() && parser.offset != end {
+            self.diagnostics.push(Diagnostic {
+                span: Some(parser.span_char()),
+                message: Message::ExpectedSeparator(')'),
+                severity: Severity::Error,
+            });
+        }
+        parser.offset = end;
+        let mut operand = operand;
+        for diagnostic in &mut self.diagnostics[first..] {
+            if matches!(diagnostic.severity, Severity::Error) {
+                diagnostic.severity = Severity::Warning;
+                operand = None;
+            }
+        }
+        // the default is required, and its errors are not suppressed
+        if !parser.as_str().starts_with(", ") {
             parser.expect(')');
-            self.argument_count("try", "1", 0, parser.span_from(name_span.offset));
+            self.argument_count("try", "2", 1, parser.span_from(name_span.offset));
             return None;
         }
-        let first = self.diagnostics.len();
-        let operand = self.parse_binary(parser, 0);
-        if operand.is_some() && parser.peek() != Some(')') {
+        parser.offset += 2;
+        let default = self.parse_binary(parser, 0)?;
+        if !parser.expect(')') {
             self.diagnostics.push(Diagnostic {
                 span: Some(parser.span_char()),
                 message: Message::ExpectedExact(")"),
                 severity: Severity::Error,
             });
-        }
-        // without a closing parenthesis, the expression after `try` cannot be found, so the errors stand
-        parser.offset = start + paren_end(&parser.data[start..])?;
-        parser.expect(')');
-        let mut success = operand.is_some();
-        for diagnostic in &mut self.diagnostics[first..] {
-            if matches!(diagnostic.severity, Severity::Error) {
-                diagnostic.severity = Severity::Warning;
-                success = false;
-            }
+            return None;
         }
         let span = parser.span_from(name_span.offset);
-        Some(Operand { data: Data::Bool(success), span, coerce: Coercion::Strict, origin: None })
+        let data = operand.unwrap_or(default).data;
+        Some(Operand { data, span, coerce: Coercion::Strict, origin: None })
     }
     /// Take an argument of `run`, which is an expression, or an environment variable as `name: expression`.
     ///
@@ -2286,6 +2411,127 @@ impl Project {
                 None
             },
         }
+    }
+    /// Take the rest of a reference to a crate, `<target>/<name>`, after its target, returning the path of its output.
+    ///
+    /// An attribute of the crate can be taken instead with `.`, as in `<target>/<name>.crate-type`.
+    fn parse_crate_reference(&mut self, parser: &mut Parser, target: String, start: usize) -> Option<Operand> {
+        parser.expect('/');
+        let (name, _) = self.parse_ident(parser)?;
+        let span = parser.span_from(start);
+        let Some(value) = self.value(&format!("{target}/{name}"), span.file) else {
+            self.diagnostics.push(Diagnostic {
+                span: Some(span),
+                message: Message::UnknownCrate { name: name.into(), target },
+                severity: Severity::Error,
+            });
+            return None;
+        };
+        let operand = Operand { data: value.data.clone(), span, coerce: Coercion::Strict, origin: value.origin };
+        if !is_attribute_access(parser) {
+            return Some(operand);
+        }
+        let (attribute, attribute_span) = self.parse_attribute_access(parser)?;
+        let c = &self.crates[&(name.to_string(), target)];
+        let data = match attribute {
+            "target" => Some(Data::Str(c.target.clone())),
+            "crate-type" => Some(Data::Str(c.crate_type().into())),
+            "path" => Some(Data::Str(c.path.display().to_string())),
+            "builtin" => Some(Data::Bool(c.builtin)),
+            "default" => Some(Data::Bool(c.default)),
+            "test" => Some(Data::Bool(c.test)),
+            "use" => Some(Data::List(c.uses.iter().map(|(name, _)| Data::Str(name.clone())).collect())),
+            _ => None,
+        };
+        self.attribute_value("crate", name, attribute, attribute_span, data.map(Some), start, parser)
+    }
+    /// Take the name of an attribute after a `.`, which is at the parser.
+    fn parse_attribute_access<'a>(&mut self, parser: &mut Parser<'a>) -> Option<(&'a str, Span)> {
+        parser.expect('.');
+        self.parse_ident(parser)
+    }
+    /// Returns the value of an attribute, where `data` is [`None`] for an unknown attribute, or [`Some`] of [`None`] for
+    /// one which is not set.
+    fn attribute_value(
+        &mut self,
+        kind: &'static str,
+        name: &str,
+        attribute: &str,
+        attribute_span: Span,
+        data: Option<Option<Data>>,
+        start: usize,
+        parser: &Parser,
+    ) -> Option<Operand> {
+        let message = match data {
+            Some(Some(data)) => {
+                return Some(Operand { data, span: parser.span_from(start), coerce: Coercion::Strict, origin: None });
+            },
+            Some(None) => Message::AttributeNotSet { kind, name: name.into(), attribute: attribute.into() },
+            None => Message::UnknownAttributeOf { kind, name: name.into(), attribute: attribute.into() },
+        };
+        self.diagnostics.push(Diagnostic { span: Some(attribute_span), message, severity: Severity::Error });
+        None
+    }
+    /// Take the attribute of a custom command, a property, a declared target or a test, after its name.
+    ///
+    /// A custom command has a property with its name, so it is looked for first, while a test has its own names, so it
+    /// is looked for last.
+    fn parse_named_attribute(&mut self, parser: &mut Parser, name: &str, span: Span, start: usize) -> Option<Operand> {
+        let (attribute, attribute_span) = self.parse_attribute_access(parser)?;
+        if let Some(custom) = self.customs.iter().find(|custom| !custom.test && custom.name == name) {
+            let paths = |paths: &[PathBuf]| Data::List(paths.iter().map(|path| Data::Str(path.display().to_string())).collect());
+            let data = match attribute {
+                "input" => Some(Some(paths(&custom.inputs))),
+                "output" => Some(Some(paths(&custom.outputs))),
+                "command" => Some(Some(Data::List(custom.command.iter().map(|s| Data::Str(s.clone())).collect()))),
+                "default" => Some(Some(Data::Bool(custom.default))),
+                _ => None,
+            };
+            return self.attribute_value("custom command", name, attribute, attribute_span, data, start, parser);
+        }
+        if let Some(property) = self.properties_idx.get(name).and_then(|&id| self.properties[id].as_ref()) {
+            let data = match attribute {
+                "default" => Some(property.default.clone()),
+                "type" => Some(Some(Data::Str(property.ty.name().into()))),
+                "read-only" => Some(Some(Data::Bool(property.read_only))),
+                "info" => Some(property.info.clone().map(Data::Str)),
+                _ => None,
+            };
+            return self.attribute_value("property", name, attribute, attribute_span, data, start, parser);
+        }
+        let Some(target) = self.custom_targets.iter().find(|target| target.name == name) else {
+            // a test has its own name, which is looked for last
+            if let Some(test) = self.customs.iter().find(|test| test.test && test.name == name) {
+                let strings = |strings: Vec<String>| Data::List(strings.into_iter().map(Data::Str).collect());
+                let data = match attribute {
+                    "input" => {
+                        let inputs = test.inputs(&self.runners).iter().map(|path| path.display().to_string()).collect();
+                        Some(Some(strings(inputs)))
+                    },
+                    "command" => Some(Some(strings(test.command(&self.runners)))),
+                    _ => None,
+                };
+                return self.attribute_value("test", name, attribute, attribute_span, data, start, parser);
+            }
+            self.diagnostics.push(Diagnostic {
+                span: Some(span),
+                message: Message::UnknownReference(name.into()),
+                severity: Severity::Error,
+            });
+            return None;
+        };
+        let strings = |strings: &[String]| Data::List(strings.iter().map(|s| Data::Str(s.clone())).collect());
+        let data = match attribute {
+            "inherit" => Some(target.inherit.clone().map(Data::Str)),
+            "test" => Some(Some(Data::Bool(target.test))),
+            "override" => Some(Some(Data::Bool(target.overrides))),
+            "runner" => Some(target.runner.map(|runner| strings(&self.runners[runner].command))),
+            // a field of the specification, which is named after its option
+            option => TARGET_OPTIONS.iter().find(|(name, ..)| *name == option).map(|&(_, field, _)| {
+                target.fields.iter().find(|(name, _)| name == field).map(|(_, data)| data.clone())
+            }),
+        };
+        self.attribute_value("target", name, attribute, attribute_span, data, start, parser)
     }
     /// Returns the value of a property referenced by an expression, and where the value was set.
     fn property(&mut self, name: &str, span: Span) -> Option<(Data, Option<Span>)> {
@@ -2533,7 +2779,30 @@ impl Project {
             if !self.parse_space(parser) {
                 return None;
             }
-            let (value, span, _) = self.parse_name(parser)?;
+            let (mut value, mut span, _) = self.parse_name(parser)?;
+            // a crate can only use crates for the same target, so it is not given, unlike in a reference to a crate
+            if is_crate_reference(parser) {
+                parser.expect('/');
+                let (crate_name, crate_span) = self.parse_ident(parser)?;
+                // the target is a property, such as `host-target`, or the name of a target, as in a reference
+                let target = match self.value(&value, span.file) {
+                    Some(Value { data: Data::Str(target), .. }) => target.clone(),
+                    _ => value,
+                };
+                let declared = self.crates.get(&(crate_name.into(), target)).map(|c| c.name_span);
+                value = crate_name.into();
+                span = Span { file: span.file, offset: span.offset, len: crate_span.offset + crate_span.len - span.offset };
+                self.diagnostics.push(Diagnostic {
+                    span: Some(span),
+                    message: Message::UseWithTarget { declared },
+                    severity: Severity::Error,
+                });
+                self.diagnostics.push(Diagnostic {
+                    span: Some(span),
+                    message: Message::Replacement { description: "use the crate by its name", replacement: value.clone() },
+                    severity: Severity::Suggestion,
+                });
+            }
             (Data::Str(value), span, None)
         } else if parser.expect(' ') {
             let operand = self.parse_expression(parser)?;
@@ -2681,10 +2950,10 @@ fn expression_end(s: &str) -> Option<usize> {
     None
 }
 
-/// Returns the index of the `)` which closes a parenthesis, given the text after the `(`.
+/// Returns the index of the end of an argument, at the `,` or `)` after it, given the text from its start.
 ///
-/// Parentheses in strings are not counted, and the parenthesis must be closed on the same line.
-fn paren_end(s: &str) -> Option<usize> {
+/// Brackets and strings within the argument are skipped, and the argument must end on the same line.
+fn argument_end(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut depth = 0usize;
     let mut i = 0;
@@ -2692,14 +2961,33 @@ fn paren_end(s: &str) -> Option<usize> {
         match bytes[i] {
             b'\n' => return None,
             b'\'' => i += 1 + string_end(&s[i + 1..])?,
-            b'(' => depth += 1,
-            b')' if depth == 0 => return Some(i),
-            b')' => depth -= 1,
+            b'(' | b'[' | b'{' => depth += 1,
+            b',' | b')' if depth == 0 => return Some(i),
+            b')' | b']' | b'}' if depth > 0 => depth -= 1,
+            b']' | b'}' => return None,
             _ => (),
         }
         i += 1;
     }
     None
+}
+
+/// Returns whether the parser is at the `/` of a reference to a crate, `<target>/<name>`, after its target, which
+/// division cannot be confused with, as an operator must have spaces around it.
+fn is_crate_reference(parser: &Parser) -> bool {
+    let mut chars = parser.as_str().chars();
+    chars.next() == Some('/') && chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+}
+
+/// The name of the test of a crate, which is the name of the crate, with its target if that is not the host target.
+fn crate_test_name(c: &rust::Crate, host: &str) -> String {
+    if c.target == host { c.name.clone() } else { format!("{}@{}", c.name, c.target) }
+}
+
+/// Returns whether the parser is at the `.` of an attribute of what is before it.
+fn is_attribute_access(parser: &Parser) -> bool {
+    let mut chars = parser.as_str().chars();
+    chars.next() == Some('.') && chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
 }
 
 /// Returns whether a character, at index `i`, cannot be part of an identifier.
@@ -2840,6 +3128,8 @@ pub enum Severity {
     Error,
     Warning,
     Note,
+    /// A change which fixes a diagnostic before it.
+    Suggestion,
 }
 impl Severity {
     pub const fn accent(&self) -> &'static str {
@@ -2847,6 +3137,7 @@ impl Severity {
             Self::Error => "\x1b[91m\x1b[1m",
             Self::Warning => "\x1b[93m\x1b[1m",
             Self::Note => "\x1b[96m\x1b[1m",
+            Self::Suggestion => "\x1b[92m\x1b[1m",
         }
     }
 }
@@ -2856,6 +3147,7 @@ impl core::fmt::Display for Severity {
             Severity::Error => write!(f, "error"),
             Severity::Warning => write!(f, "warning"),
             Severity::Note => write!(f, "note"),
+            Severity::Suggestion => write!(f, "suggestion"),
         }
     }
 }
@@ -2994,7 +3286,31 @@ pub enum Message {
         target: String,
         host: String,
     },
-    UseBinary(String),
+    UnknownReference(String),
+    UnknownAttributeOf {
+        kind: &'static str,
+        name: String,
+        attribute: String,
+    },
+    AttributeNotSet {
+        kind: &'static str,
+        name: String,
+        attribute: String,
+    },
+    UseBinary {
+        name: String,
+        /// The declaration of the binary.
+        declared: Span,
+    },
+    UseWithTarget {
+        /// The declaration of the crate for the target, if it has been declared.
+        declared: Option<Span>,
+    },
+    /// A suggestion to replace the span of the diagnostic.
+    Replacement {
+        description: &'static str,
+        replacement: String,
+    },
     OverrideAttribute(String),
     RepeatedTarget(String),
     RedeclareCrate {
@@ -3097,7 +3413,16 @@ impl core::fmt::Display for Message {
                 f,
                 "procedural macros cannot be compiled for target {target:?}, only the host target {host:?}",
             ),
-            Self::UseBinary(name) => write!(f, "crate {name:?} is a binary, which cannot be used by another crate"),
+            Self::UseWithTarget { .. } => write!(f, "cannot use a crate of a different target"),
+            Self::Replacement { description, .. } => f.write_str(description),
+            Self::UnknownReference(name) => write!(f, "no property, custom command, target or test named {name:?}"),
+            Self::UnknownAttributeOf { kind, name, attribute } => {
+                write!(f, "unknown attribute {attribute:?} of {kind} {name:?}")
+            },
+            Self::AttributeNotSet { kind, name, attribute } => {
+                write!(f, "attribute {attribute:?} of {kind} {name:?} is not set")
+            },
+            Self::UseBinary { name, .. } => write!(f, "crate {name:?} is a binary, which cannot be used by another crate"),
             Self::BuiltinTargetName(name) => {
                 write!(f, "{name:?} is the name of a builtin target, which can be changed with `override`")
             },
@@ -3187,8 +3512,9 @@ pub struct CustomTarget {
     pub fields: Vec<(String, Data)>,
     /// Whether crates for the target can be tested.
     pub test: bool,
-    /// The command which runs a test harness for the target, which is its last argument, or none to run it directly.
-    pub runner: Runner,
+    /// The index of the runner of a test harness for the target, which is its last argument, or none to run it
+    /// directly.
+    pub runner: Option<usize>,
 }
 
 /// A command, with its program if that is a path, which it depends on.
@@ -3212,6 +3538,22 @@ pub struct Custom {
     pub default: bool,
     /// Whether this is a test, which has no outputs and is run by `configure --test` rather than ninja.
     pub test: bool,
+    /// The index of the runner of the test's target, which runs its command, as with the test harness of a crate.
+    pub runner: Option<usize>,
+}
+impl Custom {
+    /// The command which is run, by the runner, if there is one.
+    pub fn command(&self, runners: &[Runner]) -> Vec<String> {
+        match self.runner {
+            Some(runner) => runners[runner].command.iter().chain(&self.command).cloned().collect(),
+            None => self.command.clone(),
+        }
+    }
+    /// The inputs, which include the program of the runner, if there is one.
+    pub fn inputs(&self, runners: &[Runner]) -> Vec<PathBuf> {
+        let program = self.runner.and_then(|runner| runners[runner].program.clone());
+        self.inputs.iter().cloned().chain(program).collect()
+    }
 }
 
 pub struct Property {
@@ -3222,6 +3564,8 @@ pub struct Property {
     read_only: bool,
     /// A description of the property, included in diagnostics about it.
     info: Option<String>,
+    /// The value of a `default` attribute, which has the property's type.
+    default: Option<Data>,
 }
 impl Property {
     pub fn new(name: String, ty: Type) -> Self {
@@ -3231,6 +3575,7 @@ impl Property {
             ty,
             read_only: false,
             info: None,
+            default: None,
         }
     }
     pub fn name(&self) -> &str {
@@ -3253,6 +3598,17 @@ pub enum Type {
     List,
 }
 impl Type {
+    /// The name of the type, as used by `declare`.
+    fn name(&self) -> &'static str {
+        match self {
+            Type::Any => "any",
+            Type::String => "str",
+            Type::Bool => "bool",
+            Type::Unsigned => "unsigned",
+            Type::Signed => "signed",
+            Type::List => "list",
+        }
+    }
     /// Returns the data if it has this type, or returns it as an error.
     ///
     /// An unsigned integer is converted for a signed type if it is in range, as a literal without a sign is unsigned.

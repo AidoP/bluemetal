@@ -1068,27 +1068,29 @@ fn try_function() {
     let project = Project::new("try", &[("Build", "\
 declare a
     default 'x'
-@if try(env('BLUEMETAL_CONFIGURE_TEST_UNSET'))
+log note try(env('BLUEMETAL_CONFIGURE_TEST_UNSET'), 'fallback')
+@if try(env('BLUEMETAL_CONFIGURE_TEST_UNSET') == 'a', false)
 log note 'not taken'
-@if !try(env('BLUEMETAL_CONFIGURE_TEST_UNSET') == 'a')
-log note 'skipped the rest'
-log note '{try(env('PATH'))} {try(upper(a))} {try(upper(5))} {try(missing)} {try(1 + )} {try(a, a)}'
-log note 'nested {try(try(read('no file')))} paren {try(upper(')('))}'
+log note '{try(upper(a), 'never')} {try(upper(5), 1)} {try(missing, 2)} {try(1 + , 3)} {try(a b, 4)}'
+log note try(get(['a', ')'], 5), [1, 2])
+log note try(missing, try(also_missing, 'nested'))
+log note try(upper(','), 'x')
 ")]);
     let output = project.configure().ok();
     output
-        // errors are reported as warnings
-        .stderr("warning: environment variable \"BLUEMETAL_CONFIGURE_TEST_UNSET\" is not set\n --> Build:3:13")
-        // the rest of the argument is skipped after an error
-        .stderr("note: skipped the rest\n")
-        .stderr("warning: unsigned value used where str is required\n --> Build:7:57")
+        // errors are reported as warnings, and the default is the value
+        .stderr("warning: environment variable \"BLUEMETAL_CONFIGURE_TEST_UNSET\" is not set\n --> Build:3:18")
+        .stderr("note: fallback\n")
+        .stderr("warning: unsigned value used where str is required\n --> Build:6:47")
         .stderr("warning: no value for property \"missing\"")
         .stderr("warning: expected expression")
-        .stderr("warning: expected \")\"")
-        .stderr("note: true true false false false false\n")
-        // a `try` succeeds even if its argument is a `try` which failed
-        .stderr("note: nested true paren true\n")
-        .stderr("configuration raised 7 warnings");
+        .stderr("warning: expected \", \" or \")\"")
+        // the rest of the argument is skipped after an error, even if it is in a string or brackets
+        .stderr("note: X 1 2 3 4\n")
+        .stderr("note: 1 2\n")
+        .stderr("note: nested\n")
+        .stderr("note: ,\n")
+        .stderr("configuration raised 9 warnings");
     assert!(!output.stderr.contains("not taken"), "{}", output.stderr);
 }
 
@@ -1097,21 +1099,25 @@ fn try_errors() {
     let project = Project::new("try-errors", &[("Build", "\
 declare a
 set a try()
+set a try(env('X'))
+set a try(env('X'), nope)
 set a try(upper('unclosed'
 ")]);
-    // errors which leave the end of the argument unknown are not suppressed
+    // the default is required, and its errors, or those which leave the end of the argument unknown, are not suppressed
     project.configure().failed()
-        .stderr("error: function \"try\" takes 1 argument, but 0 were given\n --> Build:2:7")
-        .stderr("error: expected \", \" or \")\"\n --> Build:3:27")
-        .stderr("configuration failed with 2 errors");
+        .stderr("error: function \"try\" takes 2 arguments, but 1 was given\n --> Build:2:7")
+        .stderr("error: function \"try\" takes 2 arguments, but 1 was given\n --> Build:3:7")
+        .stderr("error: no value for property \"nope\"\n --> Build:4:21")
+        .stderr("error: expected \", \" or \")\"\n --> Build:5:27")
+        .stderr("configuration failed with 4 errors");
 }
 
 #[test]
 fn missing_paths_are_not_dependencies() {
     let project = Project::new("missing-dependencies", &[("Build", "\
-@if try(run('./missing-program'))
+@if try(run('./missing-program') == '', false)
 log note 'ran'
-@if try(read('missing-file'))
+@if try(read('missing-file') == '', false)
 log note 'read'
 ")]);
     project.configure().ok().stderr("warning: failed to run \"./missing-program\"");
@@ -1128,6 +1134,7 @@ log note level * 3
 log note upper('loud')
 log warning level > 1
 log note (level)
+log suggestion 'try {level}'
 log note
 ")]);
     project.configure().failed()
@@ -1135,7 +1142,9 @@ log note
         .stderr("note: LOUD\n")
         .stderr("warning: true\n")
         .stderr("note: 2\n")
-        .stderr("error: expected \" \"\n --> Build:7:9")
+        // a suggestion is not counted
+        .stderr("suggestion: try 2\n --> Build:7:16")
+        .stderr("error: expected \" \"\n --> Build:8:9")
         .stderr("configuration failed with 1 error, 1 warning");
 }
 
@@ -1301,7 +1310,7 @@ custom d
     command 'echo' input
     input 'late'
     output 'w'
-log note '{try(input)}'
+log note '{try(input, false)}'
 ")]);
     project.configure().failed()
         .stderr("error: missing required attribute \"command\"\n --> Build:1:8")
@@ -1550,9 +1559,9 @@ test app
     project.configure().failed()
         // other environments are not supported yet
         .stderr(&format!("error: tests for target \"riscv64gc-unknown-none-elf\" cannot be run, only those for the host target \"{host}\" or a target with `test`\n --> Build:2:12"))
-        // the tests of crates are registered once the targets are known, after the statements
-        .stderr("error: redeclaration of test \"app\"\n --> Build:4:7")
-        .stderr("note: previously declared here\n --> Build:6:6");
+        // the test of a crate is forward declared with it
+        .stderr("error: redeclaration of test \"app\"\n --> Build:6:6")
+        .stderr("note: previously declared here\n --> Build:4:7");
 }
 
 #[test]
@@ -1818,7 +1827,7 @@ target plain
         bytes
     };
     let contains = |needle: &[u8]| database.windows(needle.len()).any(|window| window == needle);
-    assert!(contains(&strings(&["./run.sh", "-m", "virt", "target/vm/test/app"])));
+    assert!(contains(&strings(&["./run.sh", "-m", "virt", "./target/vm/test/app"])));
     assert!(contains(&strings(&["./target/plain/test/app"])));
 }
 
@@ -2113,6 +2122,7 @@ crate d 'd.rs'
         .stderr("error: invalid crate type \"dylib\", which must be \"lib\", \"bin\" or \"proc-macro\"\n --> Build:2:16")
         .stderr(&format!("error: procedural macros cannot be compiled for target \"riscv64gc-unknown-none-elf\", only the host target \"{host}\"\n --> Build:5:12"))
         .stderr("error: crate \"tool\" is a binary, which cannot be used by another crate\n --> Build:9:9")
+        .stderr("note: declared here\n --> Build:6:7\n  |\n6 | crate tool 'tool.rs'\n  |       ^^^^\n")
         .stderr("error: unsigned value used where str is required\n  --> Build:11:16")
         .stderr("configuration failed with 4 errors");
 }
@@ -2233,4 +2243,183 @@ log note '{min(offset, unsigned)}'
         .stderr("error: str value used where integer is required\n  --> Build:13:16")
         .stderr("error: mismatched operand types signed and unsigned\n  --> Build:14:12")
         .stderr("configuration failed with 4 errors");
+}
+
+#[test]
+fn output_properties() {
+    let project = Project::new("output-properties", &[("Build", "\
+crate core 'core.rs'
+    target ['riscv64gc-unknown-none-elf', host-target]
+crate kernel 'kernel.rs'
+    target 'riscv64gc-unknown-none-elf'
+custom image
+    input riscv64gc-unknown-none-elf/kernel
+    output 'kernel.bin'
+    command 'objcopy' '-O' 'binary' input output
+custom pair
+    output ['a.txt', 'b.txt']
+    command 'touch' output
+log note riscv64gc-unknown-none-elf/core
+@for t in ['riscv64gc-unknown-none-elf', host-target]
+log note {t}/core
+log note '{image} {pair} {8 / 2}'
+log note '{host-target/core}'
+@for t in ['riscv64gc-unknown-none-elf']
+log note '{t/kernel}'
+")]);
+    let host = project.host();
+    let output = project.configure().ok();
+    // a crate is referred to with its target, as the path of its output
+    output.stderr("note: target/riscv64gc-unknown-none-elf/libcore.rlib\n");
+    output.stderr(&format!("note: target/{host}/libcore.rlib\n"));
+    // and a custom command by its name, as its outputs
+    output.stderr("note: kernel.bin a.txt b.txt 4\n");
+    // the target can be a property, including in a string template
+    output.stderr(&format!("note: target/{host}/libcore.rlib\n  --> Build:16:10"));
+    output.stderr("note: target/riscv64gc-unknown-none-elf/libkernel.rlib\n  --> Build:18:10");
+    assert_contains(output.build("kernel.bin"), "build kernel.bin: custom target/riscv64gc-unknown-none-elf/libkernel.rlib");
+}
+
+#[test]
+fn output_property_errors() {
+    let project = Project::new("output-property-errors", &[("Build", "\
+crate core 'core.rs'
+    target 'riscv64gc-unknown-none-elf'
+custom image
+    output 'kernel.bin'
+    command 'true'
+log note x86_64-unknown-none/core
+log note riscv64gc-unknown-none-elf/nothing
+declare image
+set image 'x'
+")]);
+    project.configure().failed()
+        .stderr("error: no crate \"core\" for target \"x86_64-unknown-none\"\n --> Build:6:10")
+        .stderr("error: no crate \"nothing\" for target \"riscv64gc-unknown-none-elf\"\n --> Build:7:10")
+        // the properties of outputs are declared and read-only
+        .stderr("error: redeclaration of property \"image\"\n --> Build:8:9")
+        .stderr("note: image: the output of the custom command\n")
+        .stderr("error: cannot set read-only property \"image\"\n --> Build:9:5")
+        .stderr("configuration failed with 4 errors");
+}
+
+#[test]
+fn use_with_target() {
+    let project = Project::new("use-with-target", &[("Build", "\
+crate util 'util.rs'
+    target ['riscv64gc-unknown-none-elf', 'x86_64-unknown-none']
+crate kernel 'kernel.rs'
+    target 'riscv64gc-unknown-none-elf'
+    use riscv64gc-unknown-none-elf/util
+crate third 'third.rs'
+    use host-target/util
+")]);
+    let host = project.host();
+    project.configure().failed()
+        // the crate is still used by its name, rather than taking the target as one
+        .stderr("\
+error: cannot use a crate of a different target
+ --> Build:5:9
+  |
+5 |     use riscv64gc-unknown-none-elf/util
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: declared here
+ --> Build:1:7
+  |
+1 | crate util 'util.rs'
+  |       ^^^^
+suggestion: use the crate by its name
+ --> Build:5:9
+  |
+5 |     use util
+  |         ~~~~
+")
+        // without a declaration of the crate for the target, there is nothing to note
+        .stderr("error: cannot use a crate of a different target\n --> Build:7:9\n  |\n7 |     use host-target/util\n  |         ^^^^^^^^^^^^^^^^\nsuggestion")
+        .stderr("suggestion: use the crate by its name\n --> Build:7:9\n  |\n7 |     use util\n")
+        .stderr(&format!("error: no crate \"util\" for target \"{host}\"\n --> Build:7:9"))
+        .stderr("configuration failed with 3 errors");
+}
+
+#[test]
+fn attribute_access() {
+    let project = Project::new("attribute-access", &[("Build", "\
+declare data
+    type 'unsigned'
+    default 1
+    info 'some data'
+set data 2
+log note '{data} {data.default} {data.read-only} {data.type} {data.info} {host-target.read-only}'
+crate util 'util.rs'
+    target ['riscv64gc-unknown-none-elf', 'my-kernel']
+crate macros 'm.rs'
+    crate-type 'proc-macro'
+log note '{my-kernel/util.target} {host-target/macros.crate-type} {my-kernel/util.use} {my-kernel/util.path} {my-kernel/util.test}'
+target my-kernel
+    inherit 'riscv64gc-unknown-none-elf'
+    test
+    runner ['qemu', '-kernel']
+    target-cpu 'generic-rv64'
+target riscv64gc-unknown-none-elf
+    override
+log note '{my-kernel.inherit} {my-kernel.test} {my-kernel.runner} {my-kernel.target-cpu} {riscv64gc-unknown-none-elf.override}'
+declare plain
+log note plain.default
+log note data.bogus
+log note my-kernel.code-model
+log note nothing.default
+log note my-kernel/util.bogus
+")]);
+    project.configure_with(NIGHTLY).failed()
+        // the attributes of a property are those it was declared with, rather than its value
+        .stderr("note: 2 1 false unsigned some data true\n")
+        .stderr("note: my-kernel proc-macro  util.rs false\n")
+        .stderr("note: riscv64gc-unknown-none-elf true qemu -kernel generic-rv64 true\n")
+        .stderr("error: attribute \"default\" of property \"plain\" is not set\n  --> Build:21:16")
+        .stderr("error: unknown attribute \"bogus\" of property \"data\"\n  --> Build:22:15")
+        .stderr("error: attribute \"code-model\" of target \"my-kernel\" is not set\n  --> Build:23:20")
+        .stderr("error: no property, custom command, target or test named \"nothing\"\n  --> Build:24:10")
+        .stderr("error: unknown attribute \"bogus\" of crate \"util\"\n  --> Build:25:25")
+        .stderr("configuration failed with 5 errors");
+}
+
+#[test]
+fn custom_attribute_access() {
+    let project = Project::new("custom-attribute-access", &[
+        ("Build", "use 'sub'\nlog note '{image.input} | {image.output} | {image.command} | {image.default} | {image}'\nlog note image.bogus\n"),
+        ("sub/Build", "\
+custom image
+    input ['a.dts', 'b.dtsi']
+    output 'image.bin'
+    command './tool.sh' '-o' output input
+    default
+"),
+    ]);
+    project.configure().failed()
+        // the paths are relative to the project, as they are in the command
+        .stderr("note: sub/a.dts sub/b.dtsi | sub/image.bin | ./sub/tool.sh -o sub/image.bin sub/a.dts sub/b.dtsi | true | sub/image.bin\n")
+        .stderr("error: unknown attribute \"bogus\" of custom command \"image\"\n --> Build:3:16")
+        .stderr("configuration failed with 1 error");
+}
+
+#[test]
+fn test_attribute_access() {
+    let project = Project::new("test-attribute-access", &[
+        ("Build", "\
+use 'sub'
+log note '{unit.input} | {unit.command}'
+log note unit.output
+crate app 'app.rs'
+    test
+log note app.command
+"),
+        ("sub/Build", "test unit\n    input 'data.txt'\n    command './check.sh' input\n"),
+    ]);
+    let host = project.host();
+    project.configure().failed()
+        .stderr("note: sub/data.txt | ./sub/check.sh sub/data.txt\n")
+        .stderr("error: unknown attribute \"output\" of test \"unit\"\n --> Build:3:15")
+        // the test of a crate is forward declared with it
+        .stderr(&format!("note: ./target/{host}/test/app\n"))
+        .stderr("configuration failed with 1 error");
 }

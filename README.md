@@ -36,12 +36,24 @@ declares its crates, which are not passed builtin crates.
 - `set <name> <value>`: assign a value to a property
 - `crate <name> [<path>]`: introduce a Rust library crate named `<name>`, with its root at `<path>`, or at
   `<name>/lib.rs` relative to the file without one
-- `log <severity> <expression>`: report the value of an expression as an `error`, `warning` or `note`
+- `log <severity> <expression>`: report the value of an expression as an `error`, `warning`, `note` or `suggestion`
 - `custom <name>`: a custom build command, which ninja runs when its inputs change. Its outputs can be built with
   `ninja custom/<name>`
 - `target <name>`: a custom target, which crates can be compiled for. See below
 - `test <name>`: a test, which passes if its command succeeds. Like `custom`, it has `input` and `command` attributes,
   but no `output` or `default`. Its inputs are built with `ninja test/<name>`, or those of every test with `ninja test`
+
+A crate is a read-only property, `<target>/<name>`, whose value is the path of its output, for each target it is declared
+for. Its target can be a property with the name of a target, as in `host-target/core`, or computed with an expression in
+`{}`, as in `{get(targets, 0)}/core`. A custom command is a read-only
+property with its name, whose value is the path of its output, or a list of them if it has more than one.
+
+```
+custom image
+    input riscv64gc-unknown-none-elf/kernel
+    output 'kernel.bin'
+    command 'objcopy' '-O' 'binary' input output
+```
 
 A `<name>` is an identifier: ASCII letters, digits, `-` and `_`, not starting with a digit. Crate names cannot
 contain `-`, as rustc does not accept it. A name can instead be computed with an expression in `{}`, whose value must
@@ -120,6 +132,14 @@ log note 'added {a}, the total is {total}'
 
 An expression is a string, `true`, `false`, an integer, a list or the name of a property.
 
+An attribute is taken with `.` after the name of a property, a custom command, a crate, as `<target>/<name>`, or a
+declared target, as in `data.default`, `image.input`, `host-target/macros.crate-type` or `my-kernel.runner`. Those of a
+property are `default`, `type`, `read-only` and `info`, those of a custom command are `input`, `output` and `command`,
+as lists, and `default`, those of a test, which is looked for after the others, are `input` and `command`, those of a
+crate are `target`, `crate-type`, `path`, `builtin`, `default`, `test` and `use`, and
+those of a target are `inherit`, `test`, `runner`, `override` and its options, such as `code-model`. An attribute
+which is not set is an error.
+
 A list is written as expressions in `[]`, separated by `, `, such as `['-O', 'dtb']`, and its items can have any type.
 Lists can be joined with `+` and compared with `==` and `!=`. As a string, such as in a string template, the items of
 a list are separated by spaces, while each item is a separate argument of a command, such as for `run`.
@@ -164,12 +184,11 @@ Functions are called with their arguments in `()`, separated by `, `:
   the expression. The build is reconfigured when the file changes
 - `exists(path)`: whether a file or directory exists, as a `bool`, where the path is relative to the file containing
   the expression. The build is reconfigured when an existing path changes, but not when a missing one is created
-- `try(expression)`: whether the expression is evaluated without errors, as a `bool`. Its errors are reported as
-  warnings instead, and its value is discarded
+- `try(expression, default)`: the value of the expression, or the default if evaluating it fails. Its errors are reported
+  as warnings instead
 
 ```
-@if try(env('CROSS_COMPILE'))
-set prefix env('CROSS_COMPILE')
+set prefix try(env('CROSS_COMPILE'), '')
 ```
 
 - `which(name)`: the path of the first executable file with the given name in the directories of the `PATH` environment
