@@ -9,6 +9,12 @@ use super::value::Data;
 use super::customs::{Custom, CustomKind};
 use super::{Project, rust};
 
+/// The targets a crate is declared for, from its `target` attribute or the property in effect.
+struct CrateTargets {
+    names: Vec<String>,
+    span: Span,
+}
+
 /// The name of the test of a crate, which is the name of the crate, with its target if that is not the host target.
 fn crate_test_name(c: &rust::Crate, host: &str) -> String {
     if c.target == host { c.name.clone() } else { format!("{}@{}", c.name, c.target) }
@@ -52,7 +58,7 @@ impl Project {
         let mut builtin = false;
         let mut default = false;
         let mut test = false;
-        let mut target = None;
+        let mut targets = None;
         let mut uses = Vec::new();
         let mut kind = rust::Kind::Lib;
         while let Some(attribute) = self.next_attribute(parser, &["use"]) {
@@ -77,11 +83,11 @@ impl Project {
                     }
                 },
                 "target" => match attribute.data {
-                    Data::Str(string) => target = Some((vec![string], attribute.data_span)),
+                    Data::Str(name) => targets = Some(CrateTargets { names: vec![name], span: attribute.data_span }),
                     // a crate is declared for each of a list of targets
                     Data::List(items) if items.iter().all(|item| matches!(item, Data::Str(_))) => {
-                        let targets = items.iter().map(Data::coerce_string).collect();
-                        target = Some((targets, attribute.data_span));
+                        let names = items.iter().map(Data::coerce_string).collect();
+                        targets = Some(CrateTargets { names, span: attribute.data_span });
                     },
                     _ => self.invalid_operand(&attribute.operand(), "str", false),
                 },
@@ -102,11 +108,17 @@ impl Project {
         }
         // a procedural macro is loaded by rustc, so it is compiled for the host target, which is otherwise the `target`
         // property in effect at its declaration
-        let host = self.property("host-target", span).map_or_default(|(data, _)| data.coerce_string());
-        let default_target = if kind == rust::Kind::ProcMacro { "host-target" } else { "target" };
-        let (targets, target_span) = target.unwrap_or_else(|| {
-            (vec![self.property(default_target, span).map_or_default(|(data, _)| data.coerce_string())], span)
-        });
+        let host = self.property("host-target", span).map_or_default(|host| host.data.coerce_string());
+        let targets = match targets {
+            Some(targets) => targets,
+            None => {
+                let property = if kind == rust::Kind::ProcMacro { "host-target" } else { "target" };
+                let target = self.property(property, span).map_or_default(|target| target.data.coerce_string());
+                CrateTargets { names: vec![target], span }
+            },
+        };
+        let target_span = targets.span;
+        let targets = targets.names;
         if kind == rust::Kind::ProcMacro && let Some(target) = targets.iter().find(|target| **target != host) {
             self.diagnostics.push(Diagnostic {
                 span: Some(target_span),
@@ -115,7 +127,8 @@ impl Project {
             });
             return;
         }
-        let mut outputs = Vec::new();
+        // the targets the crate is declared for, whose outputs are declared after its tests are registered
+        let mut declared = Vec::new();
         for (i, target) in targets.iter().enumerate() {
             if targets[..i].contains(target) {
                 self.diagnostics.push(Diagnostic {
@@ -152,9 +165,7 @@ impl Project {
                         test,
                         uses: uses.clone(),
                     });
-                    // a crate is referred to as `<target>/<name>`, as it may be declared for several targets
-                    let output = c.output().map(|output| (format!("{}/{}", c.target, c.name), output));
-                    outputs.extend(output);
+                    declared.push(c.target.clone());
                     // the test is forward declared, so that it can be referred to, and completed once the target is known
                     if test {
                         let name = crate_test_name(c, &host);
@@ -164,7 +175,13 @@ impl Project {
                 },
             }
         }
-        for (property, output) in outputs {
+        for target in declared {
+            let c = &self.crates[&(name.clone(), target)];
+            let Some(output) = c.output() else {
+                continue;
+            };
+            // a crate is referred to as `<target>/<name>`, as it may be declared for several targets
+            let property = format!("{}/{}", c.target, c.name);
             self.declare_outputs(property, span, "crate", vec![output]);
         }
     }
@@ -188,14 +205,21 @@ impl Project {
     pub(super) fn add_crate_tests(&mut self) {
         let host = self.values_idx.get("host-target").map_or_default(|&value| self.values[value].data.coerce_string());
         // in the order they were declared, as the crates are not
-        let mut keys: Vec<_> = self.crates.iter()
-            .filter(|(_, c)| c.test && !c.implicit)
-            .map(|(key, c)| (key.clone(), (c.name_span.file, c.name_span.offset)))
-            .collect();
-        keys.sort_by(|(lhs, lhs_position), (rhs, rhs_position)| (lhs_position, lhs).cmp(&(rhs_position, rhs)));
-        for (key, _) in keys {
+        let mut keys = Vec::new();
+        for (key, c) in &self.crates {
+            if c.test && !c.implicit {
+                keys.push(key.clone());
+            }
+        }
+        keys.sort_by(|lhs, rhs| {
+            let (lhs_span, rhs_span) = (self.crates[lhs].name_span, self.crates[rhs].name_span);
+            (lhs_span.file, lhs_span.offset, lhs).cmp(&(rhs_span.file, rhs_span.offset, rhs))
+        });
+        for key in keys {
             let c = &self.crates[&key];
-            let (name, span, target_span) = (crate_test_name(c, &host), c.name_span, c.target_span);
+            let name = crate_test_name(c, &host);
+            let span = c.name_span;
+            let target_span = c.target_span;
             // the test which was forward declared, unless another had its name
             let declared = self.customs.iter().position(|test| {
                 test.is_test() && test.name == name && (test.name_span.file, test.name_span.offset) == (span.file, span.offset)

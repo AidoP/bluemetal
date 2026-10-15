@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use super::diagnostic::{Diagnostic, Message, Severity};
 use super::syntax::{Parser, Span};
-use super::value::{Data, Property, Type, Value};
+use super::value::{Coercion, Data, Operand, Property, Type, Value};
 use super::Project;
 
 impl Project {
@@ -269,7 +269,7 @@ impl Project {
         self.files[file].locals.insert(name.into(), id);
     }
     /// Returns the value of a property referenced by an expression, and where the value was set.
-    pub(super) fn property(&mut self, name: &str, span: Span) -> Option<(Data, Option<Span>)> {
+    pub(super) fn property(&mut self, name: &str, span: Span) -> Option<Operand> {
         let Some(value) = self.value(name, span.file) else {
             self.diagnostics.push(Diagnostic {
                 span: Some(span),
@@ -278,6 +278,6 @@ impl Project {
             });
             return None;
         };
-        Some((value.data.clone(), value.origin))
+        Some(Operand { data: value.data.clone(), span, coerce: Coercion::Strict, origin: value.origin })
     }
 }

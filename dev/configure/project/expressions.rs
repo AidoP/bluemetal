@@ -109,12 +109,11 @@ impl Project {
                 if is_attribute_access(parser) {
                     return self.parse_named_attribute(parser, name, span, start);
                 }
-                let (data, origin) = match name {
-                    "true" => (Data::Bool(true), None),
-                    "false" => (Data::Bool(false), None),
-                    _ => self.property(name, span)?,
-                };
-                Some(Operand { data, span, coerce: Coercion::Strict, origin })
+                match name {
+                    "true" => Some(Operand { data: Data::Bool(true), span, coerce: Coercion::Strict, origin: None }),
+                    "false" => Some(Operand { data: Data::Bool(false), span, coerce: Coercion::Strict, origin: None }),
+                    _ => self.property(name, span),
+                }
             },
             _ => {
                 self.diagnostics.push(Diagnostic {
