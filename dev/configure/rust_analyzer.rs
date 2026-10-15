@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::Unit;
+use crate::generate::Unit;
 
 /// Write the project file.
 ///

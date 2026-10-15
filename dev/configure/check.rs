@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::Unit;
+use crate::generate::Unit;
 use crate::database;
 
 /// Returns the diagnostics to replay for a flycheck of a unit: its own, then those of the units it depends on, directly

@@ -2,13 +2,12 @@ use std::{io::IsTerminal, path::{Path, PathBuf}};
 
 mod check;
 mod database;
+mod generate;
 mod ninja;
 mod project;
 mod rust_analyzer;
 mod target_spec;
 mod test_runner;
-
-use ninja::NinjaFile;
 
 fn main() -> std::process::ExitCode {
     let mut args = std::env::args_os();
@@ -100,392 +99,48 @@ fn run(mut args: std::env::ArgsOs) -> Result<(), Error> {
     }
     project.check();
 
-    if !project.diagnostics.is_empty() {
-        let mut errors = 0;
-        let mut warnings = 0;
-        let mut stderr = std::io::stderr().lock();
-        let pretty = stderr.is_terminal();
-        for diagnostic in &project.diagnostics {
-            match diagnostic.severity {
-                project::Severity::Error => errors += 1,
-                project::Severity::Warning => warnings += 1,
-                _ => (),
-            }
-            if let Err(error) = project.write_diagnostic(&mut stderr, diagnostic, pretty) {
-                return Err(Error::Stderr(error));
-            }
-        }
-        let result = Error::Diagnostics { errors, warnings };
-        if errors > 0 {
-            return Err(result);
-        } else if warnings > 0 {
-            let diagnostic = project::Diagnostic {
-                span: None,
-                message: project::Message::User(result.to_string()),
-                severity: project::Severity::Warning,
-            };
-            if let Err(error) = project.write_diagnostic(&mut stderr, &diagnostic, pretty) {
-                return Err(Error::Stderr(error));
-            }
-        }
-    }
-
-    // a builtin target which is overridden keeps its specification
-    for target in project.custom_targets.iter().filter(|target| !target.overrides) {
-        let inherited = match &target.inherit {
-            Some(base) => Some(target_spec_json(base)?),
-            None => None,
-        };
-        let path = target_spec::path(&target.name);
-        let spec = match target_spec::spec(target, inherited.as_deref()) {
-            Ok(spec) => spec,
-            Err(error) => return Err(Error::TargetSpec(target.name.clone(), error)),
-        };
-        // every crate for the target depends on its specification, so it is only written when it changes
-        if std::fs::read_to_string(&path).is_ok_and(|current| current == spec) {
-            continue;
-        }
-        let written = std::fs::create_dir_all(path.parent().unwrap()).and_then(|()| std::fs::write(&path, spec));
-        if let Err(error) = written {
-            return Err(Error::Write(path, error));
-        }
-    }
-    // the flag for compiling for a target, and the specification of a custom target which it depends on
-    let custom_targets: Vec<_> = project.custom_targets.iter()
-        .filter(|target| !target.overrides)
-        .map(|target| target.name.clone())
-        .collect();
-    let target_flag = |target: &str| -> (String, Option<PathBuf>) {
-        if custom_targets.iter().any(|custom| custom == target) {
-            let path = target_spec::path(target);
-            (format!("--target={} -Zunstable-options", path.display()), Some(path))
-        } else {
-            (format!("--target={target}"), None)
-        }
-    };
-
-    let depfile_path = std::path::Path::new("build.ninja.d");
-    let mut depfile = match std::fs::File::create(depfile_path) {
-        Ok(file) => file,
-        Err(error) => return Err(Error::Create(depfile_path.into(), error)),
-    };
-    if let Err(error) = write_depfile(&mut depfile, &project) {
-        return Err(Error::Write(depfile_path.into(), error));
-    }
-
-    let mut build_ninja = NinjaFile::new("build.ninja")?;
-
-    // `build.ninja` regenerates itself with the configure tool, which it also builds if it is part of the project, so
-    // `bootstrap.ninja` is only needed the first time
-    let configure = if self_hosted {
-        PathBuf::from(CONFIGURE)
-    } else {
-        std::env::current_exe().unwrap_or_else(|_| CONFIGURE.into())
-    };
-    let command = format!("{} $in $out", shell_quote(&configure.display().to_string()).replace('$', "$$"));
-    build_ninja.rule("configure", &[
-        ("command", &command),
-        ("description", "CONFIGURE $out"),
-        ("pool", "console"),
-        ("deps", "gcc"),
-        ("depfile", "$out.d"),
-        ("generator", "1"),
-    ])?;
-    let configure_dependency: Vec<_> = self_hosted.then_some(Path::new(CONFIGURE)).into_iter().collect();
-    build_ninja.build(&ninja::Build {
-        rule: "configure",
-        outputs: &[Path::new("build.ninja")],
-        inputs: &[&input],
-        implicit: &configure_dependency,
-        ..Default::default()
-    })?;
-
-    build_ninja.variable("edition", "2024")?;
-    build_ninja.rule("rustc", &[
-        ("command", "rustc --color=always --out-dir=target/tmp --emit=link=$out --emit=dep-info=$depfile --crate-type=$crate-type --crate-name=$crate-name --edition=$edition $flags $in"),
-        ("description", "RUSTC $out"),
-        ("deps", "gcc"),
-        ("depfile", "$out.d"),
-    ])?;
-
-    build_ninja.rule("rustc-check", &[
-        ("command", "rustc --error-format=json --out-dir=$outdir --emit=metadata=$out --emit=dep-info=$out.d --crate-type=$crate-type --crate-name=$crate-name --edition=$edition $flags $in 2> $diagnostics"),
-        ("description", "CHECK $out"),
-        ("deps", "gcc"),
-        ("depfile", "$out.d"),
-    ])?;
-
-    // the targets built by `ninja` without any, which are all targets if there are none
-    let mut defaults: Vec<PathBuf> = Vec::new();
-
-    build_ninja.rule("custom", &[("command", "$command"), ("description", "CUSTOM $name")])?;
-    let mut tests = Vec::new();
-    for custom in &project.customs {
-        // a test is run by `configure --test`, which builds its inputs and program with this target first
-        if custom.test {
-            let phony = Path::new("test").join(&custom.name);
-            let inputs = custom.inputs(&project.runners);
-            let inputs: Vec<_> = inputs.iter().chain(&custom.program).map(PathBuf::as_path).collect();
-            build_ninja.build(&ninja::Build { rule: "phony", outputs: &[&phony], inputs: &inputs, ..Default::default() })?;
-            tests.push(phony);
-            continue;
-        }
-        // ninja runs commands with `sh`, which must not split or expand the arguments
-        let command: Vec<_> = custom.command.iter().map(|argument| shell_quote(argument)).collect();
-        let command = command.join(" ").replace('$', "$$");
-        let outputs: Vec<_> = custom.outputs.iter().map(PathBuf::as_path).collect();
-        let inputs: Vec<_> = custom.inputs.iter().map(PathBuf::as_path).collect();
-        let program: Vec<_> = custom.program.iter().map(PathBuf::as_path).collect();
-        build_ninja.build(&ninja::Build {
-            rule: "custom",
-            outputs: &outputs,
-            inputs: &inputs,
-            implicit: &program,
-            variables: &[("command", &command), ("name", &custom.name)],
-            ..Default::default()
-        })?;
-        // so that the outputs can be built by name
-        let phony = Path::new("custom").join(&custom.name);
-        build_ninja.build(&ninja::Build {
-            rule: "phony",
-            outputs: &[&phony],
-            inputs: &outputs,
-            ..Default::default()
-        })?;
-        if custom.default {
-            defaults.push(phony);
-        }
-    }
-
-    let mut crates: Vec<_> = project.crates.into_values().collect();
-    crates.sort_unstable_by(|lhs, rhs| (&lhs.name, &lhs.target).cmp(&(&rhs.name, &rhs.target)));
-    for c in &crates {
-        // a dependency is a library, so it has an output
-        let deps: Vec<_> = externs(c, &crates).map(|(_, d)| (d.name.as_str(), d.output().unwrap())).collect();
-        let (target, spec) = target_flag(&c.target);
-        let flags = rustc_flags(&target, Path::new(&format!("target/{}", c.target)), c.kind, &deps);
-        let deps: Vec<_> = deps.iter().map(|(_, path)| path.as_path()).chain(spec.as_deref()).collect();
-        let crate_type = c.crate_type();
-        let output = c.output();
-        if let Some(output) = &output {
-            build_ninja.build(&ninja::Build {
-                rule: "rustc",
-                outputs: &[output],
-                inputs: &[&c.path],
-                implicit: &deps,
-                variables: &[("crate-name", &c.name), ("crate-type", crate_type), ("flags", &flags)],
-                ..Default::default()
-            })?;
-        }
-        if c.test {
-            build_ninja.build(&ninja::Build {
-                rule: "rustc",
-                outputs: &[&c.test_harness()],
-                inputs: &[&c.path],
-                implicit: &deps,
-                variables: &[("crate-name", &c.name), ("crate-type", crate_type), ("flags", &format!("{flags} --test"))],
-                ..Default::default()
-            })?;
-        }
-        if c.default && let Some(output) = output {
-            defaults.push(output);
-        }
-    }
-
-    let units: Vec<_> = crates.iter().map(|c| Unit {
-        label: format!("{}@{}", c.name, c.target),
-        name: c.name.clone(),
-        root: c.path.clone(),
-        target: c.target.clone(),
-        spec: target_flag(&c.target).1,
-        // a library is checked without `--test`, as its metadata is used by the crates which depend on it
-        test: c.test && !matches!(c.kind, project::rust::Kind::Lib | project::rust::Kind::ProcMacro),
-        kind: c.kind,
-        output: c.output(),
-        deps: externs(c, &crates).map(|(index, _)| index).collect(),
-        // crates from the toolchain, such as `core`, are not edited
-        member: c.implicit || !rust_analyzer::absolute(&c.path).starts_with(&sysroot),
-        build_file: project.files[c.name_span.file].path.clone(),
-    }).collect();
-
-    // each check is an ordinary edge which saves its diagnostics, so that a flycheck can replay them when it is up to
-    // date, as rust-analyzer only shows the diagnostics from the latest flycheck
-    for unit in &units {
-        // a procedural macro is run by rustc, even when checking, so its own output is used rather than its metadata
-        let deps: Vec<_> = unit.deps.iter()
-            .map(|&index| {
-                let dep = &units[index];
-                let path = match dep.kind {
-                    project::rust::Kind::ProcMacro => dep.output.clone().unwrap(),
-                    _ => dep.check_rmeta(),
-                };
-                (dep.name.as_str(), path)
-            })
-            .collect();
-        let (target, spec) = target_flag(&unit.target);
-        let mut flags = rustc_flags(&target, &unit.check_dir(), unit.kind, &deps);
-        if unit.test {
-            flags.push_str(" --test");
-        }
-        let deps: Vec<_> = deps.iter().map(|(_, path)| path.as_path()).chain(spec.as_deref()).collect();
-        let output = unit.check_rmeta();
-        let diagnostics = unit.diagnostics();
-        let outdir = unit.check_dir();
-        build_ninja.build(&ninja::Build {
-            rule: "rustc-check",
-            outputs: &[&output],
-            implicit_outputs: &[&diagnostics],
-            inputs: &[&unit.root],
-            implicit: &deps,
-            variables: &[
-                ("crate-name", &unit.name),
-                ("crate-type", unit.kind.crate_type()),
-                ("flags", &flags),
-                ("outdir", &outdir.display().to_string()),
-                ("diagnostics", &diagnostics.display().to_string()),
-            ],
-            ..Default::default()
-        })?;
-        build_ninja.build(&ninja::Build {
-            rule: "phony",
-            outputs: &[&Path::new("check").join(&unit.label)],
-            inputs: &[&output],
-            ..Default::default()
-        })?;
-    }
-
-    // builds what all of the tests need
-    let tests: Vec<_> = tests.iter().map(PathBuf::as_path).collect();
-    build_ninja.build(&ninja::Build { rule: "phony", outputs: &[Path::new("test")], inputs: &tests, ..Default::default() })?;
-
-    if !defaults.is_empty() {
-        let defaults: Vec<_> = defaults.iter().map(PathBuf::as_path).collect();
-        build_ninja.default(&defaults)?;
-    }
-
-    build_ninja.sync_all()?;
-
-    let rust_project_path = Path::new(".rust-project.json");
-    let mut rust_project = Vec::new();
-    let configure = std::env::current_exe().unwrap_or_else(|_| "target/configure".into());
-    // writing to a buffer cannot fail
-    let _ = rust_analyzer::write(&mut rust_project, Path::new(&sysroot), &configure, &units);
-    if let Err(error) = std::fs::write(rust_project_path, rust_project) {
-        return Err(Error::Write(rust_project_path.into(), error));
-    }
-
-    let diagnostics: Vec<Vec<_>> = units.iter()
-        .map(|unit| check::replayed(unit, &units).iter().map(|path| path.display().to_string()).collect())
-        .collect();
-    let flychecks = units.iter().zip(&diagnostics).map(|(unit, diagnostics)| database::Flycheck {
-        label: &unit.label,
-        diagnostics: diagnostics.iter().map(String::as_str).collect(),
-    });
-    // the database borrows the commands
-    let commands: Vec<_> = project.customs.iter().filter(|custom| custom.test).map(|test| {
-        (test.name.as_str(), test.command(&project.runners))
-    }).collect();
-    let tests = commands.iter().map(|(name, command)| database::Test {
-        name,
-        command: command.iter().map(String::as_str).collect(),
-    });
-    let mut bytes = Vec::new();
-    let _ = database::write(&mut bytes, &database::Database { flychecks: flychecks.collect(), tests: tests.collect() });
-    let database_path = Path::new(database::PATH);
-    let written = std::fs::create_dir_all(database_path.parent().unwrap())
-        .and_then(|()| std::fs::write(database_path, bytes));
-    if let Err(error) = written {
-        return Err(Error::Write(database_path.into(), error));
-    }
-
-    Ok(())
-}
-
-/// A crate which can be checked by rust-analyzer's flycheck.
-pub struct Unit {
-    /// The label of the flycheck, which is unique.
-    pub label: String,
-    pub name: String,
-    pub root: PathBuf,
-    pub target: String,
-    /// The specification of the target, if it is a custom target.
-    pub spec: Option<PathBuf>,
-    /// Whether the crate is compiled as a test, as the configure tool is.
-    pub test: bool,
-    pub kind: project::rust::Kind,
-    /// The library or binary built from the crate, if it has one.
-    pub output: Option<PathBuf>,
-    /// The indices of the crates passed with `--extern`.
-    pub deps: Vec<usize>,
-    /// Whether the crate is edited, rather than part of the toolchain.
-    pub member: bool,
-    /// The file which declares the crate.
-    pub build_file: PathBuf,
-}
-impl Unit {
-    fn check_dir(&self) -> PathBuf {
-        PathBuf::from(format!("target/{}/check", self.target))
-    }
-    fn check_rmeta(&self) -> PathBuf {
-        self.check_dir().join(format!("lib{}.rmeta", self.name))
-    }
-    /// The file of JSON diagnostics from checking the crate.
-    fn diagnostics(&self) -> PathBuf {
-        self.check_dir().join(format!("{}.json", self.name))
-    }
-}
-
-/// Returns the flags for compiling a crate of a kind with the flag for its target and its dependencies, as names and
-/// paths.
-///
-/// The outputs for a target share a directory, `search`, for the dependencies of `--extern` crates.
-fn rustc_flags(target: &str, search: &Path, kind: project::rust::Kind, deps: &[(&str, PathBuf)]) -> String {
-    let mut flags = format!("{target} -L dependency={}", search.display());
-    // the toolchain's `proc_macro` crate is not in the extern prelude otherwise
-    if kind == project::rust::Kind::ProcMacro {
-        flags.push_str(" --extern proc_macro");
-    }
-    for (name, path) in deps {
-        flags.push_str(&format!(" --extern {name}={}", path.display()));
-    }
-    flags
+    report_diagnostics(&project)?;
+    generate::write(project, &input, &sysroot, self_hosted)
 }
 
 /// The configure tool, which is built by `build.ninja` from its source when that is part of the project.
 const CONFIGURE: &str = "target/configure";
 const CONFIGURE_SOURCE: &str = "dev/configure/main.rs";
 
-/// Quote a string as a single argument for `sh`.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-/// Returns the crates passed to a crate with `--extern`, with their indices in `crates`.
+/// Write the diagnostics of a project to stderr, failing if there are errors.
 ///
-/// Builtin crates are passed to every other crate for the same target, but not to each other as that would be a cycle,
-/// so a builtin crate must `use` the others it depends on. They are not passed to the implicit crates of the build
-/// system either, which use the toolchain's standard library.
-fn externs<'a>(
-    c: &'a project::rust::Crate,
-    crates: &'a [project::rust::Crate],
-) -> impl Iterator<Item = (usize, &'a project::rust::Crate)> {
-    crates.iter().enumerate().filter(move |(_, d)| {
-        let builtin = d.target == c.target && d.builtin && !c.builtin && !c.implicit;
-        // a procedural macro is for the host target, but can be used by a crate for any target
-        let target = d.target == c.target || d.kind == project::rust::Kind::ProcMacro;
-        builtin || target && d.kind != project::rust::Kind::Bin && c.uses.iter().any(|(name, _)| *name == d.name)
-    })
-}
-
-fn write_depfile(w: &mut dyn std::io::Write, project: &project::Project) -> Result<(), std::io::Error> {
-    write!(w, "build.ninja:")?;
-    let paths = project.files.iter().map(|file| &file.path).chain(&project.dependencies);
-    for path in paths {
-        // escape the characters which are special in a depfile
-        let path = path.display().to_string().replace(' ', "\\ ").replace('#', "\\#").replace('$', "$$");
-        write!(w, " {path}")?;
+/// Warnings alone do not fail, but are followed by a warning which counts them.
+fn report_diagnostics(project: &project::Project) -> Result<(), Error> {
+    if project.diagnostics.is_empty() {
+        return Ok(());
     }
-    writeln!(w)?;
+    let mut errors = 0;
+    let mut warnings = 0;
+    let mut stderr = std::io::stderr().lock();
+    let pretty = stderr.is_terminal();
+    for diagnostic in &project.diagnostics {
+        match diagnostic.severity {
+            project::Severity::Error => errors += 1,
+            project::Severity::Warning => warnings += 1,
+            _ => (),
+        }
+        if let Err(error) = project.write_diagnostic(&mut stderr, diagnostic, pretty) {
+            return Err(Error::Stderr(error));
+        }
+    }
+    let result = Error::Diagnostics { errors, warnings };
+    if errors > 0 {
+        return Err(result);
+    } else if warnings > 0 {
+        let diagnostic = project::Diagnostic {
+            span: None,
+            message: project::Message::User(result.to_string()),
+            severity: project::Severity::Warning,
+        };
+        if let Err(error) = project.write_diagnostic(&mut stderr, &diagnostic, pretty) {
+            return Err(Error::Stderr(error));
+        }
+    }
     Ok(())
 }
 
@@ -531,20 +186,6 @@ impl core::fmt::Display for Error {
             Self::TestsFailed(count) => write!(f, "{count} tests failed"),
             Self::Exec(cmd, error) => write!(f, "failed to execute {cmd:?}: {error}"),
         }
-    }
-}
-
-/// Returns the specification of a builtin target, which is unstable.
-fn target_spec_json(target: &str) -> Result<String, Error> {
-    let mut cmd = std::process::Command::new("rustc");
-    cmd.args(["-Zunstable-options", "--print=target-spec-json", &format!("--target={target}")]);
-    let output = match cmd.output() {
-        Ok(output) => output,
-        Err(error) => return Err(Error::Exec(cmd, error)),
-    };
-    match String::from_utf8(output.stdout) {
-        Ok(json) if output.status.success() => Ok(json),
-        _ => Err(Error::InvalidOutput(cmd)),
     }
 }
 
