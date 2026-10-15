@@ -2,6 +2,7 @@
 
 use super::diagnostic::{Diagnostic, Message, Severity, suggest};
 use super::statements::Attribute;
+use super::statements::Name;
 use super::syntax::{Parser, Span};
 use super::value::Data;
 use super::Project;
@@ -96,7 +97,7 @@ impl Project {
             parser.skip_statement();
             return;
         }
-        let Some((name, span, _)) = self.parse_name(parser) else {
+        let Some(Name { name, span, .. }) = self.parse_name(parser) else {
             parser.skip_statement();
             return;
         };

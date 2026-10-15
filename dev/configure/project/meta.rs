@@ -207,7 +207,7 @@ impl Project {
         if !self.parse_space(parser) {
             return None;
         }
-        let (name, _, _) = self.parse_name(parser)?;
+        let name = self.parse_name(parser)?.name;
         if !self.parse_space(parser) {
             return None;
         }

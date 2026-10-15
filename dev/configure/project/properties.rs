@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use super::diagnostic::{Diagnostic, Message, Severity};
+use super::statements::Name;
 use super::syntax::{Parser, Span};
 use super::value::{Coercion, Data, Operand, Property, Type, Value};
 use super::Project;
@@ -13,7 +14,7 @@ impl Project {
             parser.skip_statement();
             return;
         }
-        let Some((name, span, _)) = self.parse_name(parser) else {
+        let Some(Name { name, span, .. }) = self.parse_name(parser) else {
             parser.skip_statement();
             return;
         };
@@ -154,7 +155,7 @@ impl Project {
             parser.skip_statement();
             return;
         }
-        let Some((name, span, _)) = self.parse_name(parser) else {
+        let Some(Name { name, span, .. }) = self.parse_name(parser) else {
             parser.skip_statement();
             return;
         };

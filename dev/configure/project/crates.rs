@@ -4,6 +4,7 @@ use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
 
 use super::diagnostic::{Diagnostic, Message, Severity};
+use super::statements::Name;
 use super::syntax::{Parser, Span};
 use super::value::Data;
 use super::customs::{Custom, CustomKind};
@@ -26,7 +27,7 @@ impl Project {
             parser.skip_statement();
             return;
         }
-        let Some((name, span, literal)) = self.parse_name(parser) else {
+        let Some(Name { name, span, literal }) = self.parse_name(parser) else {
             parser.skip_statement();
             return;
         };

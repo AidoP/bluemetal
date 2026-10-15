@@ -15,6 +15,14 @@ pub(super) struct Attribute<'a> {
     /// Where the value was set, if the data is the value of a property.
     pub(super) origin: Option<Span>,
 }
+/// The name of a property or crate, as taken by [`Project::parse_name`].
+pub(super) struct Name {
+    pub(super) name: String,
+    pub(super) span: Span,
+    /// Whether the name was written as an identifier, so that its characters are at known offsets.
+    pub(super) literal: bool,
+}
+
 impl Attribute<'_> {
     /// The value of the attribute as an operand, which is not converted to another type.
     pub(super) fn operand(self) -> Operand {
@@ -217,19 +225,17 @@ impl Project {
         None
     }
     /// Take the name of a property or crate, which is an identifier, or an expression in `{}` whose value is one.
-    ///
-    /// Also returns whether the name was written as an identifier, so that its characters are at known offsets.
-    pub(super) fn parse_name(&mut self, parser: &mut Parser) -> Option<(String, Span, bool)> {
+    pub(super) fn parse_name(&mut self, parser: &mut Parser) -> Option<Name> {
         if parser.peek() != Some('{') {
             let (ident, span) = self.parse_ident(parser)?;
-            return Some((ident.into(), span, true));
+            return Some(Name { name: ident.into(), span, literal: true });
         }
         let operand = self.parse_operand(parser)?;
         let name = operand.data.coerce_string();
         let message = match name.char_indices().find(invalid_ident_char) {
             Some((_, character)) => Message::InvalidIdentifier { name, character },
             None if name.is_empty() => Message::ExpectedIdentifier,
-            None => return Some((name, operand.span, false)),
+            None => return Some(Name { name, span: operand.span, literal: false }),
         };
         self.diagnostics.push(Diagnostic {
             span: Some(operand.span),
@@ -308,7 +314,9 @@ impl Project {
             if !self.parse_space(parser) {
                 return None;
             }
-            let (mut value, mut span, _) = self.parse_name(parser)?;
+            let name = self.parse_name(parser)?;
+            let mut value = name.name;
+            let mut span = name.span;
             // a crate can only use crates for the same target, so it is not given, unlike in a reference to a crate
             if is_crate_reference(parser) {
                 parser.expect('/');

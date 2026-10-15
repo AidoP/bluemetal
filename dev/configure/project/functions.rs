@@ -362,7 +362,7 @@ impl Project {
         if len == 0 || !rest[len..].starts_with(": ") {
             return Some(RunArgument::Positional(self.parse_binary(parser, 0)?));
         }
-        let (name, _, _) = self.parse_name(parser)?;
+        let name = self.parse_name(parser)?.name;
         parser.offset += 2;
         Some(RunArgument::Env(name, self.parse_binary(parser, 0)?))
     }
