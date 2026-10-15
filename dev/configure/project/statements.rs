@@ -3,7 +3,8 @@
 use std::path::PathBuf;
 
 use super::syntax::{Parser, Span, invalid_ident_char, is_crate_reference};
-use super::{Data, Diagnostic, File, Message, Meta, Project, Severity, Value};
+use super::meta::Meta;
+use super::{Data, Diagnostic, File, Message, Project, Severity, Value};
 
 pub(super) struct Attribute<'a> {
     pub(super) name: &'a str,
