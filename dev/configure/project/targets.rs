@@ -68,11 +68,7 @@ impl Project {
         let mut overrides = false;
         // the attributes which describe the specification, which a builtin target has already
         let mut spec_attributes = Vec::new();
-        while parser.indent().is_some() {
-            let Some(attribute) = self.parse_attribute(parser, &[]) else {
-                parser.skip_line();
-                continue;
-            };
+        while let Some(attribute) = self.next_attribute(parser, &[]) {
             if !matches!(attribute.name, "override" | "test" | "runner") {
                 spec_attributes.push((attribute.name, attribute.name_span));
             }

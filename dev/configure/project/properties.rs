@@ -45,11 +45,7 @@ impl Project {
         // whole declaration is known
         let mut default_value = None;
         let mut info = None;
-        while let Some(_) = parser.indent() {
-            let Some(attribute) = self.parse_attribute(parser, &[]) else {
-                parser.skip_line();
-                continue;
-            };
+        while let Some(attribute) = self.next_attribute(parser, &[]) {
             match attribute.name {
                 "type" => {
                     let name = attribute.data.coerce_string();

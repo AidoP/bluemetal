@@ -54,11 +54,7 @@ impl Project {
         let mut target = None;
         let mut uses = Vec::new();
         let mut kind = rust::Kind::Lib;
-        while let Some(_) = parser.indent() {
-            let Some(attribute) = self.parse_attribute(parser, &["use"]) else {
-                parser.skip_line();
-                continue;
-            };
+        while let Some(attribute) = self.next_attribute(parser, &["use"]) {
             match attribute.name {
                 "builtin" => builtin = true,
                 "default" => default = true,

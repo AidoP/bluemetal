@@ -288,11 +288,21 @@ impl Project {
         }
         Some((path_buf, span))
     }
+    /// Take the next indented attribute of a statement, skipping those which are invalid, which have been reported.
+    pub(super) fn next_attribute<'a>(&mut self, parser: &mut Parser<'a>, names: &[&str]) -> Option<Attribute<'a>> {
+        while parser.indent().is_some() {
+            if let Some(attribute) = self.parse_attribute(parser, names) {
+                return Some(attribute);
+            }
+            parser.skip_line();
+        }
+        None
+    }
     /// Take an indented attribute, with an optional value.
     ///
     /// The value of an attribute in `names` is a name, as taken by [`Self::parse_name`], and is required. Otherwise it
     /// is an expression.
-    pub(super) fn parse_attribute<'a>(&mut self, parser: &mut Parser<'a>, names: &[&str]) -> Option<Attribute<'a>> {
+    fn parse_attribute<'a>(&mut self, parser: &mut Parser<'a>, names: &[&str]) -> Option<Attribute<'a>> {
         let (name, name_span) = self.parse_ident(parser)?;
         let (data, data_span, origin) = if names.contains(&name) {
             if !self.parse_space(parser) {
