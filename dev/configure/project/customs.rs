@@ -179,7 +179,7 @@ impl Project {
         true
     }
     /// Take the paths of an `input` or `output` attribute, a path or a list of them, which are relative to the file.
-    pub(super) fn parse_custom_paths(&mut self, parser: &mut Parser) -> Option<Vec<PathBuf>> {
+    fn parse_custom_paths(&mut self, parser: &mut Parser) -> Option<Vec<PathBuf>> {
         if !self.parse_space(parser) {
             return None;
         }
@@ -194,7 +194,7 @@ impl Project {
     ///
     /// Any value is an argument, converted to a string as in a string template, while each item of a list is a separate
     /// argument.
-    pub(super) fn parse_command(&mut self, parser: &mut Parser) -> Option<Vec<String>> {
+    fn parse_command(&mut self, parser: &mut Parser) -> Option<Vec<String>> {
         let mut arguments = Vec::new();
         while parser.peek() == Some(' ') || arguments.is_empty() {
             if !self.parse_space(parser) {

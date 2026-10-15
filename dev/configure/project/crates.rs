@@ -194,7 +194,7 @@ impl Project {
     /// Register the test harness of a crate, like a `test` statement which runs it, which also needs `inputs`.
     ///
     /// The harness is run directly, until the runner of its target is known.
-    pub(super) fn add_crate_test(&mut self, name: String, span: Span, harness: PathBuf, mut inputs: Vec<PathBuf>) {
+    fn add_crate_test(&mut self, name: String, span: Span, harness: PathBuf, mut inputs: Vec<PathBuf>) {
         let command = vec![Path::new(".").join(&harness).display().to_string()];
         inputs.insert(0, harness);
         self.add_custom(Custom {

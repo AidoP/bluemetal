@@ -267,7 +267,7 @@ impl Operator {
 ///
 /// A string is on a single line. An expression in `{}` within it may contain strings, so their quotes do not close it,
 /// while `{{` and `}}` are escaped braces. An unclosed `{` is ignored, so that it is reported as an invalid template.
-pub(super) fn string_end(s: &str) -> Option<usize> {
+fn string_end(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {

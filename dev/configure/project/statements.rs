@@ -52,7 +52,7 @@ impl Project {
         }
     }
     /// Take a `@then` directly after a statement, returning whether there is one.
-    pub(super) fn parse_then(&mut self, parser: &mut Parser) -> bool {
+    fn parse_then(&mut self, parser: &mut Parser) -> bool {
         let Some(rest) = parser.as_str().strip_prefix("@then") else {
             return false;
         };
@@ -75,14 +75,14 @@ impl Project {
         true
     }
     /// Skip a statement chained with `@then` to a skipped statement, with its meta-statements.
-    pub(super) fn skip_chained(parser: &mut Parser) {
+    fn skip_chained(parser: &mut Parser) {
         while parser.peek() == Some('@') {
             parser.skip_line();
         }
         parser.skip_statement();
     }
     /// Take a statement, after its meta-statements.
-    pub(super) fn parse_single_statement(&mut self, parser: &mut Parser) {
+    fn parse_single_statement(&mut self, parser: &mut Parser) {
         let start = parser.offset;
         let Some((keyword, span)) = self.parse_ident(parser) else {
             parser.skip_statement();
@@ -108,7 +108,7 @@ impl Project {
             },
         }
     }
-    pub(super) fn parse_use(&mut self, parser: &mut Parser) {
+    fn parse_use(&mut self, parser: &mut Parser) {
         if !self.parse_space(parser) {
             parser.skip_statement();
             return;
@@ -142,7 +142,7 @@ impl Project {
             },
         };
     }
-    pub(super) fn parse_log(&mut self, parser: &mut Parser) {
+    fn parse_log(&mut self, parser: &mut Parser) {
         if !self.parse_space(parser) {
             parser.skip_statement();
             return;

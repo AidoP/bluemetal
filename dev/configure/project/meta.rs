@@ -174,7 +174,7 @@ impl Project {
     }
     /// Take the rest of a `@for`, a property and the values it takes, separated by spaces, where each item of a list is
     /// a value.
-    pub(super) fn parse_for(&mut self, parser: &mut Parser) -> Option<(String, Vec<Data>)> {
+    fn parse_for(&mut self, parser: &mut Parser) -> Option<(String, Vec<Data>)> {
         let header = (|| {
             if !self.parse_space(parser) {
                 return None;
@@ -213,7 +213,7 @@ impl Project {
         header
     }
     /// Take the condition of an `@if` to the end of the line, returning [`None`] if it is invalid.
-    pub(super) fn parse_condition(&mut self, parser: &mut Parser) -> Option<bool> {
+    fn parse_condition(&mut self, parser: &mut Parser) -> Option<bool> {
         if !self.parse_space(parser) {
             parser.skip_line();
             return None;

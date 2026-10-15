@@ -154,7 +154,7 @@ impl Project {
     ///
     /// A read-only property may be assigned once, by a `default` or a `set`, so further assignments are errors.
     /// The span is [`None`] for a builtin value.
-    pub(super) fn read_only_value(&self, id: usize, name: &str) -> Option<Option<Span>> {
+    fn read_only_value(&self, id: usize, name: &str) -> Option<Option<Span>> {
         if !self.properties[id].as_ref().is_some_and(|property| property.read_only) {
             return None;
         }
@@ -209,7 +209,7 @@ impl Project {
     /// Assign a value to a property, unless it does not have the property's type, returning whether it was assigned.
     ///
     /// The type of a property which has not been declared yet is checked by its declaration.
-    pub(super) fn assign(&mut self, name: &str, value: Value) -> bool {
+    fn assign(&mut self, name: &str, value: Value) -> bool {
         let Some(property) = &self.properties[value.property] else {
             self.set(name.into(), value);
             return true;
@@ -228,7 +228,7 @@ impl Project {
         }
     }
     /// Check that an assigned value has the type of its property, converting it if needed, and report it if not.
-    pub(super) fn check_type(&mut self, value: usize, name: &str) -> bool {
+    fn check_type(&mut self, value: usize, name: &str) -> bool {
         let property = self.properties[self.values[value].property].as_ref().unwrap();
         match property.ty.accept(self.values[value].data.clone()) {
             Ok(data) => {
@@ -242,7 +242,7 @@ impl Project {
         }
     }
     /// Report a value which does not have the type of its property.
-    pub(super) fn mismatched_type(&mut self, value: usize, name: &str) {
+    fn mismatched_type(&mut self, value: usize, name: &str) {
         self.diagnostics.push(Diagnostic {
             span: self.values[value].data_span,
             message: Message::MismatchedType { value, name: name.into() },

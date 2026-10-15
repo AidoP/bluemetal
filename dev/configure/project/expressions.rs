@@ -130,7 +130,7 @@ impl Project {
     ///
     /// Operands must have the type required by the operator, and the same type as each other.
     /// An operand is only converted to satisfy this as far as its [`Coercion`] permits.
-    pub(super) fn evaluate_binary(&mut self, operator: Operator, lhs: Operand, rhs: Operand) -> Option<Operand> {
+    fn evaluate_binary(&mut self, operator: Operator, lhs: Operand, rhs: Operand) -> Option<Operand> {
         let span = Span {
             file: lhs.span.file,
             offset: lhs.span.offset,
@@ -282,7 +282,7 @@ impl Project {
         Some(Operand { data, ..operand })
     }
     /// Ensure both operands are integers of the same type.
-    pub(super) fn integer_operands(&mut self, lhs: Operand, rhs: Operand, span: Span) -> Option<(Data, Data)> {
+    fn integer_operands(&mut self, lhs: Operand, rhs: Operand, span: Span) -> Option<(Data, Data)> {
         let lhs = self.integer_operand(lhs)?;
         let rhs = self.integer_operand(rhs)?;
         self.unify_sign(lhs, rhs, span)
@@ -311,7 +311,7 @@ impl Project {
         None
     }
     /// Ensure both operands have the same type, of any kind.
-    pub(super) fn comparable_operands(&mut self, lhs: Operand, rhs: Operand, span: Span) -> Option<(Data, Data)> {
+    fn comparable_operands(&mut self, lhs: Operand, rhs: Operand, span: Span) -> Option<(Data, Data)> {
         if lhs.data.type_name() == rhs.data.type_name() {
             return Some((lhs.data, rhs.data));
         }
@@ -390,7 +390,7 @@ impl Project {
         }
     }
     /// Take the next string from the parser.
-    pub(super) fn parse_string(&mut self, parser: &mut Parser) -> Option<(String, Span)> {
+    fn parse_string(&mut self, parser: &mut Parser) -> Option<(String, Span)> {
         if parser.as_str().starts_with("'''\n") {
             return self.parse_multiline_string(parser);
         }
@@ -410,7 +410,7 @@ impl Project {
     /// Each line between must be indented by 4 spaces more than the line it starts on, which is removed, or be blank.
     /// A comment, with `#` in the first column, is skipped.
     /// The lines are templates, like other strings, and are joined by newlines, without one at the end.
-    pub(super) fn parse_multiline_string(&mut self, parser: &mut Parser) -> Option<(String, Span)> {
+    fn parse_multiline_string(&mut self, parser: &mut Parser) -> Option<(String, Span)> {
         let start = parser.offset;
         let line_start = parser.data[..start].rfind('\n').map_or(0, |i| i + 1);
         let indent = parser.data[line_start..start].len() - parser.data[line_start..start].trim_start_matches(' ').len();

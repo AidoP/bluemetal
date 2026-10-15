@@ -211,7 +211,7 @@ impl Project {
         }
     }
     /// Add the runner of a target, returning its index.
-    pub(super) fn add_runner(&mut self, command: Vec<String>, file: usize) -> usize {
+    fn add_runner(&mut self, command: Vec<String>, file: usize) -> usize {
         let runner = self.resolve_command(command, file);
         self.runners.push(runner);
         self.runners.len() - 1

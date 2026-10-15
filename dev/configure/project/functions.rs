@@ -258,7 +258,7 @@ impl Project {
     ///
     /// Errors from the first argument are reported as warnings instead. As evaluation stops at the first error, the rest
     /// of the argument is skipped to the separator.
-    pub(super) fn parse_try(&mut self, parser: &mut Parser, name_span: Span) -> Option<Operand> {
+    fn parse_try(&mut self, parser: &mut Parser, name_span: Span) -> Option<Operand> {
         let start = parser.offset;
         let first = self.diagnostics.len();
         let operand = if parser.peek() == Some(')') {
@@ -423,7 +423,7 @@ impl Project {
     ///
     /// A missing dependency is always out of date, which would regenerate the configuration endlessly, so a path which
     /// does not exist is not tracked.
-    pub(super) fn depend_on_path(&mut self, path: &Path) {
+    fn depend_on_path(&mut self, path: &Path) {
         if path.exists() {
             self.depend(path.to_path_buf());
         }
@@ -461,7 +461,7 @@ impl Project {
             parser.offset += 2;
         }
     }
-    pub(super) fn argument_count(&mut self, function: &str, expected: &'static str, found: usize, span: Span) {
+    fn argument_count(&mut self, function: &str, expected: &'static str, found: usize, span: Span) {
         self.diagnostics.push(Diagnostic {
             span: Some(span),
             message: Message::ArgumentCount { function: function.into(), expected, found },
