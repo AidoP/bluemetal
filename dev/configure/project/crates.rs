@@ -204,7 +204,7 @@ impl Project {
     /// Complete the tests of the crates with a `test` attribute, which were forward declared, with the runner of their
     /// target. Tests run on the host target, or a custom target which allows tests, and the others are removed.
     pub(super) fn add_crate_tests(&mut self) {
-        let host = self.values_idx.get("host-target").map_or_default(|&value| self.values[value].data.coerce_string());
+        let host = self.host();
         // in the order they were declared, as the crates are not
         let mut keys = Vec::new();
         for (key, c) in &self.crates {

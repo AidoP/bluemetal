@@ -144,6 +144,13 @@ impl Project {
         }
         Some(&self.values[*idx?])
     }
+    /// The target triple of the machine running the build, which is the value of the builtin `host-target` property.
+    pub(super) fn host(&self) -> String {
+        let Some(&value) = self.values_idx.get("host-target") else {
+            return String::new();
+        };
+        self.values[value].data.coerce_string()
+    }
     /// Check for various conditions that cannot be evaluated as errors until reading has completed.
     /// - Unknown targets for crates, as a `target` statement may come later.
     /// - Missing declarations for `set` statements.
@@ -166,7 +173,7 @@ impl Project {
                 });
             }
         }
-        let host = self.values_idx.get("host-target").map_or_default(|&value| self.values[value].data.coerce_string());
+        let host = self.host();
         for c in self.crates.values() {
             for used in &c.uses {
                 let mut d = self.crates.get(&(used.name.clone(), c.target.clone()));
